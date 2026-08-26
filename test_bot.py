@@ -295,6 +295,20 @@ class TestConfigErrors(unittest.TestCase):
             (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
              bot_module.DISCORD_PROBE_URL) = old
 
+    def test_bad_account_api_url_rejected_before_connecting(self):
+        old = (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+               bot_module.DISCORD_ACCOUNT_API_URL)
+        bot_module.TOKEN = "test-bot-token"
+        bot_module.DISCORD_CHECK_MODE = "account"
+        bot_module.DISCORD_ACCOUNT_API_URL = "file:///tmp/account"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("DISCORD_ACCOUNT_API_URL", str(raised.exception))
+        finally:
+            (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+             bot_module.DISCORD_ACCOUNT_API_URL) = old
+
     def test_invalid_probe_header_rejected_before_connecting(self):
         old = (bot_module.TOKEN, bot_module.DISCORD_PROBE_TOKEN,
                bot_module.DISCORD_PROBE_TOKEN_HEADER)

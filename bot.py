@@ -22,7 +22,9 @@ Configuration lives in .env (see .env.example):
     TARGET_CHANNEL_ID         channel to watch (blank = every channel)
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 optional HTTP(S) proxy for outbound checks
-    DISCORD_CHECK_MODE        off (default) | probe
+    DISCORD_CHECK_MODE        off (default) | account | probe
+    DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
+    DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
     CHECK_TIMEOUT             per outbound HTTP request (default 3)
@@ -91,25 +93,58 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
-def _discord_probe_headers() -> dict[str, str] | None:
-    """Build the optional auth header without ever logging its token value."""
+def _token_header(
+    token: str,
+    header_name: str,
+    scheme: str,
+) -> dict[str, str] | None:
+    """Build one optional auth header without ever logging its token value."""
 
-    if not DISCORD_PROBE_TOKEN:
+    if not token:
         return None
-    value = (f"{DISCORD_PROBE_TOKEN_SCHEME} {DISCORD_PROBE_TOKEN}".strip()
-             if DISCORD_PROBE_TOKEN_SCHEME else DISCORD_PROBE_TOKEN)
-    return {DISCORD_PROBE_TOKEN_HEADER: value}
+    value = f"{scheme} {token}".strip() if scheme else token
+    return {header_name: value}
+
+
+def _discord_probe_headers() -> dict[str, str] | None:
+    """Build the optional probe auth header without exposing its value."""
+
+    return _token_header(
+        DISCORD_PROBE_TOKEN,
+        DISCORD_PROBE_TOKEN_HEADER,
+        DISCORD_PROBE_TOKEN_SCHEME,
+    )
+
+
+def _discord_account_api_headers() -> dict[str, str] | None:
+    """Build account-API auth headers; never reuse the bot token implicitly."""
+
+    return _token_header(
+        DISCORD_ACCOUNT_API_TOKEN,
+        DISCORD_ACCOUNT_API_TOKEN_HEADER,
+        DISCORD_ACCOUNT_API_TOKEN_SCHEME,
+    )
 
 
 TARGET_CHANNEL_ID = _opt_int("TARGET_CHANNEL_ID")
 LOG_CHANNEL_ID = _opt_int("LOG_CHANNEL_ID")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DISCORD_CHECK_MODE = os.getenv("DISCORD_CHECK_MODE", "off").strip().lower()
+DISCORD_ACCOUNT_API_URL = (
+    os.getenv("DISCORD_ACCOUNT_API_URL", "").strip()
+    or checkers.DEFAULT_DISCORD_ACCOUNT_API_URL
+)
+DISCORD_ACCOUNT_API_TOKEN = os.getenv("DISCORD_ACCOUNT_API_TOKEN", "").strip()
+DISCORD_ACCOUNT_API_TOKEN_HEADER = os.getenv(
+    "DISCORD_ACCOUNT_API_TOKEN_HEADER", "Authorization").strip() or "Authorization"
+DISCORD_ACCOUNT_API_TOKEN_SCHEME = os.getenv(
+    "DISCORD_ACCOUNT_API_TOKEN_SCHEME", "Bearer").strip()
 DISCORD_PROBE_URL = os.getenv("DISCORD_PROBE_URL", "").strip() or None
 DISCORD_PROBE_TOKEN = os.getenv("DISCORD_PROBE_TOKEN", "").strip()
 DISCORD_PROBE_TOKEN_HEADER = os.getenv(
     "DISCORD_PROBE_TOKEN_HEADER", "Authorization").strip() or "Authorization"
 DISCORD_PROBE_TOKEN_SCHEME = os.getenv("DISCORD_PROBE_TOKEN_SCHEME", "Bearer").strip()
+DISCORD_ACCOUNT_API_HEADERS = _discord_account_api_headers()
 DISCORD_PROBE_HEADERS = _discord_probe_headers()
 
 # The event handler starts after Discord delivers MESSAGE_CREATE. Reserving a
@@ -306,6 +341,8 @@ class SniperBot(discord.Client):
             discord_probe_url=DISCORD_PROBE_URL,
             discord_probe_headers=DISCORD_PROBE_HEADERS,
             timeout=check_budget,
+            discord_account_api_url=DISCORD_ACCOUNT_API_URL,
+            discord_account_api_headers=DISCORD_ACCOUNT_API_HEADERS,
         ))
         try:
             done, _ = await asyncio.wait({checker_task}, timeout=check_budget)
@@ -435,12 +472,26 @@ def main() -> None:
         raise SystemExit(
             "❌ DISCORD_TOKEN missing. Copy .env.example to .env and paste "
             "your bot token from the Discord Developer Portal.")
-    if DISCORD_CHECK_MODE not in ("off", "probe"):
-        raise SystemExit("❌ DISCORD_CHECK_MODE must be 'off' or 'probe'.")
+    if DISCORD_CHECK_MODE not in ("off", "account", "account_api", "probe"):
+        raise SystemExit(
+            "❌ DISCORD_CHECK_MODE must be 'off', 'account', or 'probe'.")
     if PROXY_URL:
         proxy_error = checkers.validate_http_url(PROXY_URL, "PROXY_URL")
         if proxy_error:
             raise SystemExit(f"❌ {proxy_error}")
+    if DISCORD_ACCOUNT_API_TOKEN:
+        if not checkers.is_valid_header_name(DISCORD_ACCOUNT_API_TOKEN_HEADER):
+            raise SystemExit(
+                "❌ DISCORD_ACCOUNT_API_TOKEN_HEADER is not a valid HTTP header name.")
+        if "\r" in DISCORD_ACCOUNT_API_TOKEN or "\n" in DISCORD_ACCOUNT_API_TOKEN:
+            raise SystemExit("❌ DISCORD_ACCOUNT_API_TOKEN must not contain a line break.")
+        if "\r" in DISCORD_ACCOUNT_API_TOKEN_SCHEME or "\n" in DISCORD_ACCOUNT_API_TOKEN_SCHEME:
+            raise SystemExit(
+                "❌ DISCORD_ACCOUNT_API_TOKEN_SCHEME must not contain a line break.")
+    if DISCORD_CHECK_MODE in ("account", "account_api"):
+        account_error = checkers.validate_account_api_url(DISCORD_ACCOUNT_API_URL)
+        if account_error:
+            raise SystemExit(f"❌ {account_error}")
     if DISCORD_PROBE_TOKEN:
         if not checkers.is_valid_header_name(DISCORD_PROBE_TOKEN_HEADER):
             raise SystemExit("❌ DISCORD_PROBE_TOKEN_HEADER is not a valid HTTP header name.")

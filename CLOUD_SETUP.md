@@ -81,8 +81,8 @@ cp .env.example .env
 #    edit .env now — see README Phase 2 for how to get the token
 
 # 3. The full offline test suite must print OK
-python test_checkers.py             # 22 offline tests (+ 2 live, skipped)
-python test_bot.py                  # 25 pipeline tests
+python test_checkers.py             # 27 offline tests (+ 2 live, skipped)
+python test_bot.py                  # 26 pipeline tests
 
 # 4. Live smoke test of the real endpoints from your machine
 python checkers.py Notch            # Minecraft + guns.lol, Discord skipped
@@ -127,18 +127,21 @@ local `.env` file. The full annotated list is in [`.env.example`](.env.example)
 | -------- | ------- | --------- |
 | `TARGET_CHANNEL_ID` | watch every channel | the channel ID to watch (recommended) |
 | `LOG_CHANNEL_ID` | no hit logging | a private channel ID for "name found free" posts |
-| `DISCORD_CHECK_MODE` | `off` (safe default) | `probe` only if you run an authorized checker |
+| `DISCORD_CHECK_MODE` | `off` (safe default) | `account` for the opt-in Account API, or `probe` for an authorized checker |
+| `DISCORD_ACCOUNT_API_URL` | Discord first-party eligibility route | optional HTTP(S) override with the same JSON contract |
+| `DISCORD_ACCOUNT_API_TOKEN` | no credential | optional authorized API/OAuth credential; never a personal client token |
 | `PROXY_URL` | direct connection | `http://user:pass@host:port` if you need one |
 
 **Optional tuning** (`CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
 `REACTION_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`,
 `RESULT_CACHE_TTL`) — safe defaults are built in; skip them unless you know why
-you're changing them. `DISCORD_PROBE_*` only matters if you enable `probe`.
+you're changing them. `DISCORD_ACCOUNT_API_*` matters only in `account` mode;
+`DISCORD_PROBE_*` only matters if you enable `probe`.
 
 **Host-specific notes:**
 
 - Values are stored as plain strings — don't wrap them in quotes.
-- `DISCORD_TOKEN` and any proxy/probe credentials should go in the host's
+- `DISCORD_TOKEN` and any account/probe/proxy credentials should go in the host's
   **secret** store where available (Render "Secret Files" are for files, not
   vars — just use the normal Environment panel for all of these; Railway and
   Heroku treat all vars as secrets by default).
@@ -600,8 +603,9 @@ confirms the new build took the settings you think it did.
 
 ## 13. Secrets & security on cloud hosts
 
-- **The only real secret is `DISCORD_TOKEN`** (plus `DISCORD_PROBE_TOKEN` /
-  proxy credentials if you use them).
+- **The required secret is `DISCORD_TOKEN`** (plus
+  `DISCORD_ACCOUNT_API_TOKEN`, `DISCORD_PROBE_TOKEN`, or proxy credentials if
+  you use them).
 - `.env` is git-ignored and `.env.example` ships with blank credential
   fields — `git status` should stay clean of secrets. The README, blueprint,
   and this guide contain no real tokens.
@@ -613,9 +617,9 @@ confirms the new build took the settings you think it did.
   (never `[env]` in `fly.toml` — that file is committed).
 - Rotating the token: Discord Developer Portal → Reset Token → update the
   host's env var → redeploy/restart. The old token dies immediately.
-- The bot logs redact credentials (`DISCORD_PROBE_TOKEN`, URL user-info) —
-  you should still never paste raw logs containing anything that looks like a
-  token into public places.
+- The bot logs redact credentials (`DISCORD_ACCOUNT_API_TOKEN`,
+  `DISCORD_PROBE_TOKEN`, URL user-info) — you should still never paste raw logs
+  containing anything that looks like a token into public places.
 - Keep the GitHub repo **private**. The bot itself needs no repository access
   at runtime — it's just the deployment source.
 

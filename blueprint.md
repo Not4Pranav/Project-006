@@ -40,7 +40,7 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | :---: | --- |
 | 🕹️ | free on Minecraft |
 | 🔫 | free on guns.lol |
-| 🐈‍⬛ | free on Discord *(only through a user-supplied authorized checker)* |
+| 🐈‍⬛ | free on Discord *(only when the opt-in Account API confirms it)* |
 | ❌ | not available anywhere that answered |
 | ⚠️ | no free result can be confirmed: every check, or a required check, is unknown |
 | ⏳ | user exceeded their check cooldown |
@@ -72,9 +72,9 @@ Discord reactions run concurrently so retries cannot serialize past it:
              │
              ├──► [Worker A] 🕹️ Mojang primary ──blocked/error──► fallback endpoint
              ├──► [Worker B] 🔫 guns.lol profile page (status + narrow page markers)
-             └──► [Worker C] 🐈‍⬛ Authorized Discord checker (mode=off ⇒ SKIPPED)
-             │        each worker: validate name → GET (3 s default request
-             │        cap, browser headers, optional user-supplied proxy) → normalize result
+             └──► [Worker C] 🐈‍⬛ Account API / external checker (mode=off ⇒ SKIPPED)
+             │        each worker: validate name → GET or account JSON POST (3 s
+             │        default request cap, browser headers, optional proxy) → normalize result
              │        all workers share the remaining response-deadline budget
              ▼
   STAGE 5  aggregate ....... list[Result] → cache only if at least one answer is definitive
@@ -100,8 +100,8 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | --- | --- | --- |
 | `bot.py` | Discord runtime: gateway events, filtering, cooldown, cache, reactions, logging | `SniperBot`, `on_message`, `_cooldown_hit`, `_cached`, `_react` |
 | `checkers.py` | Platform knowledge: endpoints, name rules, status-code interpretation, parallel fan-out, CLI | `run_all_checks`, `check_minecraft/gunslol/discord`, `interpret_*`, `Result`, `BROWSER_HEADERS` |
-| `test_bot.py` | 25 end-to-end pipeline tests with simulated Discord messages | — |
-| `test_checkers.py` | 22 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
+| `test_bot.py` | 26 end-to-end pipeline tests with simulated Discord messages | — |
+| `test_checkers.py` | 27 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
 | `.env` / `.env.example` | All runtime configuration; secrets never enter git | see §9 |
 | `requirements.txt` | `discord.py` (gateway+REST), `aiohttp` (platform HTTP), `python-dotenv` | — |
 | `Procfile` | Cloud start command (`worker: python bot.py`) | — |
@@ -142,6 +142,8 @@ the cache—timeouts, blocks, and partial outages are deliberately retried.
 results = await run_all_checks(
     session, name, proxy=proxy,
     discord_mode=mode,
+    discord_account_api_url=account_api_url,
+    discord_account_api_headers=account_api_headers,
     discord_probe_url=probe_url,
     discord_probe_headers=authorized_checker_headers,
     timeout=remaining_check_budget,
@@ -199,7 +201,7 @@ class Result:
 | --- | --- | --- | --- | --- | --- |
 | 🕹️ Minecraft | `GET https://api.mojang.com/users/profiles/minecraft/<name>` → on blocked/transient error, retry `GET https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>` | 204, 404 | 200 (profile JSON) | not `^[A-Za-z0-9_]{3,16}$` | 403, 405, 429 |
 | 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed; status **and** narrow response markers interpreted) | 404, 410, or a 200 “username not found”/unclaimed-title page | 200 profile page with no unclaimed/challenge marker | not `^[A-Za-z0-9._-]{2,24}$` | 403, 429, 503, or 200 Cloudflare challenge page |
-| 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` with optional private auth header; blank URL also skips | custom checker 404 | custom checker 200 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 401, 403, 429, malformed URL |
+| 🐈‍⬛ Discord | `off` → SKIPPED. `account` → JSON `POST` to `DISCORD_ACCOUNT_API_URL` (default first-party eligibility route). `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` | account response `taken: false` | account response `taken: true` | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 401, 403, 429, malformed URL/JSON |
 
 > **Naming clarification:** [http://Gung.lol](http://Gung.lol) was a parked domain
 > when this implementation was verified, not a profile-availability service. The checker
@@ -229,13 +231,15 @@ becomes `ERROR` rather than making the member wait beyond the reaction budget.
 
 ### 5.4 Request profile (identical for every platform)
 
-- **Method:** `GET`, redirects followed. Minecraft and the authorized external
-  Discord checker map the final status code; guns.lol also reads its small
-  semantic error page because an unclaimed name can be served as HTTP 200.
+- **Method:** `GET`, redirects followed for Minecraft/guns.lol and external
+  probe mode. Account mode uses `POST` JSON `{ "username": name }` and reads
+  `{ "taken": true|false }`; it never calls the claim endpoint. guns.lol also
+  reads its small semantic error page because an unclaimed name can be served
+  as HTTP 200.
 - **Headers:** realistic browser `User-Agent`, `Accept`, `Accept-Language`
-  (`BROWSER_HEADERS`) are used for ordinary pages. An optional
-  `DISCORD_PROBE_TOKEN` header is sent **only** to the authorized external
-  checker, never to Minecraft or guns.lol, and is never logged.
+  (`BROWSER_HEADERS`) are used for ordinary pages. Optional account/probe
+  credentials are sent **only** to their explicitly configured endpoint,
+  never to Minecraft or guns.lol, and are never logged.
 - **Timeouts:** `CHECK_TIMEOUT` defaults to 3 s per outbound request, while the
   three workers also share the remaining `RESPONSE_BUDGET_SECONDS` deadline
   (4.5 s default). The bot reserves `REACTION_TIMEOUT` (0.75 s default) for
@@ -327,7 +331,11 @@ Loaded once at startup from `.env` (see `.env.example`):
 | `DISCORD_TOKEN` | *(required)* | `bot.py` | from Developer Portal → Bot → Reset Token |
 | `TARGET_CHANNEL_ID` | all channels | Stage 1 | watch exactly one channel |
 | `LOG_CHANNEL_ID` | off | Stage 8 | 🎯 hits posted here |
-| `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `probe` |
+| `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `account` \| `probe` |
+| `DISCORD_ACCOUNT_API_URL` | Discord first-party eligibility route | checker | HTTP(S) account endpoint accepting `{ "username": name }` and returning a strict boolean |
+| `DISCORD_ACCOUNT_API_TOKEN` | blank | account checker only | optional authorized API/OAuth credential; never reuse `DISCORD_TOKEN` or a personal client token |
+| `DISCORD_ACCOUNT_API_TOKEN_HEADER` | `Authorization` | account checker only | optional credential header name |
+| `DISCORD_ACCOUNT_API_TOKEN_SCHEME` | `Bearer` | account checker only | optional credential prefix; blank sends raw |
 | `DISCORD_PROBE_URL` | blank | checker | authorized HTTP(S) `{username}` template required for probe mode; Discord homepage is never used |
 | `DISCORD_PROBE_TOKEN` | blank | Discord checker only | optional private auth token; never logged or sent to Minecraft/guns.lol |
 | `DISCORD_PROBE_TOKEN_HEADER` | `Authorization` | Discord checker only | optional token header name (for example `X-API-Key`) |
@@ -432,15 +440,17 @@ stream in the Render dashboard; the startup banner confirms config at a glance.
 - **Secrets**: bot tokens, external-checker tokens, and proxy credentials live
   only in ignored `.env` files or host secret variables. `.env.example` ships
   blank credential fields—no usable token, proxy, or API key is committed.
-- **Secret scope and logs**: `DISCORD_PROBE_TOKEN` is attached only to the
-  authorized checker request. Error details redact URL user-info and common
-  token/key query fragments before they reach logs or the checker CLI.
+- **Secret scope and logs**: account/probe credentials are attached only to
+  their explicitly configured checker request. Error details redact URL
+  user-info and common token/key query fragments before they reach logs or the
+  checker CLI; the bot token is never forwarded to the account API.
 - **Least privilege**: the invite URL requests exactly `Read Messages/View
   Channels`, `Send Messages`, `Add Reactions` — no admin, no manage-guild.
 - **Loop-safety**: bots *and* webhooks are ignored at Stage 1; the bot never
   reacts to its own output.
-- **Blast-radius**: platform checks are read-only GETs; the bot cannot modify
-  anything on the target platforms, and it never auto-registers names.
+- **Blast-radius**: Minecraft/guns.lol checks are read-only GETs and the
+  account check only asks for eligibility; it never calls the claim/update
+  endpoint or auto-registers names.
 - **Input hygiene**: a strict single-token charset regex strips anything that
   isn't a plausible username before it ever reaches the network.
 
@@ -471,10 +481,15 @@ you're done.
 
 ## 15. Known limitations (the honest bit)
 
-- **Discord has no public username-availability API.** `probe` mode does not
-  call Discord's homepage. It is available only when you supply an authorized
-  external checker with the documented `200 = taken`, `404 = free` contract;
-  otherwise Discord is honestly skipped.
+- **Discord's public bot API has no username search endpoint.** Opt-in
+  `account` mode uses the first-party account-flow eligibility route (or an
+  authorized compatible gateway), sends JSON, and requires a strict boolean
+  response. A malformed response or 401/403/429 remains unknown. `probe` mode
+  is still available for an authorized external 200/404 checker, while `off`
+  remains the safe default.
+- **The account route is not a claim operation.** The checker never sends a
+  username update and never stores or forwards a personal Discord client token;
+  confirm any candidate in Discord's own UI and follow current policies.
 - **guns.lol sits behind Cloudflare**; datacenter hosts (like Render) may see
   403 challenges. Status is reported as *blocked/unknown*, never faked. If you
   use a proxy, supply it privately through `PROXY_URL`; none is bundled.
@@ -500,6 +515,6 @@ you're done.
 | Live platform probe | `python checkers.py <name>` | endpoint truth from your machine | yes |
 | Production | Render logs + banner | correct config, gateway connected | yes |
 
-**49 tests in the suite; 47 run offline** — `python test_checkers.py &&
+**55 tests in the suite; 53 run offline** — `python test_checkers.py &&
 python test_bot.py` must print `OK` before every deploy. The two remaining
 live-network tests run only when `LIVE=1` is set.

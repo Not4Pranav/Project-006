@@ -14,7 +14,7 @@ share it and reactions run in parallel.
 | -------- | ------- |
 | 🕹️ | **Free on Minecraft** (Mojang has no profile with that name) |
 | 🔫 | **Free on guns.lol** (404/410, or its semantic “username not found” page) |
-| 🐈‍⬛ | Free on Discord *(only through your authorized external checker — see [the honest bit](#-the-honest-bit-limitations))* |
+| 🐈‍⬛ | Free on Discord *(only when the opt-in Account API confirms it — see [the honest bit](#-the-honest-bit-limitations))* |
 | ❌ | Not available on any checked platform |
 | ⚠️ | No free result can be confirmed because every check — or a required check — failed/was blocked |
 | ⏳ | User is checking too fast (cooldown) |
@@ -38,11 +38,11 @@ share it and reactions run in parallel.
             │        ├──► 🕹️ GET https://api.mojang.com/users/profiles/minecraft/<name>
             │        │        └─ fallback: https://api.minecraftservices.com/.../lookup/name/<name>
             │        ├──► 🔫 GET https://guns.lol/<name> (status + unclaimed-page marker)
-            │        └──► 🐈‍⬛ GET <discord probe URL>          (optional, off by default)
-            │                └─ each request: 3s cap by default, browser headers,
-            │                   optional proxy; all share one response deadline
+            │        └──► 🐈‍⬛ POST Discord Account API                  (optional, off by default)
+            │                └─ JSON {"username": name} → {"taken": true|false};
+            │                   optional authorized API credential; shared deadline
             ▼
-[ Status-code engine maps each HTTP response to free/taken/blocked ]
+[ Status engine maps each response/body to free/taken/blocked ]
             │
             ▼
 [ React to the message: every free platform's emoji, else ❌ / ⚠️ ]
@@ -58,7 +58,7 @@ is missing its `/` and isn't the real API). These are the verified ones:
 | -------- | :---: | ------------- | ---- | ----- | ----------------- |
 | Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback for blocked/transient primary calls) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 429 (Mojang rate limit) |
 | guns.lol | 🔫 | `https://guns.lol/<name>` | **404/410**, or a 200 page with the specific “username not found”/unclaimed title marker | **200** profile page without a challenge/unclaimed marker | 403 / 429 / 503, or a 200 Cloudflare challenge page |
-| Discord | 🐈‍⬛ | *no public API exists* — disabled unless you provide an authorized checker URL | custom checker: **404** | custom checker: **200** | 401 / 403 / 429, malformed endpoint, or network failure |
+| Discord | 🐈‍⬛ | Account API: `POST https://discord.com/api/v10/unique-username/username-attempt-unauthed` (or an authorized compatible endpoint) | JSON `{"taken": false}` | JSON `{"taken": true}` | 401 / 403 / 429, malformed response, or network failure |
 
 > **Target naming note:** At implementation time, [http://Gung.lol](http://Gung.lol)
 > is a parked domain rather than a profile-availability service. This project therefore
@@ -70,20 +70,33 @@ sending a request (Minecraft: `3–16` chars `A-Za-z0-9_`; guns.lol: `2–24` ch
 `A-Za-z0-9._-`; Discord: `2–32` chars lowercase `a-z0-9._`), so impossible names
 are reported as **invalid** without wasting a request.
 
-**About the Discord check (important):** Discord does **not** expose any public
-endpoint for checking whether an arbitrary username is available — that was
-confirmed at the very start of the original thread, and the
-`https://discord.com{username}` idea that appeared later in it is not a real
-API (it just serves Discord's homepage). Attempting to claim-check names
-requires a logged-in user session, which violates Discord's ToS. So this bot
-ships the Discord check **disabled** (`DISCORD_CHECK_MODE=off`). If you have
-an authorized checker service of your own, set `DISCORD_CHECK_MODE=probe` **and**
-provide an HTTP(S) `{username}` URL template in `DISCORD_PROBE_URL`; the bot
-otherwise skips Discord. Its explicit contract is **200 = taken**, **404 =
-free**, and **401/403/429 = unknown**. If that service needs credentials, put
-them only in your private `DISCORD_PROBE_TOKEN` environment value; the bot sends
-it only to that endpoint and never logs it. It never pretends
-`discord.com/<username>` is a valid checker.
+**About the Discord check (important):** Discord’s public bot API does not
+provide a username search endpoint. This project can nevertheless use the
+first-party account-flow eligibility route when you explicitly opt in with
+`DISCORD_CHECK_MODE=account`. It sends a JSON `POST` containing the candidate
+name and reads the documented boolean-style response (`taken: true` means
+TAKEN; `taken: false` means FREE). It never calls `discord.com/<username>`,
+never uses the bot token for this request, and never calls the username-claim
+endpoint.
+
+The account route is not a general-purpose public bot API and Discord may
+restrict it or return a challenge/rate limit. An `HTTP 200` without a strict
+boolean response is reported as unknown, not taken or free. The mode is off by
+default; enable it only for an authorized account/API integration and follow
+Discord’s current policies. The default URL is
+`https://discord.com/api/v10/unique-username/username-attempt-unauthed`; set
+`DISCORD_ACCOUNT_API_URL` only when your authorized gateway exposes the same
+`{"username": "..."}` → `{"taken": true|false}` contract. For an authorized
+account-scoped endpoint, configure its URL explicitly (for example
+`https://discord.com/api/v10/users/@me/pomelo-attempt`) and use only the
+credential type that endpoint documents; never paste a personal client token
+into this bot.
+
+The older `probe` mode remains available for an external GET checker. Its
+contract is **200 = taken**, **404 = free**, and **401/403/429 = unknown**. If
+that service needs credentials, put them only in the private
+`DISCORD_PROBE_TOKEN` environment value; the bot sends it only to that endpoint
+and never logs it.
 
 ## 📁 Project layout
 
@@ -93,8 +106,8 @@ it only to that endpoint and never logs it. It never pretends
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
 ├── blueprint.md      # technical deep-dive: how every stage works internally
 ├── CLOUD_SETUP.md    # detailed 24/7 cloud deployment guide (Render, Railway, Heroku, Fly.io, VPS)
-├── test_checkers.py  # 22 offline checker tests + 2 optional LIVE=1 network tests
-├── test_bot.py       # 25 end-to-end pipeline tests (simulated Discord messages)
+├── test_checkers.py  # 27 offline checker tests + 2 optional LIVE=1 network tests
+├── test_bot.py       # 26 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets
 ├── requirements.txt  # discord.py, aiohttp, python-dotenv
 ├── Procfile          # cloud deployment start command
@@ -147,9 +160,9 @@ You do not **need** a Discord token to verify the install. The checkers and the
 full offline test suite run without connecting to Discord at all:
 
 ```bash
-python checkers.py Notch                # live: Minecraft + guns.lol, Discord skipped
-python test_checkers.py                 # 22 offline tests (+ 2 LIVE tests skipped)
-python test_bot.py                      # 25 end-to-end pipeline tests
+python checkers.py Notch                # live: Minecraft + guns.lol, Discord skipped by default
+python test_checkers.py                 # 27 offline tests (+ 2 LIVE tests skipped)
+python test_bot.py                      # 26 end-to-end pipeline tests
 ```
 
 If those print `OK`, the Python environment is set up correctly; the only thing
@@ -280,8 +293,12 @@ That is all the bot needs. Everything below has a safe default.
 | `DISCORD_TOKEN` | ✅ | — | non-empty, no line break | Bot token from Phase 2, step 3. Missing/blank → bot exits at startup. |
 | `TARGET_CHANNEL_ID` | — | *(all channels)* | Snowflake ID (dev mode → *Copy Channel ID*) | Only react to messages in this channel. Blank = watch every channel the bot can see. |
 | `LOG_CHANNEL_ID` | — | off | Snowflake ID, or blank | When set, every name found free is posted to this channel. Blank = off. |
-| `DISCORD_CHECK_MODE` | — | `off` | `off` or `probe` (case-insensitive) | `off` = skip Discord. `probe` = query your own authorized checker URL. `probe` without a URL is treated as skipped. |
-| `DISCORD_PROBE_URL` | — | blank | HTTP(S) URL template containing `{username}` | The external checker used with `DISCORD_CHECK_MODE=probe`; *never* defaults to `discord.com`. |
+| `DISCORD_CHECK_MODE` | — | `off` | `off`, `account`, or `probe` (case-insensitive) | `off` = skip Discord. `account` = POST the account API JSON contract. `probe` = query your own authorized checker URL. |
+| `DISCORD_ACCOUNT_API_URL` | — | Discord first-party eligibility route | absolute HTTP(S) URL | Optional override for the account API; it must accept `{"username": "..."}` and return a strict boolean result. |
+| `DISCORD_ACCOUNT_API_TOKEN` | — | blank | any string, no CR/LF | Optional credential sent **only** to `DISCORD_ACCOUNT_API_URL`; never reuse `DISCORD_TOKEN` or a personal client token. |
+| `DISCORD_ACCOUNT_API_TOKEN_HEADER` | — | `Authorization` | valid HTTP header name | Header that carries the authorized account API credential. |
+| `DISCORD_ACCOUNT_API_TOKEN_SCHEME` | — | `Bearer` | string or blank | Prefix before the account API credential; blank sends it raw. |
+| `DISCORD_PROBE_URL` | — | blank | HTTP(S) URL template containing `{username}` | The external GET checker used with `DISCORD_CHECK_MODE=probe`; *never* defaults to `discord.com`. |
 | `DISCORD_PROBE_TOKEN` | — | blank | any string, no CR/LF | Optional credential sent **only** to `DISCORD_PROBE_URL`. Never logged or written to tracked files. |
 | `DISCORD_PROBE_TOKEN_HEADER` | — | `Authorization` | valid HTTP header name (e.g. `X-API-Key`) | Header that carries the probe token. |
 | `DISCORD_PROBE_TOKEN_SCHEME` | — | `Bearer` | string or blank | Prefix before the probe token; blank sends the raw token with no scheme. |
@@ -294,10 +311,25 @@ That is all the bot needs. Everything below has a safe default.
 | `RESULT_CACHE_TTL` | — | `300` | float ≥ `0` | Reuse a previous answer for a name for this many seconds (rate-limit shield). |
 
 **How validation works:** startup checks the *required* token, the
-`DISCORD_CHECK_MODE` value, `PROXY_URL`, the probe URL template, and any
-configured auth header **before** connecting to Discord. Malformed or non-finite
-numeric values fall back to a safe default rather than crashing mid-run.
-Credential-containing values are redacted from log output.
+`DISCORD_CHECK_MODE` value, `PROXY_URL`, the account API URL, the probe URL
+template, and any configured auth header **before** connecting to Discord.
+Malformed or non-finite numeric values fall back to a safe default rather than
+crashing mid-run. Credential-containing values are redacted from log output.
+
+### Example: enable the Discord Account API check
+
+```dotenv
+DISCORD_CHECK_MODE=account
+# Blank uses Discord's first-party account eligibility route.
+DISCORD_ACCOUNT_API_URL=
+# Leave blank unless an authorized gateway requires an API/OAuth credential.
+DISCORD_ACCOUNT_API_TOKEN=keep-me-private
+DISCORD_ACCOUNT_API_TOKEN_HEADER=Authorization
+DISCORD_ACCOUNT_API_TOKEN_SCHEME=Bearer
+```
+
+The account request is a JSON `POST` with `{"username": "candidate"}`. A strict
+`{"taken": false}` response adds 🐈‍⬛; `{"taken": true}` does not.
 
 ### Example: enable the optional Discord probe
 
@@ -357,8 +389,8 @@ The tests need **no Discord token and make no network calls** (except the two
 live tests that are skipped by default):
 
 ```bash
-python test_checkers.py      # 22 offline checker tests (+ 2 live tests skipped)
-python test_bot.py           # 25 end-to-end pipeline tests
+python test_checkers.py      # 27 offline checker tests (+ 2 live tests skipped)
+python test_bot.py           # 26 end-to-end pipeline tests
 ```
 
 Both should end with `OK`. The two live tests run only when you ask for them:
@@ -472,9 +504,9 @@ Availability report for 'Notch':
 **Test suite (`python test_checkers.py && python test_bot.py`):**
 
 ```
-Ran 24 tests in 0.03s
+Ran 29 tests in 0.03s
 OK (skipped=2)      <- the 2 live tests run only with LIVE=1
-Ran 25 tests in 0.14s
+Ran 26 tests in 0.14s
 OK
 ```
 
@@ -495,6 +527,11 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
   startup. SOCKS needs `pip install aiohttp-socks` plus a small code change.
 - **Hits logging** — set `LOG_CHANNEL_ID` and every name found free is posted
   to that channel with the finder's mention.
+- **Discord Account API** — set `DISCORD_CHECK_MODE=account` to POST the
+  candidate to the account eligibility route. The adapter reads strict JSON
+  `taken`/`available` booleans, treats malformed responses as unknown, and
+  never sends `DISCORD_TOKEN`. Keep the mode off unless the endpoint is
+  authorized for your use.
 - **Tuning** — `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
   `REACTION_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`, and
   `RESULT_CACHE_TTL` are all in `.env`. The response budget is capped below
@@ -510,9 +547,13 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 - **guns.lol sits behind Cloudflare** and may answer `403` to datacenter IPs —
   the bot reports that as *unknown* rather than lying to you. If you choose to
   use a proxy, supply it privately through `PROXY_URL`; no proxy is bundled.
-- **Discord availability is not publicly checkable** (see matrix above). The
-  `🐈‍⬛` reaction only appears when you explicitly configure an authorized
-  external `probe` URL; its semantics are your checker's responsibility.
+- **Discord availability is not exposed through the public bot API.** The
+  opt-in `account` mode uses Discord’s account-flow eligibility endpoint (or an
+  explicitly configured compatible gateway), reads only its JSON boolean, and
+  reports 401/403/429 or malformed responses as unknown. It never uses a
+  personal client token, sends the bot token, or calls the claim endpoint.
+- **The account endpoint may be restricted or change.** Keep the result as a
+  hint and confirm availability in Discord’s own UI before attempting a rename.
 - This bot **notifies** — it never auto-registers accounts, and using it to
   mass-harvest names would violate the platforms' terms. Keep it friendly.
 
@@ -525,15 +566,17 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 | Always ⚠️ | Outbound HTTPS blocked (hosting firewall) — test with `python checkers.py Notch`, try a proxy |
 | guns.lol always *blocked* | Cloudflare wall — use a residential/rotating `PROXY_URL` |
 | Minecraft suddenly *blocked* | Mojang rate limit — raise `RESULT_CACHE_TTL` / lower `USER_MAX_CHECKS` (the fallback endpoint already retries once automatically) |
+| Account API always *blocked* or *unknown* | The first-party route is restricted on some hosts; keep the result unknown, verify the endpoint/policy, or use an authorized compatible gateway. Never substitute a personal client token. |
 | `Improper token has been passed` | Re-copy the token; it must be alone on the `DISCORD_TOKEN=` line |
 | Tests print `PyNaCl is not installed` | Harmless — that's Discord *voice* support, which this bot doesn't use |
 
 ## 🧪 Verifying your install (summary)
 
 ```bash
-python test_checkers.py      # 22 offline tests (+ 2 skipped live tests) — should print OK
-python test_bot.py           # 25 pipeline tests — should print OK
-python checkers.py Notch     # live endpoints from your machine
+python test_checkers.py      # 27 offline tests (+ 2 skipped live tests) — should print OK
+python test_bot.py           # 26 pipeline tests — should print OK
+python checkers.py Notch           # live endpoints; Discord is skipped by default
+python checkers.py vortex --mode account  # opt-in Account API check
 LIVE=1 python test_checkers.py   # enables the 2 real-network tests
 python bot.py                # startup banner, then post names in Discord
 ```

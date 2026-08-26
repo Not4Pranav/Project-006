@@ -22,6 +22,7 @@ from checkers import (
     INVALID,
     SKIPPED,
     TAKEN,
+    interpret_discord_account_api,
     interpret_discord_probe,
     interpret_gunslol,
     interpret_minecraft,
@@ -38,6 +39,19 @@ def _session_with_status(status: int, body: str = ""):
     ctx.__aexit__ = AsyncMock(return_value=False)
     session = MagicMock()
     session.get = MagicMock(return_value=ctx)
+    return session
+
+
+def _session_with_json(status: int, payload):
+    """Fake aiohttp session whose POST yields a JSON account-api response."""
+    response = MagicMock()
+    response.status = status
+    response.json = AsyncMock(return_value=payload)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=response)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post = MagicMock(return_value=ctx)
     return session
 
 
@@ -78,6 +92,18 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_discord_probe(403), BLOCKED)
         self.assertEqual(interpret_discord_probe(429), BLOCKED)
 
+    def test_discord_account_api(self):
+        self.assertEqual(interpret_discord_account_api(200, {"taken": True}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(200, {"taken": False}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(200, {"available": True}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(200, {"available": False}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 2}}}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 3}}}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(403, {"taken": False}), BLOCKED)
+        self.assertEqual(interpret_discord_account_api(200, {}), ERROR)
+
 
 class TestValidators(unittest.TestCase):
     def test_message_pattern(self):
@@ -111,6 +137,10 @@ class TestValidators(unittest.TestCase):
             "https://checker.example/lookup/{username}"))
         self.assertIn("placeholder", checkers.validate_probe_url_template(
             "https://checker.example/lookup") or "")
+        self.assertIsNone(checkers.validate_account_api_url(
+            "https://discord.example/api/account"))
+        self.assertIn("JSON body", checkers.validate_account_api_url(
+            "https://discord.example/{username}") or "")
         self.assertTrue(checkers.is_valid_header_name("X-API-Key"))
         self.assertFalse(checkers.is_valid_header_name("Bad\nHeader"))
 
@@ -172,6 +202,47 @@ class TestCheckers(unittest.TestCase):
             probe_headers=headers))
         self.assertEqual(r.status, AVAILABLE)
         self.assertEqual(session.get.call_args.kwargs["headers"], headers)
+
+    def test_discord_account_api_posts_username_and_reads_taken(self):
+        session = _session_with_json(200, {"taken": False})
+        headers = {"Authorization": "Bearer oauth-token"}
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="account",
+            account_api_url="https://discord.example/api/account/username",
+            account_api_headers=headers))
+        self.assertEqual(r.status, AVAILABLE)
+        session.post.assert_called_once_with(
+            "https://discord.example/api/account/username",
+            json={"username": "vortex"},
+            proxy=None,
+            headers=headers,
+        )
+
+    def test_discord_account_api_uses_first_party_default(self):
+        session = _session_with_json(200, {"taken": True})
+        r = self.run_async(checkers.check_discord_account_api(session, "vortex"))
+        self.assertEqual(r.status, TAKEN)
+        self.assertEqual(
+            session.post.call_args.args[0],
+            checkers.DEFAULT_DISCORD_ACCOUNT_API_URL,
+        )
+
+    def test_discord_account_api_rejects_bad_url_without_request(self):
+        session = _session_with_json(200, {"taken": False})
+        r = self.run_async(checkers.check_discord_account_api(
+            session, "vortex", api_url="file:///tmp/account"))
+        self.assertEqual(r.status, ERROR)
+        session.post.assert_not_called()
+
+        r = self.run_async(checkers.check_discord_account_api(
+            session, "vortex", api_url="https://checker.example/{username}"))
+        self.assertEqual(r.status, ERROR)
+        session.post.assert_not_called()
+
+    def test_discord_account_api_malformed_success_is_unknown(self):
+        r = self.run_async(checkers.check_discord_account_api(
+            _session_with_json(200, {"message": "ok"}), "vortex"))
+        self.assertEqual(r.status, ERROR)
 
     def test_discord_probe_rejects_bad_template_without_request(self):
         session = _session_with_status(404)

@@ -14,14 +14,17 @@ The bot calls ``run_all_checks`` with one shared deadline so Minecraft,
 guns.lol, and the optional Discord probe run concurrently rather than adding
 their latencies together.
 
-Important: Discord does not offer a public API that can truthfully check an
-arbitrary username's availability. Its checker is therefore off by default;
-``probe`` requires an explicit, authorized external checker URL and is never
+Important: Discord's public bot API does not expose username search. The
+optional ``account`` mode uses the first-party account-flow eligibility route
+(or an authorized compatible gateway) and is still off by default. Its JSON
+answer is parsed strictly; malformed or blocked responses remain unknown.
+``probe`` remains available for an explicit external checker URL and is never
 silently pointed at Discord's homepage.
 
 Run a one-off report without starting Discord:
 
     python checkers.py Notch
+    python checkers.py vortex --mode account
     python checkers.py zxqw99182vlt --mode probe \
         --discord-probe-url 'https://checker.example/{username}'
 """
@@ -184,6 +187,66 @@ def interpret_discord_probe(status: int) -> str:
     return ERROR
 
 
+def interpret_discord_account_api(
+    status: int,
+    payload: object | None,
+) -> str:
+    """Interpret a JSON response from Discord's account username check.
+
+    The account eligibility endpoint reports its answer in JSON (normally as
+    ``{"taken": true|false}``) while the HTTP status describes transport or
+    authorization failures. A successful status without a strict boolean is
+    deliberately treated as ERROR; guessing from a missing/malformed field can
+    turn an outage into a false availability result.
+
+    A few authorized account-api gateways expose the equivalent ``available``
+    field or wrap the result in ``data``. Supporting those shapes keeps the
+    adapter useful without weakening the boolean-only contract. The optional
+    numeric ``data.check.status`` shape is the compatibility format used by
+    some Discord username account services: 2 means available, 3–6 means
+    taken, 0 invalid, and 1 unknown.
+    """
+
+    if status in (401, 403, 429):
+        return BLOCKED
+    if status == 400:
+        return INVALID
+    if status != 200 or not isinstance(payload, Mapping):
+        return ERROR
+
+    for key in ("taken", "available"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            # ``available`` has the opposite meaning to ``taken``.
+            return (TAKEN if value else AVAILABLE) if key == "taken" else (
+                AVAILABLE if value else TAKEN)
+
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        for key in ("taken", "available"):
+            value = data.get(key)
+            if isinstance(value, bool):
+                return (TAKEN if value else AVAILABLE) if key == "taken" else (
+                    AVAILABLE if value else TAKEN)
+
+        check = data.get("check")
+        if isinstance(check, Mapping):
+            account_status = check.get("status")
+            if account_status == 0:
+                return INVALID
+            if account_status == 2:
+                return AVAILABLE
+            if account_status in (3, 4, 5, 6):
+                return TAKEN
+
+    return ERROR
+
+
+# Backwards-friendly short name for callers that do not need to distinguish
+# the account API transport from the Discord platform it serves.
+interpret_discord_account = interpret_discord_account_api
+
+
 # ---------------------------------------------------------------------------
 # Low-level fetch helpers
 # ---------------------------------------------------------------------------
@@ -212,6 +275,38 @@ async def _fetch_status(
 
     async with session.get(url, proxy=proxy, headers=headers) as response:
         return response.status
+
+
+async def _fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: Mapping[str, object],
+    proxy: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> tuple[int, object | None]:
+    """POST JSON and return the status plus a decoded response, if any.
+
+    Discord's account username eligibility endpoint returns a JSON object such
+    as ``{"taken": false}`` rather than using 404 for an available name. Keep
+    JSON decoding here so the account checker can reject an HTML/error response
+    without guessing at its meaning.
+    """
+
+    async with session.post(
+        url, json=dict(payload), proxy=proxy, headers=headers,
+    ) as response:
+        try:
+            # ``content_type=None`` accepts JSON returned with a vendor or
+            # missing Content-Type. The fallback keeps small test doubles and
+            # compatible aiohttp-like clients that do not accept that keyword
+            # usable as well.
+            try:
+                body = await response.json(content_type=None)
+            except TypeError:
+                body = await response.json()
+        except (TypeError, ValueError, aiohttp.ContentTypeError):
+            body = None
+        return response.status, body
 
 
 async def _fetch_page(
@@ -255,6 +350,19 @@ def validate_http_url(url: str, label: str = "URL") -> str | None:
     if any(char.isspace() for char in url):
         return f"{label} must not contain whitespace"
     return None
+
+
+def validate_account_api_url(url: str) -> str | None:
+    """Validate the endpoint used by the JSON account-eligibility request."""
+
+    if not url:
+        return "DISCORD_ACCOUNT_API_URL is blank"
+    if "{" in url or "}" in url:
+        return (
+            "DISCORD_ACCOUNT_API_URL must not contain a username placeholder; "
+            "the username is sent in the JSON body"
+        )
+    return validate_http_url(url, "DISCORD_ACCOUNT_API_URL")
 
 
 def validate_probe_url_template(template: str) -> str | None:
@@ -310,6 +418,17 @@ MINECRAFT_ENDPOINTS: Sequence[str] = (
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{username}",
 )
 
+# This is Discord's first-party username eligibility route used by the account
+# registration flow. It is intentionally opt-in: it is not part of the public
+# bot API, can be restricted by Discord, and must not be confused with a bot
+# account token or a request to discord.com/<username>.
+DEFAULT_DISCORD_ACCOUNT_API_URL = (
+    "https://discord.com/api/v10/unique-username/"
+    "username-attempt-unauthed"
+)
+# A descriptive alias for integrations that call this an account endpoint.
+DISCORD_ACCOUNT_API_URL = DEFAULT_DISCORD_ACCOUNT_API_URL
+
 
 async def check_minecraft(session, username: str, proxy=None) -> Result:
     """Check Minecraft/Mojang availability (emoji 🕹️)."""
@@ -361,6 +480,55 @@ async def check_gunslol(session, username: str, proxy=None) -> Result:
         return _request_error("guns.lol", GUNSLOL_EMOJI, exc)
 
 
+async def check_discord_account_api(
+    session,
+    username: str,
+    proxy=None,
+    api_url: str | None = None,
+    api_headers: Mapping[str, str] | None = None,
+) -> Result:
+    """Check a username through an explicitly enabled account API.
+
+    Discord's account eligibility route accepts ``POST`` JSON of the form
+    ``{"username": "name"}`` and returns ``{"taken": true|false}``. The
+    request is an eligibility check only; this function never calls the
+    username-claim endpoint and never sends the bot token. ``api_url`` defaults
+    to Discord's first-party account-flow route, but remains overrideable for
+    an authorized gateway that exposes the same JSON contract.
+    """
+
+    if not DISCORD_PATTERN.fullmatch(username):
+        return Result(
+            "Discord", DISCORD_EMOJI, INVALID,
+            "Discord usernames are 2-32 chars, lowercase a-z 0-9 . _",
+        )
+
+    url = api_url or DISCORD_ACCOUNT_API_URL
+    url_error = validate_account_api_url(url)
+    if url_error:
+        return Result("Discord", DISCORD_EMOJI, ERROR, url_error)
+
+    try:
+        status, payload = await _fetch_json(
+            session, url, {"username": username}, proxy, api_headers)
+        outcome = interpret_discord_account_api(status, payload)
+        detail = f"HTTP {status}"
+        if status == 200 and outcome == ERROR:
+            detail += " (invalid account API response)"
+        elif status == 200 and isinstance(payload, Mapping):
+            if isinstance(payload.get("taken"), bool):
+                detail += f" (taken={str(payload['taken']).lower()})"
+            elif isinstance(payload.get("available"), bool):
+                detail += f" (available={str(payload['available']).lower()})"
+        return Result("Discord", DISCORD_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Discord", DISCORD_EMOJI, exc)
+
+
+# Short alias for integrations that refer to the adapter as the account check.
+check_discord_account = check_discord_account_api
+
+
 async def check_discord(
     session,
     username: str,
@@ -368,26 +536,31 @@ async def check_discord(
     mode: str = "off",
     probe_url: str | None = None,
     probe_headers: Mapping[str, str] | None = None,
+    account_api_url: str | None = None,
+    account_api_headers: Mapping[str, str] | None = None,
 ) -> Result:
-    """Check Discord in explicitly unofficial probe mode (emoji 🐈‍⬛).
+    """Check Discord in off, account-API, or external probe mode.
 
-    Discord provides no public endpoint for arbitrary username availability;
-    ``off`` is the honest default. Probe mode is only useful when the deployer
-    supplies an explicit, authorized checker URL of their own. The old idea of
-    requesting ``discord.com/<username>`` is not a username-availability API,
-    so this module never uses it as a default. The external endpoint contract
-    is 200 = taken and 404 = available; 401/403/429 are unknown.
+    ``off`` is the safe default. ``account`` (also accepted as
+    ``account_api``) sends a JSON eligibility request to the configured
+    account API and interprets its strict boolean response. ``probe`` remains
+    available for an external GET checker using the 200/404 contract. Neither
+    mode ever treats ``discord.com/<username>`` as an availability endpoint.
     """
 
+    mode = (mode or "off").strip().lower()
     if mode == "off":
         return Result(
             "Discord", DISCORD_EMOJI, SKIPPED,
             "check disabled (DISCORD_CHECK_MODE=off)",
         )
+    if mode in ("account", "account_api"):
+        return await check_discord_account_api(
+            session, username, proxy, account_api_url, account_api_headers)
     if mode != "probe":
         return Result(
             "Discord", DISCORD_EMOJI, ERROR,
-            "DISCORD_CHECK_MODE must be off or probe",
+            "DISCORD_CHECK_MODE must be off, account, or probe",
         )
     if not probe_url:
         return Result(
@@ -456,6 +629,8 @@ async def run_all_checks(
     discord_probe_url: str | None = None,
     discord_probe_headers: Mapping[str, str] | None = None,
     timeout: float | None = None,
+    discord_account_api_url: str | None = None,
+    discord_account_api_headers: Mapping[str, str] | None = None,
 ) -> list[Result]:
     """Fan out every platform check in parallel.
 
@@ -471,7 +646,8 @@ async def run_all_checks(
         _run_bounded(
             check_discord(
                 session, username, proxy, discord_mode, discord_probe_url,
-                discord_probe_headers),
+                discord_probe_headers, discord_account_api_url,
+                discord_account_api_headers),
             fallbacks[2], timeout,
         ),
     )
@@ -479,17 +655,21 @@ async def run_all_checks(
 
 
 # ---------------------------------------------------------------------------
-# CLI self-test: python checkers.py <username> [--mode off|probe] [--proxy URL]
+# CLI self-test: python checkers.py <username> [--mode off|account|probe]
 # ---------------------------------------------------------------------------
 
 async def _cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Test the platform checkers without running the bot.")
     parser.add_argument("username", help="name to check, e.g. Notch")
-    parser.add_argument("--mode", choices=("off", "probe"), default="off",
-                        help="Discord check mode (default: off)")
+    parser.add_argument(
+        "--mode", choices=("off", "account", "probe"), default="off",
+        help="Discord check mode (default: off)")
     parser.add_argument("--discord-probe-url", default=None,
                         help="explicit authorized checker URL template for probe mode")
+    parser.add_argument(
+        "--discord-account-api-url", default=None,
+        help="optional account API URL (default: Discord username eligibility route)")
     parser.add_argument("--proxy", default=None,
                         help="optional http(s) proxy URL")
     parser.add_argument("--timeout", type=float, default=8.0,
@@ -504,6 +684,7 @@ async def _cli(argv: list[str] | None = None) -> int:
             session, ns.username, ns.proxy,
             discord_mode=ns.mode,
             discord_probe_url=ns.discord_probe_url,
+            discord_account_api_url=ns.discord_account_api_url,
             timeout=deadline,
         )
 

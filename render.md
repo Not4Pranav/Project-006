@@ -271,8 +271,8 @@ intent ON → bot invited to your server → channel IDs copied.
 5. **Optional tuning** (safe defaults exist — skip unless you know why):
    `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`, `REACTION_TIMEOUT`,
    `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`, `RESULT_CACHE_TTL`,
-   `DISCORD_CHECK_MODE`, `DISCORD_PROBE_*`, `PROXY_URL`.
-   Full descriptions live in [`.env.example`](.env.example).
+   `DISCORD_CHECK_MODE`, `DISCORD_ACCOUNT_API_*`, `DISCORD_PROBE_*`,
+   `PROXY_URL`. Full descriptions live in [`.env.example`](.env.example).
 6. Click **Save Changes**. Render redeploys automatically.
 7. (Optional) Group related vars under **Environment Groups** for reuse across
    services.
@@ -329,9 +329,10 @@ listed in the *Uses* column.
 | 4 | **Render CLI token** | ❌ Optional | Local `render` CLI | `render login` → browser → **Authorize CLI** | Expires periodically; re-run `render login` |
 | 5 | **GitHub token (PAT/SSH)** | ❌ Optional | Pushing to a *private* repo from your machine, or scripted deploys | GitHub → Settings → Developer settings → **Personal access tokens** → generate | You choose expiry (30/90 days); rotate manually |
 | 6 | **Deploy Hook URL** | ❌ Optional | Trigger a redeploy from CI/curl | Service → Settings → **Deploy Hook** → **Generate** | Contains an embedded secret; anyone with URL can redeploy |
-| 7 | **Discord probe token** (`DISCORD_PROBE_TOKEN`) | ❌ Optional | Only if you run your own +2 username checker | You create it in *your own* checker service (or your proxy's API key) | Up to you |
-| 8 | **Proxy credentials** (`PROXY_URL`) | ❌ Optional | Route outbound checks via a residential proxy | Your proxy provider's dashboard (e.g. Bright Data, Oxylabs, or self-hosted) | Provider-specific |
-| 9 | Render payment method | ❌ Optional | Only if you run a paid worker instance (recommended) | Render Dashboard → **Billing** → add card | Card details are never a token; stored by Render |
+| 7 | **Account API credential** (`DISCORD_ACCOUNT_API_TOKEN`) | ❌ Optional | Only in `DISCORD_CHECK_MODE=account` when the authorized endpoint requires it | Your authorized account API/OAuth provider; never use a personal Discord client token | Provider-specific |
+| 8 | **Discord probe token** (`DISCORD_PROBE_TOKEN`) | ❌ Optional | Only if you run your own +2 username checker | You create it in *your own* checker service (or your proxy's API key) | Up to you |
+| 9 | **Proxy credentials** (`PROXY_URL`) | ❌ Optional | Route outbound checks via a residential proxy | Your proxy provider's dashboard (e.g. Bright Data, Oxylabs, or self-hosted) | Provider-specific |
+| 10 | Render payment method | ❌ Optional | Only if you run a paid worker instance (recommended) | Render Dashboard → **Billing** → add card | Card details are never a token; stored by Render |
 
 ### 10.1 Discord bot token — full acquisition walkthrough
 
@@ -346,10 +347,12 @@ discord.com/developers/applications
   → Privileged Gateway Intents → MESSAGE CONTENT INTENT → ON
 ```
 
-- **There is no "Discord username-availability token."** Discord has no public
-  API for that, which is why the bot's Discord check is `off` by default and
-  why `DISCORD_CHECK_MODE=probe` needs **your own** checker URL + token.
-  Do not buy or search for such a token — it doesn't exist.
+- **There is no Discord bot permission that unlocks username availability.**
+  The bot's check is `off` by default. `account` mode uses the first-party
+  account-flow eligibility route (or a compatible authorized gateway) and may
+  work without a credential; if your authorized provider requires one, store
+  it as `DISCORD_ACCOUNT_API_TOKEN`. Never use or request a personal Discord
+  client token.
 - **Rotating:** Portal → Bot → Reset Token → paste new token into Render's
   Environment tab → Save Changes. The old token dies immediately.
 
@@ -485,7 +488,9 @@ auto-deploys make this optional.
 - ❌ No AWS / GCP / Azure keys
 - ❌ No Render token for the standard dashboard deploy
 - ❌ No Minecraft or guns.lol API key (public endpoints)
-- ❌ No "Discord username API" token (doesn't exist — see 10.1)
+- ❌ No separate Discord bot permission or token is required for the default
+  Account API route; only add `DISCORD_ACCOUNT_API_TOKEN` for an authorized
+  gateway that explicitly requires it
 - ❌ No database credentials, no Redis password
 - ❌ No SSH keys on Render (and free instances don't support SSH anyway)
 
