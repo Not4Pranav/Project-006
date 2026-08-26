@@ -1,5 +1,9 @@
 # ☁️ Multi-Sniper — Cloud Setup Guide
 
+> **Canonical ordered setup:** [SETUP.md](SETUP.md) covers prerequisites, Discord
+> configuration, local validation, DNS Robot Chromium installation, deployment,
+> verification, updates, and troubleshooting. This file adds host-specific notes.
+>
 > How to run the Multi-Sniper Discord bot **24/7 on a cloud host**, step by
 > step: Render, Railway, Heroku, Fly.io, or your own VPS. This is the
 > deployment companion to the [README](README.md) (quick start + local setup)
@@ -38,11 +42,11 @@ Read this once — it drives every decision below.
 | Requirement | What it means for you |
 | ----------- | --------------------- |
 | **Long-running process** | The bot must stay alive constantly. Anything that *sleeps* on inactivity kills it. |
-| **No web server, no HTTP port** | The bot never listens. It only makes **outbound** HTTPS calls (Discord gateway/API, Mojang, guns.lol). Do **not** pick a plan type that requires an HTTP listener (e.g. Render "Web Service" with a health-check path — it will fail because nothing answers). |
-| **Outbound HTTPS (port 443)** | Both the Discord WebSocket and the platform checks use TLS. No inbound firewall rules are needed at all; just don't block outbound 443. |
+| **No web server, no HTTP port** | The bot never listens. It only makes **outbound** HTTPS calls (Discord gateway/API, Mojang, guns.lol, and optionally DNS Robot through Chromium). Do **not** pick a plan type that requires an HTTP listener (e.g. Render "Web Service" with a health-check path — it will fail because nothing answers). |
+| **Outbound HTTPS (port 443)** | Both the Discord WebSocket and the platform checks use TLS. DNS Robot mode also needs browser egress to its page and the page's public resources. No inbound firewall rules are needed; just don't block outbound 443. |
 | **Environment variables** | All configuration comes from env vars (loaded from `.env` locally, from the host's env/secret manager in the cloud). There is no config file to edit on the server. |
-| **Python 3.9+** | The code uses modern type hints. All hosts below support it. |
-| **Modest RAM** | Peak usage is a few tens of MB: one aiohttp session, one Discord gateway connection, small in-memory cooldown/cache dictionaries. Every free/cheap tier has enough. |
+| **Python 3.10+** | The code uses modern type hints. All hosts below support it. |
+| **Modest RAM** | Normal HTTP mode uses a few tens of MB; DNS Robot also keeps a headless Chromium process, so choose a host with enough memory for a browser (512 MB is preferred; 256 MB may be tight under load). |
 | **State is RAM-only** | Cooldown buckets and the result cache live in memory. A restart clears them (by design — they are rate-limit protection, not data). No database, no volume, no persistent disk is required. |
 | **Startup requires `DISCORD_TOKEN`** | If it's missing or blank the bot prints `❌ DISCORD_TOKEN missing…` and exits. The host will keep restarting it until you set it, so set env vars **before** the first deploy. |
 
@@ -72,17 +76,19 @@ works locally *before* you touch a host:
 
 ```bash
 # 1. In the repo root, create + activate a venv and install deps
-python -m venv venv
-source venv/bin/activate            # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
+# Only when DISCORD_CHECK_MODE=dnsrobot (or you plan to enable it):
+# python -m playwright install --with-deps chromium
 
 # 2. Copy the template and put in your real DISCORD_TOKEN (and any optional vars)
 cp .env.example .env
 #    edit .env now — see README Phase 2 for how to get the token
 
 # 3. The full offline test suite must print OK
-python test_checkers.py             # 22 offline tests (+ 2 live, skipped)
-python test_bot.py                  # 25 pipeline tests
+python test_checkers.py             # 34 offline tests (+ 2 live, skipped)
+python test_bot.py                  # 30 pipeline tests
 
 # 4. Live smoke test of the real endpoints from your machine
 python checkers.py Notch            # Minecraft + guns.lol, Discord skipped
@@ -127,18 +133,23 @@ local `.env` file. The full annotated list is in [`.env.example`](.env.example)
 | -------- | ------- | --------- |
 | `TARGET_CHANNEL_ID` | watch every channel | the channel ID to watch (recommended) |
 | `LOG_CHANNEL_ID` | no hit logging | a private channel ID for "name found free" posts |
-| `DISCORD_CHECK_MODE` | `off` (safe default) | `probe` only if you run an authorized checker |
+| `DISCORD_CHECK_MODE` | `off` (safe default) | `dnsrobot` to load DNS Robot in isolated Chromium, `account`/`account_api` for the opt-in Account API, or `probe` for an authorized checker |
+| `DISCORD_ACCOUNT_API_URL` | Discord first-party eligibility route | optional HTTPS override with the same JSON contract |
+| `DISCORD_ACCOUNT_API_TOKEN` | no credential | optional authorized API/OAuth credential; never a personal client token |
 | `PROXY_URL` | direct connection | `http://user:pass@host:port` if you need one |
 
 **Optional tuning** (`CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
 `REACTION_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`,
 `RESULT_CACHE_TTL`) — safe defaults are built in; skip them unless you know why
-you're changing them. `DISCORD_PROBE_*` only matters if you enable `probe`.
+you're changing them. `dnsrobot` needs no extra credential or URL; it loads
+DNS Robot's browser page in Chromium. Install Chromium during the build when
+this mode is enabled. `DISCORD_ACCOUNT_API_*` matters only in
+`account` mode; `DISCORD_PROBE_*` only matters if you enable `probe`.
 
 **Host-specific notes:**
 
 - Values are stored as plain strings — don't wrap them in quotes.
-- `DISCORD_TOKEN` and any proxy/probe credentials should go in the host's
+- `DISCORD_TOKEN` and any account/probe/proxy credentials should go in the host's
   **secret** store where available (Render "Secret Files" are for files, not
   vars — just use the normal Environment panel for all of these; Railway and
   Heroku treat all vars as secrets by default).
@@ -168,13 +179,16 @@ how to acquire it), and §2/§15 for free alternatives.
    - **Name**: `multi-sniper`
    - **Region**: closest to your Discord server (e.g. `Oregon (US West)` or `Frankfurt (EU Central)`)
    - **Runtime**: `Python 3` (latest stable is fine)
-   - **Build Command**: `pip install -r requirements.txt`
+   - **Build Command**: `python -m pip install -r requirements.txt` (add `&& python -m playwright install --with-deps chromium` when using `dnsrobot`)
    - **Start Command**: `python bot.py`
      (The repo's `Procfile` already declares `worker: python bot.py`, so you
      can also leave this field on its Procfile default — Render reads it.)
    - **Instance Type**: `Starter` (paid, ~$7/mo per service) — Background
      Workers have **no free instance type** as of Aug 2026
-5. Click **Create Background Worker**.
+5. Click **Create Background Worker**. If the creation form offers environment
+   variables, add them before submitting; otherwise open the service's
+   **Environment** tab immediately after creation. The first automatic build may
+   exit safely because the bot cannot start without `DISCORD_TOKEN`.
 
 ### 5.2 Set environment variables
 
@@ -231,11 +245,11 @@ how to acquire it), and §2/§15 for free alternatives.
 
 ## 6. Railway
 
-Git-connected deploys with a clean dashboard. No free tier until recently —
-as of writing there is a $0 **Free** plan with a small monthly usage
-allowance, a **Trial** with a one-time $5 credit, and a $5/mo **Hobby** plan
-(1 vCPU / 0.5 GB is far more than this bot needs). Verify at
-[railway.com/pricing](https://railway.app/pricing).
+Git-connected deploys with a clean dashboard. Railway's plans, trial credits,
+usage allowances, and service limits change, so check the current
+[Railway pricing](https://railway.app/pricing) before choosing a plan. Select a
+long-running service plan with enough memory for Chromium when using `dnsrobot`;
+otherwise the normal HTTP-only worker has modest resource needs.
 
 ### 6.1 Create the service
 
@@ -250,6 +264,10 @@ allowance, a **Trial** with a one-time $5 credit, and a $5/mo **Hobby** plan
    - **Start Command**: `python bot.py`
      (Railway's Nixpacks builder can read a `Procfile`, but setting the start
      command explicitly is the reliable path.)
+   - **Build Command**: use the detected Python install, or explicitly run
+     `python -m pip install -r requirements.txt`. For `dnsrobot`, append
+     `&& python -m playwright install --with-deps chromium`; select a build
+     image/plan that permits the browser's Linux dependencies.
 2. Service → **Variables** → add:
    - `DISCORD_TOKEN` → your bot token
    - `TARGET_CHANNEL_ID` → channel ID (optional)
@@ -275,9 +293,10 @@ allowance, a **Trial** with a one-time $5 credit, and a $5/mo **Hobby** plan
 
 ## 7. Heroku (worker dyno)
 
-Heroku's free tier was retired in **November 2022** — everything below costs
-money (Eco $5/mo flat with a 1000-hour/month dyno pool, or Basic $7/mo). The
-repo is already Heroku-shaped: `Procfile` says `worker: python bot.py`.
+Heroku pricing and dyno plans change; verify the current cost and available
+worker types in the [Heroku pricing documentation](https://www.heroku.com/pricing).
+The repo is already Heroku-shaped: `Procfile` says `worker: python bot.py`.
+Choose a worker plan that can stay running; do not use a sleeping web dyno.
 
 ### 7.1 Prepare
 
@@ -295,10 +314,31 @@ heroku buildpacks:set heroku/python
 
 ### 7.2 Set config vars
 
+Use Heroku's **Settings → Config Vars** UI for `DISCORD_TOKEN` and other
+secrets when possible. If you must use the CLI, read the token interactively so
+it does not appear in shell history:
+
 ```bash
-heroku config:set DISCORD_TOKEN=your-token-here
+read -r -s DISCORD_TOKEN
+printf '\n'
+heroku config:set DISCORD_TOKEN="$DISCORD_TOKEN"
+unset DISCORD_TOKEN
 heroku config:set TARGET_CHANNEL_ID=123456789012345678     # optional
-# ... plus any optional vars from §4
+# ... set non-secret optional vars from §4
+```
+
+The standard Heroku Python buildpack installs the Python package but does not
+provide the managed Chromium binary and Linux browser libraries. Use the
+container/Docker path in §10 for `DISCORD_CHECK_MODE=dnsrobot`, or keep DNS
+Robot disabled on a plain buildpack worker. With the Dockerfile from §10, the
+container deployment is:
+
+```bash
+heroku stack:set container --app multi-sniper
+heroku container:login
+heroku container:push worker --app multi-sniper
+heroku container:release worker --app multi-sniper
+heroku ps:scale worker=1 --app multi-sniper
 ```
 
 ### 7.3 Deploy
@@ -326,12 +366,10 @@ in Discord to confirm reactions.
 
 ### 7.5 Notes
 
-- **Eco dynos** share a 1000-hour/month pool per account — one bot worker
-  running 24/7 (~720–744 h) fits; a second service won't. Eco dynos sleep
-  after inactivity (that mainly affects web dynos; a worker has no traffic to
-  sleep on) and can be cold-restarted by the platform.
-- **Basic** ($7/mo) never sleeps and gives a dedicated dyno slot — the
-  comfortable choice if you want zero surprises.
+- If you choose a metered or pooled worker plan, confirm that its monthly
+  hours cover the period you need and account for platform restarts.
+- Keep the worker process scaled to one and check the current dyno restart/
+  sleep behavior before relying on it for 24/7 availability.
 - Redeploys: `git push heroku main` again (or connect GitHub in the
   dashboard for auto-deploys).
 - If a deploy says `push rejected`, you likely have uncommitted changes or
@@ -393,8 +431,14 @@ Key points:
 
 ### 8.3 Secrets & deploy
 
+Use the Fly dashboard for the token when possible. If you use the CLI, read it
+interactively so it is not saved in shell history:
+
 ```bash
-fly secrets set DISCORD_TOKEN=your-token-here
+read -r -s DISCORD_TOKEN
+printf '\n'
+fly secrets set DISCORD_TOKEN="$DISCORD_TOKEN"
+unset DISCORD_TOKEN
 fly secrets set TARGET_CHANNEL_ID=123456789012345678     # optional
 
 fly deploy
@@ -428,22 +472,32 @@ sudo useradd -r -m -s /usr/sbin/nologin multisniper
 sudo mkdir -p /opt/multisniper
 sudo chown multisniper:multisniper /opt/multisniper
 
-# as the app user:
-sudo -u multisniper git clone <your-private-repo-url> /opt/multisniper/app
+# Public repository: clone as the app user.
+sudo -u multisniper git clone https://github.com/Not4Pranav/Project-006.git /opt/multisniper/app
+# For a private repository, follow SETUP §7.3 to configure a read-only GitHub
+# deploy key for multisniper, verify github.com's published SSH fingerprint,
+# and use instead: git@github.com:<owner>/<repo>.git
+# Never put a PAT in this URL, shell history, or the environment file.
+
 sudo -u multisniper python3 -m venv /opt/multisniper/venv
-sudo -u multisniper /opt/multisniper/venv/bin/pip install -r /opt/multisniper/app/requirements.txt
+sudo -u multisniper /opt/multisniper/venv/bin/python -m pip install --upgrade pip
+sudo -u multisniper /opt/multisniper/venv/bin/python -m pip install -r /opt/multisniper/app/requirements.txt
+# If using dnsrobot, install OS libraries as root, then the browser as the app user:
+sudo /opt/multisniper/venv/bin/python -m playwright install-deps chromium
+sudo -u multisniper /opt/multisniper/venv/bin/python -m playwright install chromium
 ```
 
 ### 9.2 Secrets file
 
-Create `/etc/multisniper.env` (root-only), one `KEY=VALUE` per line, no
-quotes:
+Create `/etc/multisniper.env` as one `KEY=VALUE` per line. It must be
+readable by the dedicated service account but not by other users:
 
 ```bash
 sudo nano /etc/multisniper.env
 # DISCORD_TOKEN=your-token-here
 # TARGET_CHANNEL_ID=123456789012345678
-sudo chmod 600 /etc/multisniper.env
+sudo chown root:multisniper /etc/multisniper.env
+sudo chmod 640 /etc/multisniper.env
 ```
 
 ### 9.3 systemd unit
@@ -481,7 +535,7 @@ journalctl -u multisniper -f          # follow the logs (startup banner + checks
 ### 9.4 Updating
 
 ```bash
-sudo -u multisniper git -C /opt/multisniper/app pull
+sudo -u multisniper git -C /opt/multisniper/app pull --ff-only
 sudo systemctl restart multisniper
 ```
 
@@ -493,10 +547,18 @@ that's the only inbound rule you need.
 
 ### 9.6 Quick tmux alternative (no systemd)
 
+Run the temporary process as the service user from the app directory:
+
 ```bash
-tmux new -s multisniper
-source venv/bin/activate && python bot.py
-# detach: Ctrl+B then D — reattach with: tmux attach -t multisniper
+sudo -u multisniper -H tmux new -s multisniper
+# inside tmux (the systemd EnvironmentFile is not loaded by tmux):
+set -a
+. /etc/multisniper.env
+set +a
+cd /opt/multisniper/app
+/opt/multisniper/venv/bin/python bot.py
+# detach: Ctrl+B then D — reattach with:
+sudo -u multisniper -H tmux attach -t multisniper
 ```
 
 (Use `tmux new -s multisniper -d '...'` for one-liners.) Fine for testing;
@@ -518,7 +580,9 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt
+# Required when DISCORD_CHECK_MODE=dnsrobot:
+RUN python -m playwright install --with-deps chromium
 
 COPY bot.py checkers.py Procfile ./
 
@@ -539,7 +603,7 @@ services:
     name: multi-sniper
     runtime: python
     plan: starter           # workers have no free instance type
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python -m pip install -r requirements.txt && python -m playwright install --with-deps chromium
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
@@ -600,8 +664,9 @@ confirms the new build took the settings you think it did.
 
 ## 13. Secrets & security on cloud hosts
 
-- **The only real secret is `DISCORD_TOKEN`** (plus `DISCORD_PROBE_TOKEN` /
-  proxy credentials if you use them).
+- **The required secret is `DISCORD_TOKEN`** (plus
+  `DISCORD_ACCOUNT_API_TOKEN`, `DISCORD_PROBE_TOKEN`, or proxy credentials if
+  you use them).
 - `.env` is git-ignored and `.env.example` ships with blank credential
   fields — `git status` should stay clean of secrets. The README, blueprint,
   and this guide contain no real tokens.
@@ -613,9 +678,9 @@ confirms the new build took the settings you think it did.
   (never `[env]` in `fly.toml` — that file is committed).
 - Rotating the token: Discord Developer Portal → Reset Token → update the
   host's env var → redeploy/restart. The old token dies immediately.
-- The bot logs redact credentials (`DISCORD_PROBE_TOKEN`, URL user-info) —
-  you should still never paste raw logs containing anything that looks like a
-  token into public places.
+- The bot logs redact credentials (`DISCORD_ACCOUNT_API_TOKEN`,
+  `DISCORD_PROBE_TOKEN`, URL user-info) — you should still never paste raw logs
+  containing anything that looks like a token into public places.
 - Keep the GitHub repo **private**. The bot itself needs no repository access
   at runtime — it's just the deployment source.
 

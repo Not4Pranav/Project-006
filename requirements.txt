@@ -1,7 +1,10 @@
 # Multi-Sniper runtime dependencies.
-# Python 3.9+ required (the code uses modern type-hint syntax).
-# Install with:  pip install -r requirements.txt
+# Python 3.10+ required (the code uses modern type-hint syntax).
+# Install with:  python -m pip install -r requirements.txt
+# DNS Robot mode also needs a Chromium executable; install it with:
+#   python -m playwright install chromium
 
 discord.py>=2.3,<3
 aiohttp>=3.9,<4
 python-dotenv>=1.0,<2
+playwright>=1.48,<2

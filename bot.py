@@ -7,7 +7,7 @@ normalized checker results, and reacts to the *same* Discord message:
 
     🕹️  Minecraft free
     🔫  guns.lol free
-    🐈‍⬛ Discord free (best-effort probe only; disabled by default)
+    🐈‍⬛ Discord free (DNS Robot, account, or authorized probe; disabled by default)
     ❌  nothing checked was free
     ⚠️  no free result can be confirmed (all or a required check was inconclusive)
     ⏳  member exceeded the per-user cooldown
@@ -22,9 +22,17 @@ Configuration lives in .env (see .env.example):
     TARGET_CHANNEL_ID         channel to watch (blank = every channel)
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 optional HTTP(S) proxy for outbound checks
-    DISCORD_CHECK_MODE        off (default) | probe
+    DISCORD_CHECK_MODE        off (default) | dnsrobot | account | account_api | probe
+    DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
+    DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
+
+The ``dnsrobot`` mode loads DNS Robot's username-checker page in an isolated
+Playwright/Chromium context and reads the rendered Discord card. The page makes
+its own credential-free browser request; this bot never forwards account/probe
+credentials to the page or its browser context.
+
     CHECK_TIMEOUT             per outbound HTTP request (default 3)
     RESPONSE_BUDGET_SECONDS   checks + reactions after MESSAGE_CREATE (default 4.5)
     REACTION_TIMEOUT          cap for each Discord reaction call (default .75)
@@ -91,25 +99,64 @@ def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), maximum)
 
 
-def _discord_probe_headers() -> dict[str, str] | None:
-    """Build the optional auth header without ever logging its token value."""
+def _has_http_control_chars(value: str) -> bool:
+    """Reject characters that can corrupt an HTTP header or log line."""
 
-    if not DISCORD_PROBE_TOKEN:
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _token_header(
+    token: str,
+    header_name: str,
+    scheme: str,
+) -> dict[str, str] | None:
+    """Build one optional auth header without ever logging its token value."""
+
+    if not token:
         return None
-    value = (f"{DISCORD_PROBE_TOKEN_SCHEME} {DISCORD_PROBE_TOKEN}".strip()
-             if DISCORD_PROBE_TOKEN_SCHEME else DISCORD_PROBE_TOKEN)
-    return {DISCORD_PROBE_TOKEN_HEADER: value}
+    value = f"{scheme} {token}".strip() if scheme else token
+    return {header_name: value}
+
+
+def _discord_probe_headers() -> dict[str, str] | None:
+    """Build the optional probe auth header without exposing its value."""
+
+    return _token_header(
+        DISCORD_PROBE_TOKEN,
+        DISCORD_PROBE_TOKEN_HEADER,
+        DISCORD_PROBE_TOKEN_SCHEME,
+    )
+
+
+def _discord_account_api_headers() -> dict[str, str] | None:
+    """Build account-API auth headers; never reuse the bot token implicitly."""
+
+    return _token_header(
+        DISCORD_ACCOUNT_API_TOKEN,
+        DISCORD_ACCOUNT_API_TOKEN_HEADER,
+        DISCORD_ACCOUNT_API_TOKEN_SCHEME,
+    )
 
 
 TARGET_CHANNEL_ID = _opt_int("TARGET_CHANNEL_ID")
 LOG_CHANNEL_ID = _opt_int("LOG_CHANNEL_ID")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DISCORD_CHECK_MODE = os.getenv("DISCORD_CHECK_MODE", "off").strip().lower()
+DISCORD_ACCOUNT_API_URL = (
+    os.getenv("DISCORD_ACCOUNT_API_URL", "").strip()
+    or checkers.DEFAULT_DISCORD_ACCOUNT_API_URL
+)
+DISCORD_ACCOUNT_API_TOKEN = os.getenv("DISCORD_ACCOUNT_API_TOKEN", "").strip()
+DISCORD_ACCOUNT_API_TOKEN_HEADER = os.getenv(
+    "DISCORD_ACCOUNT_API_TOKEN_HEADER", "Authorization").strip() or "Authorization"
+DISCORD_ACCOUNT_API_TOKEN_SCHEME = os.getenv(
+    "DISCORD_ACCOUNT_API_TOKEN_SCHEME", "Bearer").strip()
 DISCORD_PROBE_URL = os.getenv("DISCORD_PROBE_URL", "").strip() or None
 DISCORD_PROBE_TOKEN = os.getenv("DISCORD_PROBE_TOKEN", "").strip()
 DISCORD_PROBE_TOKEN_HEADER = os.getenv(
     "DISCORD_PROBE_TOKEN_HEADER", "Authorization").strip() or "Authorization"
 DISCORD_PROBE_TOKEN_SCHEME = os.getenv("DISCORD_PROBE_TOKEN_SCHEME", "Bearer").strip()
+DISCORD_ACCOUNT_API_HEADERS = _discord_account_api_headers()
 DISCORD_PROBE_HEADERS = _discord_probe_headers()
 
 # The event handler starts after Discord delivers MESSAGE_CREATE. Reserving a
@@ -155,6 +202,11 @@ class SniperBot(discord.Client):
         intents.message_content = True  # also enable it in the Developer Portal
         super().__init__(intents=intents)
         self.http_sniper: aiohttp.ClientSession | None = None
+        # The literal DNS Robot mode owns a long-lived browser process so each
+        # lookup only creates a short-lived isolated context/page.
+        self._playwright = None
+        self.dnsrobot_browser = None
+        self.dnsrobot_semaphore: asyncio.Semaphore | None = None
         # Per-user token bucket: {user_id: deque[timestamps]}
         self._buckets: dict[int, deque[float]] = defaultdict(deque)
         # Recent results cache: {username_lower: (timestamp, [Result, ...])}
@@ -167,11 +219,38 @@ class SniperBot(discord.Client):
         self.http_sniper = aiohttp.ClientSession(
             headers=checkers.BROWSER_HEADERS, timeout=timeout)
 
+        if DISCORD_CHECK_MODE == "dnsrobot":
+            try:
+                self._playwright, self.dnsrobot_browser = (
+                    await checkers.start_dnsrobot_browser(PROXY_URL))
+                # Keep browser work bounded when several messages arrive at
+                # once; each context remains isolated from other lookups.
+                self.dnsrobot_semaphore = asyncio.Semaphore(2)
+            except Exception as exc:  # noqa: BLE001 - mode stays safely unknown
+                log.error(
+                    "DNS Robot browser unavailable; Discord results will be "
+                    "ERROR until Chromium is installed: %s",
+                    checkers._redact_sensitive_text(exc),
+                )
+
     async def close(self) -> None:
-        if self.http_sniper and not self.http_sniper.closed:
-            await self.http_sniper.close()
-        self.http_sniper = None
-        await super().close()
+        try:
+            if self.http_sniper and not self.http_sniper.closed:
+                await self.http_sniper.close()
+        finally:
+            try:
+                if self.dnsrobot_browser is not None:
+                    await self.dnsrobot_browser.close()
+            finally:
+                try:
+                    if self._playwright is not None:
+                        await self._playwright.stop()
+                finally:
+                    self.http_sniper = None
+                    self.dnsrobot_browser = None
+                    self.dnsrobot_semaphore = None
+                    self._playwright = None
+                    await super().close()
 
     # -- state helpers ------------------------------------------------------
 
@@ -217,9 +296,9 @@ class SniperBot(discord.Client):
         """Cache complete, definitive answers; never cache a partial outage."""
 
         definitive = {checkers.AVAILABLE, checkers.TAKEN, checkers.INVALID}
-        unknown = {checkers.ERROR, checkers.BLOCKED}
+        allowed = definitive | {checkers.SKIPPED}
         return (bool(results)
-                and not any(result.status in unknown for result in results)
+                and all(result.status in allowed for result in results)
                 and any(result.status in definitive for result in results))
 
     # -- Discord reaction helpers -----------------------------------------
@@ -236,10 +315,26 @@ class SniperBot(discord.Client):
         if cap <= 0:
             log.warning("Skipping reaction %r: response deadline exhausted", emoji)
             return
+        reaction_task = asyncio.create_task(message.add_reaction(emoji))
         try:
-            await asyncio.wait_for(message.add_reaction(emoji), timeout=cap)
-        except asyncio.TimeoutError:
+            done, _ = await asyncio.wait({reaction_task}, timeout=cap)
+        except asyncio.CancelledError:
+            reaction_task.cancel()
+            reaction_task.add_done_callback(self._consume_cancelled_reaction_task)
+            raise
+
+        if reaction_task not in done:
+            # Do not use wait_for here: it waits for cancellation cleanup, so a
+            # non-cooperative Discord client mock or adapter could consume the
+            # entire response budget. The callback consumes the eventual task
+            # outcome without keeping this handler on the critical path.
+            reaction_task.cancel()
+            reaction_task.add_done_callback(self._consume_cancelled_reaction_task)
             log.warning("Reaction %r exceeded the %.2fs response cap", emoji, cap)
+            return
+
+        try:
+            reaction_task.result()
         except discord.Forbidden:
             log.warning("Missing 'Add Reactions' permission in #%s",
                         getattr(message.channel, "name", message.channel.id))
@@ -274,6 +369,18 @@ class SniperBot(discord.Client):
         ))
 
     @staticmethod
+    def _consume_cancelled_reaction_task(task: asyncio.Task) -> None:
+        """Consume a late reaction outcome after the response budget expires."""
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - consume any late task failure
+            log.debug("Late reaction task exited after deadline: %s",
+                      checkers._redact_sensitive_text(exc))
+
+    @staticmethod
     def _consume_cancelled_checker_task(task: asyncio.Task) -> None:
         """Consume a late task outcome so cancellation never emits a warning."""
 
@@ -306,6 +413,10 @@ class SniperBot(discord.Client):
             discord_probe_url=DISCORD_PROBE_URL,
             discord_probe_headers=DISCORD_PROBE_HEADERS,
             timeout=check_budget,
+            discord_account_api_url=DISCORD_ACCOUNT_API_URL,
+            discord_account_api_headers=DISCORD_ACCOUNT_API_HEADERS,
+            dnsrobot_browser=self.dnsrobot_browser,
+            dnsrobot_semaphore=self.dnsrobot_semaphore,
         ))
         try:
             done, _ = await asyncio.wait({checker_task}, timeout=check_budget)
@@ -328,6 +439,64 @@ class SniperBot(discord.Client):
                         checkers._redact_sensitive_text(exc))
             return checkers.timeout_results("checker task failed")
 
+    async def _write_hit_log(
+        self,
+        message: discord.Message,
+        available: list[checkers.Result],
+        deadline: float,
+    ) -> None:
+        """Write the optional hit log without extending the user response path."""
+
+        if not LOG_CHANNEL_ID:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.debug("Skipping hit log: response deadline exhausted")
+            return
+
+        channel = self.get_channel(LOG_CHANNEL_ID)
+        try:
+            if channel is None:
+                channel = await asyncio.wait_for(
+                    self.fetch_channel(LOG_CHANNEL_ID), timeout=remaining)
+        except asyncio.TimeoutError:
+            log.warning("Could not fetch hit-log channel before the response deadline")
+            return
+        except discord.HTTPException as exc:
+            log.warning("Could not fetch hit-log channel: %s", exc)
+            return
+        except Exception as exc:  # noqa: BLE001 - optional logging is non-fatal
+            log.warning(
+                "Unexpected hit-log lookup failure: %s",
+                checkers._redact_sensitive_text(exc),
+            )
+            return
+
+        if channel is None:
+            return
+        names = ", ".join(
+            f"{result.platform} {result.emoji}" for result in available)
+        text = (
+            f"🎯 `{message.content.strip()}` is FREE on: {names} "
+            f"(found by {message.author.mention})")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.debug("Skipping hit log send: response deadline exhausted")
+            return
+        try:
+            await asyncio.wait_for(channel.send(text), timeout=remaining)
+        except asyncio.TimeoutError:
+            log.warning("Hit-log message exceeded the response deadline")
+        except discord.HTTPException as exc:
+            log.warning("Could not write to log channel: %s", exc)
+        except AttributeError as exc:
+            log.warning("Hit-log channel cannot receive messages: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - optional logging is non-fatal
+            log.warning(
+                "Unexpected hit-log failure: %s",
+                checkers._redact_sensitive_text(exc),
+            )
+
     # -- events -------------------------------------------------------------
 
     async def on_ready(self) -> None:
@@ -337,6 +506,9 @@ class SniperBot(discord.Client):
               f"{TARGET_CHANNEL_ID if TARGET_CHANNEL_ID else 'ALL CHANNELS'}")
         print("🕹️ Platforms        : Minecraft | guns.lol | "
               f"Discord (mode: {DISCORD_CHECK_MODE})")
+        if DISCORD_CHECK_MODE == "dnsrobot":
+            print("🌐 DNS Robot browser : "
+                  f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
         print(f"🧊 Proxy            : {'on' if PROXY_URL else 'off (direct)'}")
         print(f"⏳ User cooldown    : {USER_MAX_CHECKS} checks / "
               f"{USER_WINDOW_SECONDS:.0f}s")
@@ -398,8 +570,13 @@ class SniperBot(discord.Client):
             reaction_emojis = [result.emoji for result in available]
         else:
             statuses = {result.status for result in results}
+            known_non_unknown = {
+                checkers.AVAILABLE, checkers.TAKEN, checkers.INVALID,
+                checkers.SKIPPED,
+            }
             unknown = {checkers.ERROR, checkers.BLOCKED}
-            if not statuses or statuses & unknown or statuses <= {checkers.SKIPPED}:
+            if (not statuses or statuses - known_non_unknown
+                    or statuses & unknown or statuses <= {checkers.SKIPPED}):
                 # A partial outage does not prove the name is taken everywhere.
                 # Surface the uncertainty rather than issuing a misleading ❌.
                 reaction_emojis = [EMOJI_ALL_FAILED]
@@ -409,23 +586,10 @@ class SniperBot(discord.Client):
         # 7. The member-visible answer is complete before optional logging.
         await self._react_all(message, reaction_emojis, deadline)
 
-        # 8. Optional private log for genuine availability hits.
+        # 8. Optional private log for genuine availability hits. It is bounded
+        # by the same deadline and never delays the member-visible reaction.
         if available and LOG_CHANNEL_ID:
-            channel = self.get_channel(LOG_CHANNEL_ID)
-            if channel is None:
-                try:  # Not in cache yet? Ask Discord's API once.
-                    channel = await self.fetch_channel(LOG_CHANNEL_ID)
-                except discord.HTTPException:
-                    channel = None
-            if channel:
-                names = ", ".join(
-                    f"{result.platform} {result.emoji}" for result in available)
-                try:
-                    await channel.send(
-                        f"🎯 `{username}` is FREE on: {names} "
-                        f"(found by {message.author.mention})")
-                except discord.HTTPException as exc:
-                    log.warning("Could not write to log channel: %s", exc)
+            await self._write_hit_log(message, available, deadline)
 
 
 def main() -> None:
@@ -435,19 +599,37 @@ def main() -> None:
         raise SystemExit(
             "❌ DISCORD_TOKEN missing. Copy .env.example to .env and paste "
             "your bot token from the Discord Developer Portal.")
-    if DISCORD_CHECK_MODE not in ("off", "probe"):
-        raise SystemExit("❌ DISCORD_CHECK_MODE must be 'off' or 'probe'.")
+    if _has_http_control_chars(TOKEN):
+        raise SystemExit("❌ DISCORD_TOKEN must not contain control characters.")
+    if DISCORD_CHECK_MODE not in (
+            "off", "dnsrobot", "account", "account_api", "probe"):
+        raise SystemExit(
+            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', 'account', "
+            "'account_api', or 'probe'.")
     if PROXY_URL:
-        proxy_error = checkers.validate_http_url(PROXY_URL, "PROXY_URL")
+        proxy_error = checkers.validate_proxy_url(PROXY_URL)
         if proxy_error:
             raise SystemExit(f"❌ {proxy_error}")
+    if DISCORD_ACCOUNT_API_TOKEN:
+        if not checkers.is_valid_header_name(DISCORD_ACCOUNT_API_TOKEN_HEADER):
+            raise SystemExit(
+                "❌ DISCORD_ACCOUNT_API_TOKEN_HEADER is not a valid HTTP header name.")
+        if _has_http_control_chars(DISCORD_ACCOUNT_API_TOKEN):
+            raise SystemExit("❌ DISCORD_ACCOUNT_API_TOKEN must not contain control characters.")
+        if _has_http_control_chars(DISCORD_ACCOUNT_API_TOKEN_SCHEME):
+            raise SystemExit(
+                "❌ DISCORD_ACCOUNT_API_TOKEN_SCHEME must not contain control characters.")
+    if DISCORD_CHECK_MODE in ("account", "account_api"):
+        account_error = checkers.validate_account_api_url(DISCORD_ACCOUNT_API_URL)
+        if account_error:
+            raise SystemExit(f"❌ {account_error}")
     if DISCORD_PROBE_TOKEN:
         if not checkers.is_valid_header_name(DISCORD_PROBE_TOKEN_HEADER):
             raise SystemExit("❌ DISCORD_PROBE_TOKEN_HEADER is not a valid HTTP header name.")
-        if "\r" in DISCORD_PROBE_TOKEN or "\n" in DISCORD_PROBE_TOKEN:
-            raise SystemExit("❌ DISCORD_PROBE_TOKEN must not contain a line break.")
-        if "\r" in DISCORD_PROBE_TOKEN_SCHEME or "\n" in DISCORD_PROBE_TOKEN_SCHEME:
-            raise SystemExit("❌ DISCORD_PROBE_TOKEN_SCHEME must not contain a line break.")
+        if _has_http_control_chars(DISCORD_PROBE_TOKEN):
+            raise SystemExit("❌ DISCORD_PROBE_TOKEN must not contain control characters.")
+        if _has_http_control_chars(DISCORD_PROBE_TOKEN_SCHEME):
+            raise SystemExit("❌ DISCORD_PROBE_TOKEN_SCHEME must not contain control characters.")
     if DISCORD_CHECK_MODE == "probe" and DISCORD_PROBE_URL:
         probe_error = checkers.validate_probe_url_template(DISCORD_PROBE_URL)
         if probe_error:

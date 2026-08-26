@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot as bot_module
 import checkers
-from test_checkers import _session_with_status
+from test_checkers import _browser_with_status, _session_with_status
 
 WATCHED = 42  # pretend channel id
 
@@ -36,7 +36,8 @@ def make_message(content, user_id=1, channel_id=WATCHED, author_bot=False,
 def make_bot(session_status=404):
     """Build a SniperBot wired to a fake HTTP session."""
     b = bot_module.SniperBot()
-    b.http_sniper = _session_with_status(session_status)
+    body = "<html><body>claimed profile</body></html>" if session_status == 200 else ""
+    b.http_sniper = _session_with_status(session_status, body)
     return b
 
 
@@ -112,6 +113,23 @@ class TestReactions(unittest.TestCase):
                           "\U0001F52B",          # 🔫 guns.lol
                           "\U0001F408\u200D\u2B1B"])  # 🐈‍⬛ Discord
 
+    def test_dnsrobot_mode_loads_page_without_probe_credentials(self):
+        old_mode = bot_module.DISCORD_CHECK_MODE
+        bot_module.DISCORD_CHECK_MODE = "dnsrobot"
+        try:
+            b = make_bot(404)
+            browser, page, _ = _browser_with_status("Available")
+            b.dnsrobot_browser = browser
+            msg = make_message("zxqw99182")
+            asyncio.run(b.on_message(msg))
+            self.assertEqual(reactions(msg),
+                             ["\U0001F579\uFE0F", "\U0001F52B",
+                              "\U0001F408\u200D\u2B1B"])
+            page.goto.assert_called_once()
+            b.http_sniper.post.assert_not_called()
+        finally:
+            bot_module.DISCORD_CHECK_MODE = old_mode
+
     def test_taken_everywhere_gets_cross(self):
         b = make_bot(200)  # 200 everywhere -> taken on all platforms
         msg = make_message("Notch")
@@ -159,6 +177,21 @@ class TestReactions(unittest.TestCase):
         b = make_bot()
         msg = make_message("vortex")
         with patch.object(checkers, "run_all_checks", partial_results):
+            asyncio.run(b.on_message(msg))
+        self.assertEqual(reactions(msg), ["⚠️"])
+        self.assertNotIn("vortex", b._cache)
+
+    def test_unrecognized_status_gets_warning_and_is_not_cached(self):
+        async def malformed_results(*_args, **_kwargs):
+            return [
+                checkers.Result("Minecraft", "🕹️", checkers.TAKEN),
+                checkers.Result("guns.lol", "🔫", "unexpected"),
+                checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+            ]
+
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch.object(checkers, "run_all_checks", malformed_results):
             asyncio.run(b.on_message(msg))
         self.assertEqual(reactions(msg), ["⚠️"])
         self.assertNotIn("vortex", b._cache)
@@ -252,6 +285,36 @@ class TestLatencyBudget(unittest.TestCase):
         self.assertLess(elapsed, 0.15)
         self.assertEqual(reactions(message), ["⚠️"])
 
+    def test_reaction_deadline_does_not_wait_for_non_cooperative_client(self):
+        async def hangs_after_cancellation(_emoji):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate an adapter that delays cancellation cleanup. The
+                # handler must return before this sleep completes.
+                await asyncio.sleep(0.2)
+
+        async def scenario():
+            b = make_bot()
+            message = make_message("vortex")
+            message.add_reaction = hangs_after_cancellation
+            started = time.monotonic()
+            await b._react(message, "⚠️", timeout=0.01)
+            return time.monotonic() - started
+
+        loop = asyncio.new_event_loop()
+        try:
+            elapsed = loop.run_until_complete(scenario())
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+        self.assertLess(elapsed, 0.1)
+
 
 class TestConfigErrors(unittest.TestCase):
     def test_non_finite_number_uses_safe_default(self):
@@ -295,6 +358,20 @@ class TestConfigErrors(unittest.TestCase):
             (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
              bot_module.DISCORD_PROBE_URL) = old
 
+    def test_bad_account_api_url_rejected_before_connecting(self):
+        old = (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+               bot_module.DISCORD_ACCOUNT_API_URL)
+        bot_module.TOKEN = "test-bot-token"
+        bot_module.DISCORD_CHECK_MODE = "account"
+        bot_module.DISCORD_ACCOUNT_API_URL = "file:///tmp/account"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("DISCORD_ACCOUNT_API_URL", str(raised.exception))
+        finally:
+            (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+             bot_module.DISCORD_ACCOUNT_API_URL) = old
+
     def test_invalid_probe_header_rejected_before_connecting(self):
         old = (bot_module.TOKEN, bot_module.DISCORD_PROBE_TOKEN,
                bot_module.DISCORD_PROBE_TOKEN_HEADER)
@@ -315,6 +392,16 @@ class TestConfigErrors(unittest.TestCase):
         try:
             with self.assertRaises(SystemExit):
                 bot_module.main()
+        finally:
+            bot_module.TOKEN = old
+
+    def test_token_line_break_rejected(self):
+        old = bot_module.TOKEN
+        bot_module.TOKEN = "test-bot-token\nextra"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("control characters", str(raised.exception))
         finally:
             bot_module.TOKEN = old
 
