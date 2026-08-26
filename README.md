@@ -1,17 +1,22 @@
 # 🎯 Multi-Sniper — Discord Username Availability Bot
 
-A Discord bot that works like a username sniper's scout: when a member posts a
-name in the watched channel, the bot checks **Minecraft**, **guns.lol** and
-(optionally) **Discord** in parallel — all within a ~1–5 second window — and
-reacts to the message with one emoji per platform where the name is **FREE**.
+A Discord bot that works like a username scout: when a member posts a name in
+the watched channel, the bot checks **Minecraft**, **guns.lol** and
+(optionally) **Discord** in parallel, then reacts to that same message with one
+emoji per platform where the name is **FREE**. The valid-message handler has a
+**4.5-second default response budget** (clamped below five seconds): checkers
+share it and reactions run in parallel.
+
+> **Domain note:** this project checks the active **guns.lol** profile platform.
+> `gung.lol` is a different, parked domain; it is not an alias for guns.lol.
 
 | Reaction | Meaning |
 | -------- | ------- |
 | 🕹️ | **Free on Minecraft** (Mojang has no profile with that name) |
-| 🔫 | **Free on guns.lol** (no profile page exists) |
-| 🐈‍⬛ | Free on Discord *(best-effort probe only — see [the honest bit](#-the-honest-bit-limitations))* |
+| 🔫 | **Free on guns.lol** (404/410, or its semantic “username not found” page) |
+| 🐈‍⬛ | Free on Discord *(only through your authorized external checker — see [the honest bit](#-the-honest-bit-limitations))* |
 | ❌ | Not available on any checked platform |
-| ⚠️ | Every check failed (network down / IP blocked) |
+| ⚠️ | No free result can be confirmed because every check — or a required check — failed/was blocked |
 | ⏳ | User is checking too fast (cooldown) |
 | *(no reaction)* | Message ignored — not a bare username, wrong channel, or sent by a bot/webhook |
 
@@ -32,10 +37,10 @@ reacts to the message with one emoji per platform where the name is **FREE**.
             ├──► 4. Parallel fan-out (asyncio.gather — all at once, not one-by-one)
             │        ├──► 🕹️ GET https://api.mojang.com/users/profiles/minecraft/<name>
             │        │        └─ fallback: https://api.minecraftservices.com/.../lookup/name/<name>
-            │        ├──► 🔫 GET https://guns.lol/<name>
+            │        ├──► 🔫 GET https://guns.lol/<name> (status + unclaimed-page marker)
             │        └──► 🐈‍⬛ GET <discord probe URL>          (optional, off by default)
-            │                └─ each request: 3s timeout, browser headers,
-            │                   optional proxy, never blocks the event loop
+            │                └─ each request: 3s cap by default, browser headers,
+            │                   optional proxy; all share one response deadline
             ▼
 [ Status-code engine maps each HTTP response to free/taken/blocked ]
             │
@@ -51,13 +56,18 @@ is missing its `/` and isn't the real API). These are the verified ones:
 
 | Platform | Emoji | Real endpoint | FREE | TAKEN | Blocked / unknown |
 | -------- | :---: | ------------- | ---- | ----- | ----------------- |
-| Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback when the primary 403s) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 429 (Mojang rate limit) |
-| guns.lol | 🔫 | `https://guns.lol/<name>` | **404** (no profile page) | **200** (page renders) | 403 / 503 (Cloudflare bot wall) |
-| Discord | 🐈‍⬛ | *no public API exists* — see note below | (probe: 404) | (probe: 200/401) | 429 |
+| Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback for blocked/transient primary calls) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 429 (Mojang rate limit) |
+| guns.lol | 🔫 | `https://guns.lol/<name>` | **404/410**, or a 200 page with the specific “username not found”/unclaimed title marker | **200** profile page without a challenge/unclaimed marker | 403 / 429 / 503, or a 200 Cloudflare challenge page |
+| Discord | 🐈‍⬛ | *no public API exists* — disabled unless you provide an authorized checker URL | custom checker: **404** | custom checker: **200** | 401 / 403 / 429, malformed endpoint, or network failure |
+
+> **Target naming note:** At implementation time, [http://Gung.lol](http://Gung.lol)
+> is a parked domain rather than a profile-availability service. This project therefore
+> checks the active [guns.lol](https://guns.lol) profile platform; it does not
+> pretend that the parked `Gung.lol` domain can answer username availability.
 
 Every check also validates the name against the platform's rules *before*
 sending a request (Minecraft: `3–16` chars `A-Za-z0-9_`; guns.lol: `2–24` chars
-`A-Za-z0-9_-`; Discord: `2–32` chars lowercase `a-z0-9._`), so impossible names
+`A-Za-z0-9._-`; Discord: `2–32` chars lowercase `a-z0-9._`), so impossible names
 are reported as **invalid** without wasting a request.
 
 **About the Discord check (important):** Discord does **not** expose any public
@@ -66,9 +76,14 @@ confirmed at the very start of the original thread, and the
 `https://discord.com{username}` idea that appeared later in it is not a real
 API (it just serves Discord's homepage). Attempting to claim-check names
 requires a logged-in user session, which violates Discord's ToS. So this bot
-ships the Discord check **disabled** (`DISCORD_CHECK_MODE=off`). If you set it
-to `probe`, it performs a clearly-labelled best-effort GET against
-`DISCORD_PROBE_URL` using the blueprint's status mapping — don't trust it.
+ships the Discord check **disabled** (`DISCORD_CHECK_MODE=off`). If you have
+an authorized checker service of your own, set `DISCORD_CHECK_MODE=probe` **and**
+provide an HTTP(S) `{username}` URL template in `DISCORD_PROBE_URL`; the bot
+otherwise skips Discord. Its explicit contract is **200 = taken**, **404 =
+free**, and **401/403/429 = unknown**. If that service needs credentials, put
+them only in your private `DISCORD_PROBE_TOKEN` environment value; the bot sends
+it only to that endpoint and never logs it. It never pretends
+`discord.com/<username>` is a valid checker.
 
 ## 📁 Project layout
 
@@ -77,8 +92,8 @@ to `probe`, it performs a clearly-labelled best-effort GET against
 ├── bot.py            # the runtime: gateway events, filters, cooldown, reactions
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
 ├── blueprint.md      # technical deep-dive: how every stage works internally
-├── test_checkers.py  # 16 checker tests (offline) + LIVE=1 real-network tests
-├── test_bot.py       # 17 end-to-end pipeline tests (simulated Discord messages)
+├── test_checkers.py  # 22 offline checker tests + 2 optional LIVE=1 network tests
+├── test_bot.py       # 25 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets
 ├── requirements.txt  # discord.py, aiohttp, python-dotenv
 ├── Procfile          # cloud deployment start command
@@ -125,18 +140,31 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+> The tracked template contains **blank credential fields**. Put bot tokens,
+> external-checker tokens, and proxy credentials only in your ignored `.env` or
+> your deployment provider's secret manager.
+
 | Variable | Required | Default | What it does |
 | -------- | -------- | ------- | ------------ |
 | `DISCORD_TOKEN` | ✅ | — | Bot token from the Developer Portal |
 | `TARGET_CHANNEL_ID` | — | *(all channels)* | Only react in this channel |
 | `LOG_CHANNEL_ID` | — | off | Post every "free" hit to this channel |
-| `DISCORD_CHECK_MODE` | — | `off` | `off` or `probe` (unofficial) |
-| `DISCORD_PROBE_URL` | — | `https://discord.com/{username}` | URL template for probe mode |
-| `PROXY_URL` | — | direct | Route checks via `http://user:pass@host:port` |
-| `CHECK_TIMEOUT` | — | `3` | Per-request timeout (seconds) |
+| `DISCORD_CHECK_MODE` | — | `off` | `off`, or `probe` with an authorized external checker |
+| `DISCORD_PROBE_URL` | — | blank | Required HTTP(S) `{username}` URL template when `probe` is enabled; never defaults to Discord's homepage |
+| `DISCORD_PROBE_TOKEN` | — | blank | Optional credential sent **only** to `DISCORD_PROBE_URL`; never logged or stored in tracked files |
+| `DISCORD_PROBE_TOKEN_HEADER` | — | `Authorization` | Header used for the optional probe token (for example `X-API-Key`) |
+| `DISCORD_PROBE_TOKEN_SCHEME` | — | `Bearer` | Prefix before the optional token; set blank to send the raw token |
+| `PROXY_URL` | — | direct | User-supplied HTTP(S) proxy for outbound checks; validated at startup and never stored in the repo |
+| `CHECK_TIMEOUT` | — | `3` | Per-outbound-request timeout (seconds; clamped below the response budget) |
+| `RESPONSE_BUDGET_SECONDS` | — | `4.5` | Hard budget for checks **and** reactions after a valid message; clamped below 5 seconds |
+| `REACTION_TIMEOUT` | — | `0.75` | Cap for each Discord reaction REST call; platform reactions run concurrently |
 | `USER_MAX_CHECKS` | — | `3` | Checks allowed per user per window |
 | `USER_WINDOW_SECONDS` | — | `60` | Cooldown window (seconds) |
 | `RESULT_CACHE_TTL` | — | `300` | Cache repeat lookups (seconds) |
+
+> Startup rejects malformed `PROXY_URL` values, external-checker URL templates,
+> and configured auth-header names before connecting. Malformed/non-finite numeric settings
+> safely fall back to defaults; credential values are never printed.
 
 > To copy a channel ID: Discord **Settings → Advanced → Developer Mode ON**,
 > then right-click the channel → **Copy Channel ID**.
@@ -180,6 +208,7 @@ Railway/Fly.io/any VPS with Python 3.9+ works identically.
 🕹️ Platforms        : Minecraft | guns.lol | Discord (mode: off)
 🧊 Proxy            : off (direct)
 ⏳ User cooldown    : 3 checks / 60s
+⚡ Response budget  : 4.50s (reaction cap 0.75s)
 ==========================================================
 ```
 
@@ -209,9 +238,9 @@ Availability report for 'Notch':
 **Test suite (`python test_checkers.py && python test_bot.py`):**
 
 ```
-Ran 16 tests in 0.018s
+Ran 24 tests in 0.03s
 OK (skipped=2)      <- the 2 live tests run only with LIVE=1
-Ran 17 tests in 0.066s
+Ran 25 tests in 0.14s
 OK
 ```
 
@@ -219,21 +248,23 @@ OK
 
 ```bash
 LIVE=1 python test_checkers.py     # hits the real Mojang + guns.lol APIs
-python checkers.py Notch           # taken name -> [TAKEN] everywhere
-python checkers.py zxqw7k3vlt9m42q # random name -> [FREE] everywhere
+python checkers.py Notch           # inspect Minecraft + guns.lol (Discord is skipped by default)
+python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 ```
 
 ---
 
 ## 🔧 Optional features
 
-- **Rotating proxy** — set `PROXY_URL=http://user:pass@backconnect-host:port`
-  and every outbound check rides a fresh exit IP. HTTP(S) proxies are built in;
-  SOCKS needs `pip install aiohttp-socks` plus a small code change.
+- **User-supplied proxy** — set `PROXY_URL` only in your private `.env` or host
+  secret manager. Every outbound check uses it; HTTP(S) URLs are validated at
+  startup. SOCKS needs `pip install aiohttp-socks` plus a small code change.
 - **Hits logging** — set `LOG_CHANNEL_ID` and every name found free is posted
   to that channel with the finder's mention.
-- **Tuning** — `CHECK_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`,
-  `RESULT_CACHE_TTL` are all in `.env`.
+- **Tuning** — `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
+  `REACTION_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`, and
+  `RESULT_CACHE_TTL` are all in `.env`. The response budget is capped below
+  five seconds deliberately.
 - **Add a platform** — copy a 15-line checker in `checkers.py` (e.g. GitHub:
   `https://api.github.com/users/<name>` → 404 = free), add an emoji and add it
   to `run_all_checks`. That's it.
@@ -243,10 +274,11 @@ python checkers.py zxqw7k3vlt9m42q # random name -> [FREE] everywhere
 - **Mojang rate-limits hard.** The cooldown + cache + fallback endpoint exist
   so your server IP doesn't get blocked. Don't lower them for a busy server.
 - **guns.lol sits behind Cloudflare** and may answer `403` to datacenter IPs —
-  the bot reports that as *unknown* rather than lying to you. A residential/
-  rotating proxy usually helps.
+  the bot reports that as *unknown* rather than lying to you. If you choose to
+  use a proxy, supply it privately through `PROXY_URL`; no proxy is bundled.
 - **Discord availability is not publicly checkable** (see matrix above). The
-  `🐈‍⬛` reaction only appears in unofficial `probe` mode and may be wrong.
+  `🐈‍⬛` reaction only appears when you explicitly configure an authorized
+  external `probe` URL; its semantics are your checker's responsibility.
 - This bot **notifies** — it never auto-registers accounts, and using it to
   mass-harvest names would violate the platforms' terms. Keep it friendly.
 
@@ -265,9 +297,9 @@ python checkers.py zxqw7k3vlt9m42q # random name -> [FREE] everywhere
 ## 🧪 Verifying your install (summary)
 
 ```bash
-python test_checkers.py      # 16 offline tests — should print OK
-python test_bot.py           # 17 pipeline tests — should print OK
+python test_checkers.py      # 22 offline tests (+ 2 skipped live tests) — should print OK
+python test_bot.py           # 25 pipeline tests — should print OK
 python checkers.py Notch     # live endpoints from your machine
-LIVE=1 python test_checkers.py   # + 2 real-network tests
+LIVE=1 python test_checkers.py   # enables the 2 real-network tests
 python bot.py                # startup banner, then post names in Discord
 ```
