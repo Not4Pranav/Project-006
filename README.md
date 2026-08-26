@@ -76,6 +76,7 @@ to `probe`, it performs a clearly-labelled best-effort GET against
 .
 ├── bot.py            # the runtime: gateway events, filters, cooldown, reactions
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
+├── blueprint.md      # technical deep-dive: how every stage works internally
 ├── test_checkers.py  # 16 checker tests (offline) + LIVE=1 real-network tests
 ├── test_bot.py       # 17 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets

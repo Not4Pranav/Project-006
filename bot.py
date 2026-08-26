@@ -136,9 +136,18 @@ class SniperBot(discord.Client):
         return False
 
     def _cached(self, username: str) -> Optional[list[checkers.Result]]:
-        hit = self._cache.get(username.lower())
-        if hit and time.monotonic() - hit[0] < RESULT_CACHE_TTL:
+        key = username.lower()
+        hit = self._cache.get(key)
+        if hit is None:
+            return None
+        if time.monotonic() - hit[0] < RESULT_CACHE_TTL:
             return hit[1]
+        # expired - evict now so the cache cannot grow without bound
+        del self._cache[key]
+        if len(self._cache) > 5000:  # occasional full sweep of stragglers
+            now = time.monotonic()
+            self._cache = {k: v for k, v in self._cache.items()
+                           if now - v[0] < RESULT_CACHE_TTL}
         return None
 
     async def _react(self, message: discord.Message, emoji: str) -> None:
