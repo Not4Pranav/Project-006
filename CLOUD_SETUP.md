@@ -4,6 +4,10 @@
 > step: Render, Railway, Heroku, Fly.io, or your own VPS. This is the
 > deployment companion to the [README](README.md) (quick start + local setup)
 > and the [blueprint](blueprint.md) (how the bot works internally).
+>
+> **Render users:** see [render.md](render.md) for the dedicated, step-by-step
+> Render guide — it covers the full setup plus **every token/credential you
+> need and exactly how to acquire each one**.
 
 ---
 
@@ -51,7 +55,7 @@ host, not a "web" host**, and you need a place to store one secret.
 
 | Your situation | Pick |
 | -------------- | ---- |
-| Want it free, set-and-forget, managed | **Render** — Background Worker, free tier (~750 instance-hours/month ≈ a single worker running ~24/7). |
+| Want the easiest managed setup and don't mind a few dollars | **Render** — Background Worker, **paid instance required** (~$7/mo Starter; Background Workers have **no free instance type**). For $0, see the VPS row or [render.md](render.md). |
 | Want a modern dashboard + git deploys and don't mind a few dollars | **Railway** — service, `python bot.py`, $0 Free / $5 Hobby (verify current plans). |
 | Already on Heroku / want the classic `Procfile` + git-push flow | **Heroku** — worker dyno (Eco $5/mo or Basic $7/mo; **no free tier** since Nov 2022). |
 | Want per-second billing and a CLI-first workflow | **Fly.io** — Machines; no permanent free tier (trial credit only), cheapest always-on ≈ $2–5/mo. |
@@ -144,8 +148,16 @@ you're changing them. `DISCORD_PROBE_*` only matters if you enable `probe`.
 
 ## 5. Recommended: Render (Background Worker)
 
-The repo's default production path: free tier, git-connected auto-deploys,
-and a process type that matches the bot exactly (no web listener required).
+> ⭐ Complete step-by-step Render guide (incl. every token & how to get it):
+> **[render.md](render.md)**.
+
+The repo's default production path: git-connected auto-deploys and a process
+type that matches the bot exactly (no web listener required). **Note:** Render's
+free instances apply only to Web Services / Postgres / Key Value / static
+sites — a **Background Worker requires a paid instance type** (~$7/mo Starter),
+and there is no supported free path on Render for this bot. See
+[render.md](render.md) for a full step-by-step guide (including every token and
+how to acquire it), and §2/§15 for free alternatives.
 
 ### 5.1 Create the service
 
@@ -160,7 +172,8 @@ and a process type that matches the bot exactly (no web listener required).
    - **Start Command**: `python bot.py`
      (The repo's `Procfile` already declares `worker: python bot.py`, so you
      can also leave this field on its Procfile default — Render reads it.)
-   - **Instance Type**: `Free`
+   - **Instance Type**: `Starter` (paid, ~$7/mo per service) — Background
+     Workers have **no free instance type** as of Aug 2026
 5. Click **Create Background Worker**.
 
 ### 5.2 Set environment variables
@@ -188,18 +201,25 @@ and a process type that matches the bot exactly (no web listener required).
 3. Type a bare username in the watched Discord channel → you get reactions.
 4. Each check logs one line (e.g. `Minecraft available HTTP 404 (zxqw… )`).
 
-### 5.4 Free-tier behaviour (important)
+### 5.4 Instance type & pricing (important)
 
-- Free instances are limited to **750 instance-hours per month** — a single
-  background worker running 24/7 uses ~720–744, so one worker fits. If your
-  account runs *other* free services too, their hours share the same pool.
-- Background workers don't "spin down on inactivity" the way free **web**
-  services do (there's no incoming traffic to wake them), but they do stop
-  when the monthly hour pool is exhausted — Render emails you and the service
-  resumes the next month (or you upgrade).
-- Free instances are shared-CPU and can be recycled; discord.py reconnects
-  automatically and Render restarts the process, so brief blips are normal.
-- Verify current free-tier terms on [Render's pricing page](https://render.com/pricing) — they have changed before and may again.
+- **Background Workers have no free instance type** — you must pick a paid
+  instance (Starter, ~$7/mo per service) to run this bot on Render. Free
+  instances exist only for Web Services, Postgres, Key Value, and static
+  sites; "upgrading" your *workspace* plan does not add a free worker.
+- A **paid** worker never spins down on inactivity (there's no inbound
+  traffic anyway) and keeps the Discord connection alive 24/7, which is
+  exactly what this bot needs.
+- **Why a free Web Service won't work:** free web services spin down after
+  15 minutes without inbound traffic and take ~1 minute to wake; plus Render
+  expects a web service to answer an HTTP health check, which `bot.py` never
+  does.
+- Paid instances are billed per service per month; verify current prices on
+  [Render's pricing page](https://render.com/pricing) — terms have changed
+  before and may again.
+- Want it $0 anyway? Use the VPS option in [§9](#9-any-vps-with-systemd)
+  (e.g. Oracle Cloud Always-Free) or see the full alternatives in
+  [render.md](render.md) §14.
 
 ### 5.5 Redeploys
 
@@ -518,7 +538,7 @@ services:
   - type: worker
     name: multi-sniper
     runtime: python
-    plan: free
+    plan: starter           # workers have no free instance type
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -617,8 +637,8 @@ General symptoms first:
 Per host:
 
 - **Render** — *"Your service is starting…" forever*: open the **Events** tab;
-  a failed build shows the pip error there. *Worker stopped mid-month*: free
-  instance-hour pool exhausted (email sent) — resume next month or upgrade.
+  a failed build shows the pip error there. *"No free instance type" error at
+  creation*: Background Workers need a paid instance — pick `Starter`.
   *Auto-deploy not firing*: check **Settings → Auto-Deploy** toggle and that
   the branch matches.
 - **Railway** — *Build fails at Nixpacks*: ensure Start Command is
@@ -647,14 +667,17 @@ Per host:
 
 | Host | Free option | Paid entry | Process type | Deploy flow | Good for |
 | ---- | ----------- | ---------- | ------------ | ----------- | -------- |
-| **Render** | ✅ Free (750 instance-h/mo pool) | ~$7/mo Starter | Background Worker (no port) | GitHub auto-deploy | Default recommendation; free 24/7-ish worker |
+| **Render** | ❌ no free instance for Background Workers | ~$7/mo Starter (per service) | Background Worker (no port) | GitHub auto-deploy | Most managed; must pay per service |
 | **Railway** | Trial $5 credit; Free $0/mo with tiny usage allowance | $5/mo Hobby | Service (no port needed) | GitHub auto-deploy | Modern dashboard, near-free |
 | **Heroku** | ❌ (removed Nov 2022) | Eco $5/mo (1000 h pool) / Basic $7/mo | Worker dyno (`Procfile`) | `git push heroku` | Already on Heroku; classic flow |
 | **Fly.io** | ❌ (trial credit only) | ~$2–5/mo usage (shared-cpu-1x, 256 MB) | Machine, non-HTTP process | `fly deploy` CLI | Per-second billing, global regions |
 | **VPS** | Oracle Cloud Always-Free VM; otherwise from ~$4/mo | $4–6/mo | systemd service | `git pull` + restart | Full control, unlimited hours |
 
-**Bottom line:** run it on **Render's free Background Worker** if you want
-managed + free; run it on a **VPS** if you want zero platform risk and don't
-mind owning the box; pay a few dollars on **Railway/Fly** if you prefer their
-workflows. Every option uses the same recipe: install `requirements.txt`,
-start `python bot.py`, set `DISCORD_TOKEN`, watch the logs for the banner.
+**Bottom line:** run it on **Render's Background Worker (paid, ~$7/mo)** if
+you want the simplest managed setup; run it on a **VPS** (Oracle Always-Free
+or ~$4–6/mo) if you want $0 and don't mind owning the box; pay a few dollars
+on **Railway/Fly** if you prefer their workflows. Every option uses the same
+recipe: install `requirements.txt`, start `python bot.py`, set
+`DISCORD_TOKEN`, watch the logs for the banner. For the complete Render
+walkthrough including every token and how to acquire it, see
+[render.md](render.md).
