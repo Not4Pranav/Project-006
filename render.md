@@ -272,7 +272,9 @@ intent ON → bot invited to your server → channel IDs copied.
    `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`, `REACTION_TIMEOUT`,
    `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`, `RESULT_CACHE_TTL`,
    `DISCORD_CHECK_MODE`, `DISCORD_ACCOUNT_API_*`, `DISCORD_PROBE_*`,
-   `PROXY_URL`. Full descriptions live in [`.env.example`](.env.example).
+   `PROXY_URL`. Set `DISCORD_CHECK_MODE=dnsrobot` for the fastest DNS Robot
+   browser-flow check; it needs no extra secret. Full descriptions live in
+   [`.env.example`](.env.example).
 6. Click **Save Changes**. Render redeploys automatically.
 7. (Optional) Group related vars under **Environment Groups** for reuse across
    services.
@@ -348,11 +350,13 @@ discord.com/developers/applications
 ```
 
 - **There is no Discord bot permission that unlocks username availability.**
-  The bot's check is `off` by default. `account` mode uses the first-party
-  account-flow eligibility route (or a compatible authorized gateway) and may
-  work without a credential; if your authorized provider requires one, store
-  it as `DISCORD_ACCOUNT_API_TOKEN`. Never use or request a personal Discord
-  client token.
+  The bot's check is `off` by default. `dnsrobot` mirrors the credential-free
+  browser request used by `https://dnsrobot.net/username-checker` and needs no
+  extra secret. `account` mode uses the first-party account-flow eligibility
+  route (or a compatible authorized gateway) and may work without a credential;
+  if your authorized provider requires one, store it as
+  `DISCORD_ACCOUNT_API_TOKEN`. Never use or request a personal Discord client
+  token.
 - **Rotating:** Portal → Bot → Reset Token → paste new token into Render's
   Environment tab → Save Changes. The old token dies immediately.
 

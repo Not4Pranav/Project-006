@@ -23,6 +23,7 @@ from checkers import (
     SKIPPED,
     TAKEN,
     interpret_discord_account_api,
+    interpret_discord_dnsrobot,
     interpret_discord_probe,
     interpret_gunslol,
     interpret_minecraft,
@@ -113,6 +114,12 @@ class TestInterpreters(unittest.TestCase):
             200, {"data": {"check": {"status": 2.0}}}), ERROR)
         self.assertEqual(interpret_discord_account_api(403, {"taken": False}), BLOCKED)
         self.assertEqual(interpret_discord_account_api(200, {}), ERROR)
+
+    def test_discord_dnsrobot_uses_the_same_strict_browser_contract(self):
+        self.assertEqual(interpret_discord_dnsrobot(200, {"taken": False}), AVAILABLE)
+        self.assertEqual(interpret_discord_dnsrobot(200, {"taken": True}), TAKEN)
+        self.assertEqual(interpret_discord_dnsrobot(403, {"taken": False}), BLOCKED)
+        self.assertEqual(interpret_discord_dnsrobot(200, {"status": "available"}), ERROR)
 
 
 class TestValidators(unittest.TestCase):
@@ -239,6 +246,34 @@ class TestCheckers(unittest.TestCase):
             session.post.call_args.args[0],
             checkers.DEFAULT_DISCORD_ACCOUNT_API_URL,
         )
+
+    def test_discord_dnsrobot_mirrors_fast_browser_request_without_credentials(self):
+        session = _session_with_json(200, {"taken": False})
+        r = self.run_async(checkers.check_discord(
+            session, "Vortex", mode="dnsrobot",
+            account_api_headers={"Authorization": "Bearer must-not-forward"},
+            probe_headers={"X-Checker-Token": "must-not-forward"}))
+        self.assertEqual(r.status, AVAILABLE)
+        expected_headers = {
+            **checkers.DNSROBOT_BROWSER_HEADERS,
+            "Referer": checkers.dnsrobot_username_checker_url("Vortex"),
+        }
+        session.post.assert_called_once_with(
+            checkers.DEFAULT_DISCORD_DNSROBOT_API_URL,
+            json={"username": "vortex"},
+            proxy=None,
+            headers=expected_headers,
+        )
+        self.assertNotIn("Authorization", session.post.call_args.kwargs["headers"])
+        self.assertEqual(
+            checkers.dnsrobot_username_checker_url("a.b"),
+            "https://dnsrobot.net/username-checker?u=a.b",
+        )
+
+    def test_discord_dnsrobot_block_is_unknown(self):
+        r = self.run_async(checkers.check_discord_dnsrobot(
+            _session_with_json(403, {"message": "Forbidden"}), "vortex"))
+        self.assertEqual(r.status, BLOCKED)
 
     def test_discord_account_api_rejects_bad_url_without_request(self):
         session = _session_with_json(200, {"taken": False})

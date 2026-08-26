@@ -81,8 +81,8 @@ cp .env.example .env
 #    edit .env now — see README Phase 2 for how to get the token
 
 # 3. The full offline test suite must print OK
-python test_checkers.py             # 28 offline tests (+ 2 live, skipped)
-python test_bot.py                  # 28 pipeline tests
+python test_checkers.py             # 31 offline tests (+ 2 live, skipped)
+python test_bot.py                  # 29 pipeline tests
 
 # 4. Live smoke test of the real endpoints from your machine
 python checkers.py Notch            # Minecraft + guns.lol, Discord skipped
@@ -127,7 +127,7 @@ local `.env` file. The full annotated list is in [`.env.example`](.env.example)
 | -------- | ------- | --------- |
 | `TARGET_CHANNEL_ID` | watch every channel | the channel ID to watch (recommended) |
 | `LOG_CHANNEL_ID` | no hit logging | a private channel ID for "name found free" posts |
-| `DISCORD_CHECK_MODE` | `off` (safe default) | `account` for the opt-in Account API, or `probe` for an authorized checker |
+| `DISCORD_CHECK_MODE` | `off` (safe default) | `dnsrobot` to mirror DNS Robot's browser flow, `account` for the opt-in Account API, or `probe` for an authorized checker |
 | `DISCORD_ACCOUNT_API_URL` | Discord first-party eligibility route | optional HTTP(S) override with the same JSON contract |
 | `DISCORD_ACCOUNT_API_TOKEN` | no credential | optional authorized API/OAuth credential; never a personal client token |
 | `PROXY_URL` | direct connection | `http://user:pass@host:port` if you need one |
@@ -135,8 +135,9 @@ local `.env` file. The full annotated list is in [`.env.example`](.env.example)
 **Optional tuning** (`CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
 `REACTION_TIMEOUT`, `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`,
 `RESULT_CACHE_TTL`) — safe defaults are built in; skip them unless you know why
-you're changing them. `DISCORD_ACCOUNT_API_*` matters only in `account` mode;
-`DISCORD_PROBE_*` only matters if you enable `probe`.
+you're changing them. `dnsrobot` needs no extra credential or URL; it mirrors
+DNS Robot's browser-side request. `DISCORD_ACCOUNT_API_*` matters only in
+`account` mode; `DISCORD_PROBE_*` only matters if you enable `probe`.
 
 **Host-specific notes:**
 

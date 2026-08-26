@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import bot as bot_module
 import checkers
-from test_checkers import _session_with_status
+from test_checkers import _session_with_json, _session_with_status
 
 WATCHED = 42  # pretend channel id
 
@@ -111,6 +111,26 @@ class TestReactions(unittest.TestCase):
                          ["\U0001F579\uFE0F",   # 🕹️ Minecraft
                           "\U0001F52B",          # 🔫 guns.lol
                           "\U0001F408\u200D\u2B1B"])  # 🐈‍⬛ Discord
+
+    def test_dnsrobot_mode_uses_browser_flow_without_probe_credentials(self):
+        old_mode = bot_module.DISCORD_CHECK_MODE
+        bot_module.DISCORD_CHECK_MODE = "dnsrobot"
+        try:
+            b = make_bot(404)
+            dnsrobot_session = _session_with_json(200, {"taken": False})
+            b.http_sniper.post = dnsrobot_session.post
+            msg = make_message("zxqw99182")
+            asyncio.run(b.on_message(msg))
+            self.assertEqual(reactions(msg),
+                             ["\U0001F579\uFE0F", "\U0001F52B",
+                              "\U0001F408\u200D\u2B1B"])
+            dnsrobot_session.post.assert_called_once()
+            self.assertNotIn(
+                "Authorization",
+                dnsrobot_session.post.call_args.kwargs["headers"],
+            )
+        finally:
+            bot_module.DISCORD_CHECK_MODE = old_mode
 
     def test_taken_everywhere_gets_cross(self):
         b = make_bot(200)  # 200 everywhere -> taken on all platforms

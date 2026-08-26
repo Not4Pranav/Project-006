@@ -18,8 +18,10 @@ Important: Discord's public bot API does not expose username search. The
 optional ``account`` mode uses the first-party account-flow eligibility route
 (or an authorized compatible gateway) and is still off by default. Its JSON
 answer is parsed strictly; malformed or blocked responses remain unknown.
-``probe`` remains available for an explicit external checker URL and is never
-silently pointed at Discord's homepage.
+``dnsrobot`` mirrors the fast browser-side request used by
+https://dnsrobot.net/username-checker; it does not forward account/probe
+credentials. ``probe`` remains available for an explicit external checker URL
+and is never silently pointed at Discord's homepage.
 
 Run a one-off report without starting Discord:
 
@@ -36,7 +38,7 @@ import asyncio
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 import aiohttp
 
@@ -268,6 +270,20 @@ def interpret_discord_account_api(
     return boolean_outcome or ERROR
 
 
+def interpret_discord_dnsrobot(status: int, payload: object | None) -> str:
+    """Interpret the JSON returned by DNS Robot's browser-side Discord check.
+
+    DNS Robot's published username-checker page does not expose a DNS Robot
+    server API for Discord. Its browser code sends the candidate to Discord's
+    first-party ``username-attempt-unauthed`` route and reads the same strict
+    ``{"taken": true|false}`` shape as the account adapter. Keep this small
+    named wrapper so the mode has an explicit, auditable contract rather than
+    silently sharing account-mode configuration or credentials.
+    """
+
+    return interpret_discord_account_api(status, payload)
+
+
 # Backwards-friendly short name for callers that do not need to distinguish
 # the account API transport from the Discord platform it serves.
 interpret_discord_account = interpret_discord_account_api
@@ -459,6 +475,31 @@ DEFAULT_DISCORD_ACCOUNT_API_URL = (
 # A descriptive alias for integrations that call this an account endpoint.
 DISCORD_ACCOUNT_API_URL = DEFAULT_DISCORD_ACCOUNT_API_URL
 
+# DNS Robot's username-checker page is a browser UI, not a server-side Discord
+# API. Its published client performs one direct, unauthenticated POST to the
+# v9 route below after loading https://dnsrobot.net/username-checker?u=<name>.
+# Keeping these as separate constants makes the provenance explicit: this
+# mode mirrors the page's documented browser flow for low latency, while the
+# ordinary ``account`` mode remains independently configurable.
+DEFAULT_DISCORD_DNSROBOT_URL = "https://dnsrobot.net/username-checker"
+DEFAULT_DISCORD_DNSROBOT_API_URL = (
+    "https://discord.com/api/v9/unique-username/"
+    "username-attempt-unauthed"
+)
+DNSROBOT_USERNAME_CHECKER_URL = DEFAULT_DISCORD_DNSROBOT_URL
+DNSROBOT_BROWSER_HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Origin": "https://dnsrobot.net",
+    "Referer": DEFAULT_DISCORD_DNSROBOT_URL,
+}
+
+
+def dnsrobot_username_checker_url(username: str) -> str:
+    """Build the same query URL used by DNS Robot's username checker page."""
+
+    return f"{DEFAULT_DISCORD_DNSROBOT_URL}?{urlencode({'u': username})}"
+
 
 async def check_minecraft(session, username: str, proxy=None) -> Result:
     """Check Minecraft/Mojang availability (emoji 🕹️)."""
@@ -559,6 +600,57 @@ async def check_discord_account_api(
 check_discord_account = check_discord_account_api
 
 
+async def check_discord_dnsrobot(
+    session,
+    username: str,
+    proxy=None,
+) -> Result:
+    """Mirror DNS Robot's fast browser-side Discord availability request.
+
+    The website itself loads at :func:`dnsrobot_username_checker_url`, then its
+    JavaScript sends a JSON POST directly to Discord. There is no DNS Robot
+    server API to scrape, so this adapter mirrors that public page flow instead
+    of starting a browser or guessing an undocumented proxy. It deliberately
+    has no credential parameters: neither account-API nor probe credentials
+    are ever forwarded to the DNS Robot flow.
+    """
+
+    normalized_username = username.lower()
+    if not DISCORD_PATTERN.fullmatch(normalized_username):
+        return Result(
+            "Discord", DISCORD_EMOJI, INVALID,
+            "Discord usernames are 2-32 chars, lowercase a-z 0-9 . _",
+        )
+
+    try:
+        # The page flow is tied to the submitted candidate. Copy the public
+        # headers per request so this function cannot mutate the shared
+        # constant or inherit account/probe credentials.
+        browser_headers = {
+            **DNSROBOT_BROWSER_HEADERS,
+            "Referer": dnsrobot_username_checker_url(username),
+        }
+        status, payload = await _fetch_json(
+            session,
+            DEFAULT_DISCORD_DNSROBOT_API_URL,
+            {"username": normalized_username},
+            proxy,
+            browser_headers,
+        )
+        outcome = interpret_discord_dnsrobot(status, payload)
+        detail = f"HTTP {status} (DNS Robot browser flow)"
+        if status == 200 and outcome == ERROR:
+            detail += " (invalid account API response)"
+        elif status == 200 and isinstance(payload, Mapping):
+            if isinstance(payload.get("taken"), bool):
+                detail += f" (taken={str(payload['taken']).lower()})"
+            elif isinstance(payload.get("available"), bool):
+                detail += f" (available={str(payload['available']).lower()})"
+        return Result("Discord", DISCORD_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Discord", DISCORD_EMOJI, exc)
+
+
 async def check_discord(
     session,
     username: str,
@@ -569,13 +661,15 @@ async def check_discord(
     account_api_url: str | None = None,
     account_api_headers: Mapping[str, str] | None = None,
 ) -> Result:
-    """Check Discord in off, account-API, or external probe mode.
+    """Check Discord in off, DNS Robot, account, or probe mode.
 
-    ``off`` is the safe default. ``account`` (also accepted as
-    ``account_api``) sends a JSON eligibility request to the configured
-    account API and interprets its strict boolean response. ``probe`` remains
-    available for an external GET checker using the 200/404 contract. Neither
-    mode ever treats ``discord.com/<username>`` as an availability endpoint.
+    ``off`` is the safe default. ``dnsrobot`` mirrors the fast browser request
+    made by ``https://dnsrobot.net/username-checker?u=...`` and never accepts
+    credentials. ``account`` (also accepted as ``account_api``) sends a JSON
+    eligibility request to the configured account API and interprets its strict
+    boolean response. ``probe`` remains available for an external GET checker
+    using the 200/404 contract. No mode treats ``discord.com/<username>`` as an
+    availability endpoint.
     """
 
     mode = (mode or "off").strip().lower()
@@ -584,13 +678,15 @@ async def check_discord(
             "Discord", DISCORD_EMOJI, SKIPPED,
             "check disabled (DISCORD_CHECK_MODE=off)",
         )
+    if mode == "dnsrobot":
+        return await check_discord_dnsrobot(session, username, proxy)
     if mode in ("account", "account_api"):
         return await check_discord_account_api(
             session, username, proxy, account_api_url, account_api_headers)
     if mode != "probe":
         return Result(
             "Discord", DISCORD_EMOJI, ERROR,
-            "DISCORD_CHECK_MODE must be off, account, account_api, or probe",
+            "DISCORD_CHECK_MODE must be off, dnsrobot, account, account_api, or probe",
         )
     if not probe_url:
         return Result(
@@ -685,7 +781,8 @@ async def run_all_checks(
 
 
 # ---------------------------------------------------------------------------
-# CLI self-test: python checkers.py <username> [--mode off|account|account_api|probe]
+# CLI self-test: python checkers.py <username>
+#   [--mode off|dnsrobot|account|account_api|probe]
 # ---------------------------------------------------------------------------
 
 async def _cli(argv: list[str] | None = None) -> int:
@@ -693,8 +790,10 @@ async def _cli(argv: list[str] | None = None) -> int:
         description="Test the platform checkers without running the bot.")
     parser.add_argument("username", help="name to check, e.g. Notch")
     parser.add_argument(
-        "--mode", choices=("off", "account", "account_api", "probe"), default="off",
-        help="Discord check mode (default: off; account_api is a compatibility alias)")
+        "--mode", choices=("off", "dnsrobot", "account", "account_api", "probe"),
+        default="off",
+        help=("Discord check mode (default: off; dnsrobot mirrors DNS Robot's "
+              "browser flow; account_api is a compatibility alias)"))
     parser.add_argument("--discord-probe-url", default=None,
                         help="explicit authorized checker URL template for probe mode")
     parser.add_argument(

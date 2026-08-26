@@ -22,11 +22,17 @@ Configuration lives in .env (see .env.example):
     TARGET_CHANNEL_ID         channel to watch (blank = every channel)
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 optional HTTP(S) proxy for outbound checks
-    DISCORD_CHECK_MODE        off (default) | account | account_api | probe
+    DISCORD_CHECK_MODE        off (default) | dnsrobot | account | account_api | probe
     DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
     DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
+
+The ``dnsrobot`` mode mirrors DNS Robot's fast browser flow. The website does
+not provide a server-side Discord API; its page sends one credential-free JSON
+request to Discord, so this mode uses that same request and never forwards
+account/probe credentials.
+
     CHECK_TIMEOUT             per outbound HTTP request (default 3)
     RESPONSE_BUDGET_SECONDS   checks + reactions after MESSAGE_CREATE (default 4.5)
     REACTION_TIMEOUT          cap for each Discord reaction call (default .75)
@@ -502,9 +508,11 @@ def main() -> None:
             "your bot token from the Discord Developer Portal.")
     if "\r" in TOKEN or "\n" in TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN must not contain a line break.")
-    if DISCORD_CHECK_MODE not in ("off", "account", "account_api", "probe"):
+    if DISCORD_CHECK_MODE not in (
+            "off", "dnsrobot", "account", "account_api", "probe"):
         raise SystemExit(
-            "❌ DISCORD_CHECK_MODE must be 'off', 'account', 'account_api', or 'probe'.")
+            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', 'account', "
+            "'account_api', or 'probe'.")
     if PROXY_URL:
         proxy_error = checkers.validate_http_url(PROXY_URL, "PROXY_URL")
         if proxy_error:

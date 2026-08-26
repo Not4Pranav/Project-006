@@ -40,7 +40,7 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | :---: | --- |
 | 🕹️ | free on Minecraft |
 | 🔫 | free on guns.lol |
-| 🐈‍⬛ | **free on Discord** when the opt-in Account API or an explicit authorized probe confirms it |
+| 🐈‍⬛ | **free on Discord** when the opt-in DNS Robot browser flow, Account API, or explicit authorized probe confirms it |
 | ❌ | not available anywhere that answered |
 | ⚠️ | no free result can be confirmed: every check, or a required check, is unknown |
 | ⏳ | user exceeded their check cooldown |
@@ -72,9 +72,9 @@ Discord reactions run concurrently so retries cannot serialize past it:
              │
              ├──► [Worker A] 🕹️ Mojang primary ──blocked/error──► fallback endpoint
              ├──► [Worker B] 🔫 guns.lol profile page (status + narrow page markers)
-             └──► [Worker C] 🐈‍⬛ Account API / external checker (mode=off ⇒ SKIPPED)
-             │        each worker: validate name → GET or account JSON POST (3 s
-             │        default request cap, browser headers, optional proxy) → normalize result
+             └──► [Worker C] 🐈‍⬛ Discord mode (off / dnsrobot / account / probe)
+             │        each worker: validate name → GET or credential-free/account JSON POST
+             │        (3 s default request cap, browser headers, optional proxy) → normalize result
              │        all workers share the remaining response-deadline budget
              ▼
   STAGE 5  aggregate ....... list[Result] → cache only if at least one answer is definitive
@@ -100,8 +100,8 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | --- | --- | --- |
 | `bot.py` | Discord runtime: gateway events, filtering, cooldown, cache, reactions, logging | `SniperBot`, `on_message`, `_cooldown_hit`, `_cached`, `_react` |
 | `checkers.py` | Platform knowledge: endpoints, name rules, status-code interpretation, parallel fan-out, CLI | `run_all_checks`, `check_minecraft/gunslol/discord`, `interpret_*`, `Result`, `BROWSER_HEADERS` |
-| `test_bot.py` | 28 end-to-end pipeline tests with simulated Discord messages | — |
-| `test_checkers.py` | 28 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
+| `test_bot.py` | 29 end-to-end pipeline tests with simulated Discord messages | — |
+| `test_checkers.py` | 31 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
 | `.env` / `.env.example` | All runtime configuration; secrets never enter git | see §9 |
 | `requirements.txt` | `discord.py` (gateway+REST), `aiohttp` (platform HTTP), `python-dotenv` | — |
 | `Procfile` | Cloud start command (`worker: python bot.py`) | — |
@@ -201,7 +201,7 @@ class Result:
 | --- | --- | --- | --- | --- | --- |
 | 🕹️ Minecraft | `GET https://api.mojang.com/users/profiles/minecraft/<name>` → on blocked/transient error, retry `GET https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>` | 204, 404 | 200 (profile JSON) | not `^[A-Za-z0-9_]{3,16}$` | 403, 405, 429 |
 | 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed; status **and** narrow response markers interpreted) | 404, 410, or a 200 “username not found”/unclaimed-title page | 200 profile page with no unclaimed/challenge marker | not `^[A-Za-z0-9._-]{2,24}$` | 403, 429, 503, or 200 Cloudflare challenge page |
-| 🐈‍⬛ Discord | `off` → SKIPPED. `account`/`account_api` → JSON `POST` to `DISCORD_ACCOUNT_API_URL` (default first-party eligibility route). `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` | account response `taken: false` | account response `taken: true` | not `^[a-z0-9._]{2,32}$` (lowercase-only!) or an explicit account-API invalid response | 401, 403, 429, malformed URL/JSON (all unknown) |
+| 🐈‍⬛ Discord | `off` → SKIPPED. `dnsrobot` → mirror the browser request documented at `https://dnsrobot.net/username-checker?u=<name>` with a credential-free JSON `POST`. `account`/`account_api` → JSON `POST` to `DISCORD_ACCOUNT_API_URL`. `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` | JSON `taken: false` | JSON `taken: true` | not `^[a-z0-9._]{2,32}$` (lowercase-only!) or an explicit invalid response | 401, 403, 429, malformed URL/JSON, or network failure (all unknown) |
 
 > **Naming clarification:** [http://Gung.lol](http://Gung.lol) was a parked domain
 > when this implementation was verified, not a profile-availability service. The checker
@@ -232,14 +232,18 @@ becomes `ERROR` rather than making the member wait beyond the reaction budget.
 ### 5.4 Request profile (identical for every platform)
 
 - **Method:** `GET`, redirects followed for Minecraft/guns.lol and external
-  probe mode. Account mode uses `POST` JSON `{ "username": name }` and reads
-  `{ "taken": true|false }`; it never calls the claim endpoint. guns.lol also
-  reads its small semantic error page because an unclaimed name can be served
-  as HTTP 200.
+  probe mode. DNS Robot mode mirrors the page's browser-side `POST` JSON
+  `{ "username": name }` to Discord and reads `{ "taken": true|false }`; it
+  uses no credential and does not launch a browser. Account mode uses the same
+  JSON shape at its configured endpoint and never calls the claim endpoint.
+  guns.lol also reads its small semantic error page because an unclaimed name
+  can be served as HTTP 200.
 - **Headers:** realistic browser `User-Agent`, `Accept`, `Accept-Language`
-  (`BROWSER_HEADERS`) are used for ordinary pages. Optional account/probe
-  credentials are sent **only** to their explicitly configured endpoint,
-  never to Minecraft or guns.lol, and are never logged.
+  (`BROWSER_HEADERS`) are used for ordinary pages. DNS Robot mode adds only its
+  public page `Origin`/`Referer` and JSON content headers; it has no credential
+  input. Optional account/probe credentials are sent **only** to their
+  explicitly configured endpoint, never to Minecraft, guns.lol, or DNS Robot,
+  and are never logged.
 - **Timeouts:** `CHECK_TIMEOUT` defaults to 3 s per outbound request, while the
   three workers also share the remaining `RESPONSE_BUDGET_SECONDS` deadline
   (4.5 s default). The bot reserves `REACTION_TIMEOUT` (0.75 s default) for
@@ -331,7 +335,7 @@ Loaded once at startup from `.env` (see `.env.example`):
 | `DISCORD_TOKEN` | *(required)* | `bot.py` | from Developer Portal → Bot → Reset Token |
 | `TARGET_CHANNEL_ID` | all channels | Stage 1 | watch exactly one channel |
 | `LOG_CHANNEL_ID` | off | Stage 8 | 🎯 hits posted here |
-| `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `account` \| `account_api` (compatibility alias) \| `probe` |
+| `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `dnsrobot` \| `account` \| `account_api` (compatibility alias) \| `probe` |
 | `DISCORD_ACCOUNT_API_URL` | Discord first-party eligibility route | checker | HTTP(S) account endpoint accepting `{ "username": name }` and returning a strict boolean |
 | `DISCORD_ACCOUNT_API_TOKEN` | blank | account checker only | optional authorized API/OAuth credential; never reuse `DISCORD_TOKEN` or a personal client token |
 | `DISCORD_ACCOUNT_API_TOKEN_HEADER` | `Authorization` | account checker only | optional credential header name |
@@ -440,10 +444,11 @@ stream in the Render dashboard; the startup banner confirms config at a glance.
 - **Secrets**: bot tokens, external-checker tokens, and proxy credentials live
   only in ignored `.env` files or host secret variables. `.env.example` ships
   blank credential fields—no usable token, proxy, or API key is committed.
-- **Secret scope and logs**: account/probe credentials are attached only to
+- **Secret scope and logs**: DNS Robot mode has no credential input and adds
+  only public origin headers. Account/probe credentials are attached only to
   their explicitly configured checker request. Error details redact URL
   user-info and common token/key query fragments before they reach logs or the
-  checker CLI; the bot token is never forwarded to the account API.
+  checker CLI; the bot token is never forwarded to the account API or DNS Robot.
 - **Least privilege**: the invite URL requests exactly `Read Messages/View
   Channels`, `Send Messages`, `Add Reactions` — no admin, no manage-guild.
 - **Loop-safety**: bots *and* webhooks are ignored at Stage 1; the bot never
@@ -481,12 +486,12 @@ you're done.
 
 ## 15. Known limitations (the honest bit)
 
-- **Discord's public bot API has no username search endpoint.** Opt-in
-  `account` mode uses the first-party account-flow eligibility route (or an
-  authorized compatible gateway), sends JSON, and requires a strict boolean
-  response. A malformed response or 401/403/429 remains unknown. `probe` mode
-  is still available for an authorized external 200/404 checker, while `off`
-  remains the safe default.
+- **Discord's public bot API has no username search endpoint.** DNS Robot's
+  page is a browser UI that makes a credential-free direct request to Discord.
+  Opt-in `dnsrobot` mode mirrors that exact published browser flow for speed; it
+  does not pretend the page has a server API or launch a slow browser. A
+  malformed response or 401/403/429 remains unknown. `account`/`account_api` and
+  `probe` remain available, while `off` remains the safe default.
 - **The account route is not a claim operation.** The checker never sends a
   username update and never stores or forwards a personal Discord client token;
   confirm any candidate in Discord's own UI and follow current policies.
@@ -515,6 +520,6 @@ you're done.
 | Live platform probe | `python checkers.py <name>` | endpoint truth from your machine | yes |
 | Production | Render logs + banner | correct config, gateway connected | yes |
 
-**58 tests in the suite; 56 run offline** — `python test_checkers.py &&
+**62 tests in the suite; 60 run offline** — `python test_checkers.py &&
 python test_bot.py` must print `OK` before every deploy. The two remaining
 live-network tests run only when `LIVE=1` is set.
