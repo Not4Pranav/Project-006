@@ -15,7 +15,7 @@
 5. [The check engine](#5-the-check-engine)
 6. [Reaction decision table](#6-reaction-decision-table)
 7. [Defense layers (anti-rate-limit stack)](#7-defense-layers-anti-rate-limit-stack)
-8. [Latency budget — the 1-to-5 second promise](#8-latency-budget--the-1-to-5-second-promise)
+8. [Latency budget — the under-five-second response path](#8-latency-budget--the-under-five-second-response-path)
 9. [Configuration reference](#9-configuration-reference)
 10. [Failure-mode matrix](#10-failure-mode-matrix)
 11. [Worked example — full trace of "vortex"](#11-worked-example--full-trace-of-vortex)
@@ -30,9 +30,11 @@
 ## 1. Mission
 
 When a member posts a **bare username** in a watched Discord channel, the bot
-determines — within **1–5 seconds** — whether that name is registrable on
-**Minecraft**, **guns.lol** and (optionally, unofficially) **Discord**, and
-answers **with reactions instead of chat spam**:
+determines — with a **4.5-second default internal response budget** (clamped
+below five seconds) — whether that name is registrable on **Minecraft**,
+**guns.lol** and (optionally, unofficially) **Discord**, then answers **with
+reactions instead of chat spam**. The checker fan-out shares the budget and
+Discord reactions run concurrently so retries cannot serialize past it:
 
 | Reaction | Meaning |
 | :---: | --- |
@@ -40,7 +42,7 @@ answers **with reactions instead of chat spam**:
 | 🔫 | free on guns.lol |
 | 🐈‍⬛ | free on Discord *(probe mode only)* |
 | ❌ | not available anywhere that answered |
-| ⚠️ | every check failed — nothing definitive is known |
+| ⚠️ | no free result can be confirmed: every check, or a required check, is unknown |
 | ⏳ | user exceeded their check cooldown |
 | *(silence)* | message was not a username / wrong channel / bot or webhook author |
 
@@ -68,14 +70,15 @@ answers **with reactions instead of chat spam**:
   STAGE 3  cache ........... result seen in the last 300 s? ──yes─> jump to STAGE 6
   STAGE 4  fan-out ......... asyncio.gather — all platform checks AT ONCE
              │
-             ├──► [Worker A] 🕹️ Mojang primary ──403──► Mojang fallback endpoint
-             ├──► [Worker B] 🔫 guns.lol profile page (Cloudflare-fronted)
+             ├──► [Worker A] 🕹️ Mojang primary ──blocked/error──► fallback endpoint
+             ├──► [Worker B] 🔫 guns.lol profile page (status + narrow page markers)
              └──► [Worker C] 🐈‍⬛ Discord probe  (mode=off ⇒ instant SKIPPED)
-             │        each worker: validate name → GET (3 s cap, browser
-             │        headers, optional proxy) → interpret status code
+             │        each worker: validate name → GET (3 s default request
+             │        cap, browser headers, optional proxy) → normalize result
+             │        all workers share the remaining response-deadline budget
              ▼
-  STAGE 5  aggregate ....... list[Result] → cached under name.lower()
-  STAGE 6  react ........... one emoji per AVAILABLE platform (in fixed order)
+  STAGE 5  aggregate ....... list[Result] → cache only if at least one answer is definitive
+  STAGE 6  react ........... AVAILABLE emojis concurrently (fixed logical order)
   STAGE 7  fallback ........ none available? → ❌ (or ⚠️ if nothing definitive)
   STAGE 8  log ............. any hits? → post to 📋 LOG_CHANNEL_ID (optional)
 ========================================================================================
@@ -97,8 +100,8 @@ answers **with reactions instead of chat spam**:
 | --- | --- | --- |
 | `bot.py` | Discord runtime: gateway events, filtering, cooldown, cache, reactions, logging | `SniperBot`, `on_message`, `_cooldown_hit`, `_cached`, `_react` |
 | `checkers.py` | Platform knowledge: endpoints, name rules, status-code interpretation, parallel fan-out, CLI | `run_all_checks`, `check_minecraft/gunslol/discord`, `interpret_*`, `Result`, `BROWSER_HEADERS` |
-| `test_bot.py` | 17 end-to-end pipeline tests with simulated Discord messages | — |
-| `test_checkers.py` | 16 checker tests (offline) + 2 `LIVE=1` real-network tests | — |
+| `test_bot.py` | 20 end-to-end pipeline tests with simulated Discord messages | — |
+| `test_checkers.py` | 18 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
 | `.env` / `.env.example` | All runtime configuration; secrets never enter git | see §9 |
 | `requirements.txt` | `discord.py` (gateway+REST), `aiohttp` (platform HTTP), `python-dotenv` | — |
 | `Procfile` | Cloud start command (`worker: python bot.py`) | — |
@@ -191,9 +194,9 @@ class Result:
 
 | Platform | Endpoint(s) | AVAILABLE | TAKEN | INVALID (offline rule) | BLOCKED |
 | --- | --- | --- | --- | --- | --- |
-| 🕹️ Minecraft | `GET https://api.mojang.com/users/profiles/minecraft/<name>` → on 403, retry `GET https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>` | 204, 404 | 200 (profile JSON) | not `^[A-Za-z0-9_]{3,16}$` | 403, 405, 429 |
-| 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed, final status interpreted) | 404, 410 | 200 (page renders) | not `^[A-Za-z0-9_-]{2,24}$` | 403, 429, 503 (Cloudflare) |
-| 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <DISCORD_PROBE_URL>` (default `https://discord.com/{username}`) | 404 | 200, 401, 403 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 429 |
+| 🕹️ Minecraft | `GET https://api.mojang.com/users/profiles/minecraft/<name>` → on blocked/transient error, retry `GET https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>` | 204, 404 | 200 (profile JSON) | not `^[A-Za-z0-9_]{3,16}$` | 403, 405, 429 |
+| 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed; status **and** narrow response markers interpreted) | 404, 410, or a 200 “username not found”/unclaimed-title page | 200 profile page with no unclaimed/challenge marker | not `^[A-Za-z0-9._-]{2,24}$` | 403, 429, 503, or 200 Cloudflare challenge page |
+| 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <explicit authorized DISCORD_PROBE_URL>`; blank URL also skips | custom checker 404 | custom checker 200, 401, 403 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 429 |
 
 Every other status code maps to `ERROR` (treated as "unknown", never silently
 reported as taken or free).
@@ -207,22 +210,30 @@ IPs. The checker therefore:
 validate name ──invalid──► INVALID (no request)
      │ valid
      ▼
-GET primary (api.mojang.com) ──BLOCKED──► GET fallback (api.minecraftservices.com)
-     │ definitive (200/204/404/…)              │
-     ▼                                         ▼
-   return                              definitive? return : return BLOCKED
+GET primary (api.mojang.com) ──BLOCKED / transient ERROR──► fallback lookup
+     │ definitive (200/204/404/…)                              │
+     ▼                                                         ▼
+   return                                           definitive? return : unknown
 network error on either ──► try the other ──► both fail ──► ERROR
+
+The outer shared response deadline can cancel a slow fallback; its result then
+becomes `ERROR` rather than making the member wait beyond the reaction budget.
 ```
 
 ### 5.4 Request profile (identical for every platform)
 
-- **Method:** `GET`, redirects followed, only the final status code is read.
+- **Method:** `GET`, redirects followed. Minecraft and the optional Discord
+  probe map the final status code; guns.lol also reads its small semantic error
+  page because an unclaimed name can be served as HTTP 200.
 - **Headers:** realistic browser `User-Agent`, `Accept`, `Accept-Language`
-  (`BROWSER_HEADERS`) so trivial bot filters pass.
-- **Timeout:** hard cap `CHECK_TIMEOUT` (default 3 s) — a lagging platform can
-  never stall the pipeline past the 5-second promise.
-- **Proxy:** every request optionally rides `PROXY_URL`
-  (`http://user:pass@host:port`), enabling rotating/backconnect exit IPs.
+  (`BROWSER_HEADERS`) so ordinary profile pages are requested consistently.
+- **Timeouts:** `CHECK_TIMEOUT` defaults to 3 s per outbound request, while the
+  three workers also share the remaining `RESPONSE_BUDGET_SECONDS` deadline
+  (4.5 s default). The bot reserves `REACTION_TIMEOUT` (0.75 s default) for
+  the Discord REST reactions.
+- **Proxy:** every request can optionally use `PROXY_URL`
+  (`http://user:pass@host:port`). A challenge/rate-limit response remains
+  `BLOCKED`; the bot never claims it proves availability.
 - **Concurrency:** the three checks share **one** `aiohttp.ClientSession`
   created once in `setup_hook()` (connection pooling, no per-message setup).
 
@@ -235,53 +246,63 @@ Let `A` = platforms with status AVAILABLE, and `S` = set of all statuses.
 | Condition | Reaction(s) |
 | --- | --- |
 | `A ≠ ∅` | platform emoji of every AVAILABLE platform, fixed order 🕹️ 🔫 🐈‍⬛ |
-| `A = ∅` and `S ⊆ {TAKEN, INVALID}` (all definitive "no") | ❌ |
-| `A = ∅` and `S` mixes definitive + unknown | ❌ *(definitive platforms said taken/invalid)* |
-| `A = ∅` and `S ⊆ {ERROR, BLOCKED, SKIPPED}` (nothing definitive) | ⚠️ |
+| `A = ∅` and `S` contains `ERROR` or `BLOCKED` | ⚠️ *(another platform may still be free)* |
+| `A = ∅` and `S ⊆ {SKIPPED}` (nothing was checkable) | ⚠️ |
+| `A = ∅` and remaining statuses are only `TAKEN`, `INVALID`, and/or `SKIPPED` | ❌ |
 | cooldown exceeded | ⏳ (only) |
 | message rejected by Stage 1 | *(silence)* |
 
-> The ⚠️ path is deliberate honesty: if every platform errored, saying ❌
-> ("taken") would be a lie. Example: Discord check `off` + Mojang timeout +
-> guns.lol 403 → ⚠️.
+> The ⚠️ path is deliberate honesty: if an unblocked platform is still unknown,
+> saying ❌ ("taken everywhere") would be a lie. Example: Discord check `off`
+> + Mojang timeout + guns.lol 403 → ⚠️; likewise, Minecraft `TAKEN` + guns.lol
+> `BLOCKED` is still ⚠️ because guns.lol might be free.
 
 ---
 
 ## 7. Defense layers (anti-rate-limit stack)
 
-The platforms rate-limit hard (Mojang especially). Five layers stack:
+The platforms rate-limit hard (Mojang especially). Six layers stack:
 
 | Layer | Mechanism | Default | Protects |
 | --- | --- | --- | --- |
 | 1. Input filter | regex + bot/webhook/channel gates | always on | stops junk traffic before it exists |
 | 2. Per-user cooldown | token bucket, 3 checks / 60 s | 3/60 s | one member can't flood |
-| 3. Result cache | TTL 300 s keyed `name.lower()` | 300 s | the *same* name never hits platforms twice in 5 min |
+| 3. Result cache | complete definitive result sets only, TTL 300 s keyed `name.lower()` | 300 s | repeat names do not re-hit platforms; partial outages are not cached |
 | 4. Offline validation | per-platform name rules | always on | impossible names cost 0 requests |
-| 5. Proxy routing | optional `PROXY_URL` per request | off | rotates exit IP when hosts wall datacenter IPs |
+| 5. Per-request cap | `CHECK_TIMEOUT` | 3 s | one socket cannot hang the worker |
+| 6. Shared response deadline | checks + parallel reactions | 4.5 s | fallback retries cannot push the visible answer past five seconds |
 
-Plus resilience: 3 s per-request timeout, Mojang fallback endpoint, and
+Plus resilience: Mojang fallback, body-aware guns.lol interpretation, and
 per-check exception isolation — one platform melting down never cancels the
-others (`gather` without `return_exceptions` is safe because every checker
-**catches its own** network errors and returns `ERROR` instead of raising).
+others. A timeout turns into an honest `ERROR` result rather than a fabricated
+“taken” answer.
 
 ---
 
-## 8. Latency budget — the 1-to-5 second promise
+## 8. Latency budget — the under-five-second response path
 
-Typical end-to-end for one message (parallel stages counted once):
+The budget starts when `on_message` receives a valid Discord event (gateway
+transport time occurs before that). It is deliberately smaller than five
+seconds to leave scheduling headroom:
 
 ```
-Discord gateway delivery .............................   50–300 ms   (Discord's side)
 Stage 1–3 filter + cooldown + cache ..................      < 1 ms
-Stage 4 slowest platform check (parallel) ............   200–800 ms   (DNS+TLS+RTT, ≤3 s cap)
-Stage 6–7 reaction REST calls (1–3, sequential) ......   100–600 ms
-────────────────────────────────────────────────────────────────────
-TYPICAL TOTAL ........................................    ~0.4–1.7 s
-WORST CASE (one platform times out at 3 s) ...........    ~3.8 s     ✔ still < 5 s
+Shared checker fan-out (parallel) ....................   200–800 ms typical
+  └── hard cap: RESPONSE_BUDGET_SECONDS - REACTION_TIMEOUT
+Parallel reaction REST calls ..........................   100–600 ms typical
+  └── each hard-capped at REACTION_TIMEOUT
+────────────────────────────────────────────────────────────────────────────
+TYPICAL HANDLER TIME ..................................    ~0.3–1.4 s
+DEFAULT HANDLER CEILING ...............................       4.5 s
 ```
 
-Worst case is bounded by construction: gateway latency + 3 s timeout +
-reaction calls — the budget the original blueprint demanded.
+With defaults, the fan-out has roughly **3.75 s** and reactions retain **0.75
+s**. `run_all_checks` applies that same wall-clock cap to all workers; the bot
+wraps it in a second outer timeout as a safety fence. If the checker budget is
+exhausted, workers become `ERROR` and the bot can still add ⚠️ in the reserved
+reaction time. Availability outcomes cannot guarantee Discord's own network
+or API uptime, but the application never intentionally waits past its internal
+4.5-second handler budget.
 
 ---
 
@@ -295,9 +316,11 @@ Loaded once at startup from `.env` (see `.env.example`):
 | `TARGET_CHANNEL_ID` | all channels | Stage 1 | watch exactly one channel |
 | `LOG_CHANNEL_ID` | off | Stage 8 | 🎯 hits posted here |
 | `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `probe` |
-| `DISCORD_PROBE_URL` | `https://discord.com/{username}` | checker | `{username}` template slot |
+| `DISCORD_PROBE_URL` | blank | checker | explicit authorized `{username}` template required for probe mode; Discord homepage is never used |
 | `PROXY_URL` | direct | all requests | `http://user:pass@host:port` |
-| `CHECK_TIMEOUT` | `3` | aiohttp session | seconds, hard cap per request |
+| `CHECK_TIMEOUT` | `3` | aiohttp session | seconds, hard cap per outbound request (clamped below response budget) |
+| `RESPONSE_BUDGET_SECONDS` | `4.5` | stages 4–7 | total valid-message checker + reaction budget; clamped below 5 seconds |
+| `REACTION_TIMEOUT` | `0.75` | Stage 6 | cap for each concurrent Discord reaction REST call |
 | `USER_MAX_CHECKS` | `3` | Stage 2 | per user per window |
 | `USER_WINDOW_SECONDS` | `60` | Stage 2 | window length |
 | `RESULT_CACHE_TTL` | `300` | Stage 3 | seconds |
@@ -309,9 +332,10 @@ Loaded once at startup from `.env` (see `.env.example`):
 | What breaks | What the bot does | Member sees |
 | --- | --- | --- |
 | One platform times out | other platforms still answer | partial emojis or ❌ |
+| Shared checker deadline expires | outstanding workers become ERROR; reaction reserve remains | ⚠️ or a definitive partial answer |
 | All platforms unreachable | every check returns ERROR | ⚠️ |
-| guns.lol Cloudflare wall (403/503) | status BLOCKED, logged | ⚠️ or ❌ (with guns.lol omitted) |
-| Mojang rate limit | automatic retry on fallback endpoint | normal emojis, slower |
+| guns.lol Cloudflare wall (403/503 or 200 challenge page) | status BLOCKED, logged | ⚠️ or ❌ (with guns.lol omitted) |
+| Mojang rate limit | automatic retry on fallback endpoint while deadline remains | normal emojis or an honest partial/⚠️ answer |
 | Missing Add-Reactions permission | logged warning, checks continue | nothing (check server logs) |
 | Bad/missing token | clean `SystemExit` with instructions | bot offline, console explains |
 | Webhook mirrors channel content | ignored at Stage 1 — no reaction loops | — |
@@ -332,7 +356,7 @@ t=0 ms    Stage 2: bucket[user] = [now]  (1/3 used)
 t=0 ms    Stage 3: "vortex" not in cache → miss
 t=1 ms    Stage 4: gather() launches three coroutines
             ├─ Minecraft: ^[A-Za-z0-9_]{3,16}$ ✓ → GET api.mojang.com/.../vortex
-            ├─ guns.lol : ^[A-Za-z0-9_-]{2,24}$ ✓ → GET guns.lol/vortex
+            ├─ guns.lol : ^[A-Za-z0-9._-]{2,24}$ ✓ → GET guns.lol/vortex
             └─ Discord  : mode=off → Result(SKIPPED) instantly
 t=420 ms  Minecraft answers 204 → interpret → AVAILABLE
 t=510 ms  guns.lol answers 404  → interpret → AVAILABLE
@@ -457,5 +481,6 @@ you're done.
 | Live platform probe | `python checkers.py <name>` | endpoint truth from your machine | yes |
 | Production | Render logs + banner | correct config, gateway connected | yes |
 
-**33 offline tests total — `python test_checkers.py && python test_bot.py`
-must print `OK` before every deploy.**
+**40 tests in the suite; 38 run offline** — `python test_checkers.py &&
+python test_bot.py` must print `OK` before every deploy. The two remaining
+live-network tests run only when `LIVE=1` is set.

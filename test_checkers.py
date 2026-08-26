@@ -10,7 +10,7 @@ Live tests (hit the REAL Mojang / guns.lol endpoints from your machine):
 import asyncio
 import os
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 
@@ -20,10 +20,13 @@ from checkers import (AVAILABLE, BLOCKED, ERROR, INVALID, SKIPPED, TAKEN,
                       interpret_minecraft)
 
 
-def _session_with_status(status: int):
-    """Fake aiohttp session whose GET always yields the given status."""
+def _session_with_status(status: int, body: str = ""):
+    """Fake aiohttp session whose GET yields a status and small HTML body."""
+    response = MagicMock()
+    response.status = status
+    response.text = AsyncMock(return_value=body)
     ctx = MagicMock()
-    ctx.__aenter__ = AsyncMock(return_value=MagicMock(status=status))
+    ctx.__aenter__ = AsyncMock(return_value=response)
     ctx.__aexit__ = AsyncMock(return_value=False)
     session = MagicMock()
     session.get = MagicMock(return_value=ctx)
@@ -46,6 +49,19 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_gunslol(403), BLOCKED)      # Cloudflare
         self.assertEqual(interpret_gunslol(503), BLOCKED)
         self.assertEqual(interpret_gunslol(418), ERROR)
+
+    def test_gunslol_200_page_semantics(self):
+        # guns.lol may return 200 for its semantic "unclaimed" page.
+        self.assertEqual(
+            interpret_gunslol(200, "<h1>Username not found</h1>"), AVAILABLE)
+        self.assertEqual(
+            interpret_gunslol(200, "<title>Everything you want | guns.lol</title>"), AVAILABLE)
+        self.assertEqual(
+            interpret_gunslol(200, "<title>Just a moment...</title>"), BLOCKED)
+        # Do not confuse a claimed profile's generic Discord-widget text with
+        # the narrower availability marker above.
+        self.assertEqual(
+            interpret_gunslol(200, "<p>User Not Found on Discord</p>"), TAKEN)
 
     def test_discord_probe(self):
         self.assertEqual(interpret_discord_probe(200), TAKEN)
@@ -71,6 +87,7 @@ class TestValidators(unittest.TestCase):
         self.assertIsNone(checkers.MINECRAFT_PATTERN.fullmatch("ab"))       # <3
         self.assertIsNone(checkers.MINECRAFT_PATTERN.fullmatch("x" * 17))   # >16
         self.assertIsNone(checkers.MINECRAFT_PATTERN.fullmatch("bad name"))
+        self.assertIsNotNone(checkers.GUNSLOL_PATTERN.fullmatch("id.search"))
         self.assertIsNone(checkers.DISCORD_PATTERN.fullmatch("Notch"))      # uppercase
         self.assertIsNotNone(checkers.DISCORD_PATTERN.fullmatch("notch.dev"))
 
@@ -103,13 +120,27 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_gunslol(_session_with_status(403), "zxqw99182"))
         self.assertEqual(r.status, BLOCKED)
 
+    def test_gunslol_unclaimed_200_page(self):
+        r = self.run_async(checkers.check_gunslol(
+            _session_with_status(200, "<h1>Username not found</h1>"),
+            "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertIn("unclaimed page", r.detail)
+
     def test_discord_off_by_default(self):
         r = self.run_async(checkers.check_discord(_session_with_status(200), "vortex", mode="off"))
         self.assertEqual(r.status, SKIPPED)
 
     def test_discord_probe(self):
-        r = self.run_async(checkers.check_discord(_session_with_status(404), "vortex", mode="probe"))
+        r = self.run_async(checkers.check_discord(
+            _session_with_status(404), "vortex", mode="probe",
+            probe_url="https://checker.example/{username}"))
         self.assertEqual(r.status, AVAILABLE)
+
+    def test_discord_probe_requires_explicit_url(self):
+        r = self.run_async(checkers.check_discord(
+            _session_with_status(404), "vortex", mode="probe"))
+        self.assertEqual(r.status, SKIPPED)
 
     def test_network_error_handled(self):
         broken = MagicMock()
@@ -120,9 +151,24 @@ class TestCheckers(unittest.TestCase):
 
     def test_parallel_run_all(self):
         results = self.run_async(checkers.run_all_checks(
-            _session_with_status(404), "zxqw99182", discord_mode="probe"))
+            _session_with_status(404), "zxqw99182", discord_mode="probe",
+            discord_probe_url="https://checker.example/{username}"))
         self.assertEqual(len(results), 3)
         self.assertTrue(all(r.available for r in results))
+
+    def test_shared_deadline_returns_honest_error_results(self):
+        async def slow_checker(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            return checkers.Result("unexpected", "?", AVAILABLE)
+
+        with patch.object(checkers, "check_minecraft", slow_checker), \
+             patch.object(checkers, "check_gunslol", slow_checker), \
+             patch.object(checkers, "check_discord", slow_checker):
+            results = self.run_async(checkers.run_all_checks(
+                _session_with_status(404), "zxqw99182", timeout=0.001))
+
+        self.assertEqual([r.status for r in results], [ERROR, ERROR, ERROR])
+        self.assertTrue(all("deadline" in r.detail for r in results))
 
 
 class TestLiveNetwork(unittest.TestCase):

@@ -8,8 +8,9 @@ Run with plain Python:     python test_bot.py
 """
 
 import asyncio
+import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import checkers
 import bot as bot_module
@@ -94,10 +95,13 @@ class TestFilters(unittest.TestCase):
 class TestReactions(unittest.TestCase):
     def setUp(self):
         self.old_mode = bot_module.DISCORD_CHECK_MODE
+        self.old_probe_url = bot_module.DISCORD_PROBE_URL
         bot_module.DISCORD_CHECK_MODE = "probe"
+        bot_module.DISCORD_PROBE_URL = "https://checker.example/{username}"
 
     def tearDown(self):
         bot_module.DISCORD_CHECK_MODE = self.old_mode
+        bot_module.DISCORD_PROBE_URL = self.old_probe_url
 
     def test_free_everywhere_gets_all_three_emojis(self):
         b = make_bot(404)  # 404 everywhere -> free on all platforms
@@ -139,10 +143,25 @@ class TestReactions(unittest.TestCase):
         broken.get = MagicMock(side_effect=checkers.aiohttp.ClientError("down"))
         b = make_bot()
         b.http_sniper = broken
-        # lowercase name so the Discord probe is *valid* and actually errors
+        # Lowercase name so the Discord probe is valid and actually errors.
         msg = make_message("vortex")
         asyncio.run(b.on_message(msg))
         self.assertEqual(reactions(msg), ["⚠️"])
+
+    def test_partial_outage_gets_warning_not_misleading_cross(self):
+        async def partial_results(*_args, **_kwargs):
+            return [
+                checkers.Result("Minecraft", "🕹️", checkers.TAKEN),
+                checkers.Result("guns.lol", "🔫", checkers.BLOCKED),
+                checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+            ]
+
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch.object(checkers, "run_all_checks", partial_results):
+            asyncio.run(b.on_message(msg))
+        self.assertEqual(reactions(msg), ["⚠️"])
+        self.assertNotIn("vortex", b._cache)
 
 
 class TestCooldown(unittest.TestCase):
@@ -182,10 +201,46 @@ class TestCache(unittest.TestCase):
         second = make_message("zxqw99182", user_id=2)  # different user
         asyncio.run(b.on_message(first))
         asyncio.run(b.on_message(second))
-        # only ONE round of HTTP requests for two messages
+        # Only ONE round of HTTP requests for two messages.
         self.assertEqual(b.http_sniper.get.call_count, 2)  # MC + guns.lol
-        # but both messages still get their reactions
+        # But both messages still get their reactions.
         self.assertEqual(reactions(first), reactions(second))
+
+    def test_inconclusive_outage_is_not_cached(self):
+        broken = MagicMock()
+        broken.get = MagicMock(side_effect=checkers.aiohttp.ClientError("down"))
+        b = make_bot()
+        b.http_sniper = broken
+        asyncio.run(b.on_message(make_message("vortex")))
+        self.assertNotIn("vortex", b._cache)
+
+
+class TestLatencyBudget(unittest.TestCase):
+    def test_outer_deadline_stops_a_non_cooperative_checker(self):
+        old_budget = bot_module.RESPONSE_BUDGET_SECONDS
+        old_reaction_timeout = bot_module.REACTION_TIMEOUT
+
+        async def ignores_its_timeout(*_args, **_kwargs):
+            await asyncio.sleep(0.2)
+            return []
+
+        bot_module.RESPONSE_BUDGET_SECONDS = 0.05
+        bot_module.REACTION_TIMEOUT = 0.01
+        try:
+            b = make_bot()
+            message = make_message("vortex")
+            started = time.monotonic()
+            with patch.object(checkers, "run_all_checks", ignores_its_timeout):
+                asyncio.run(b.on_message(message))
+            elapsed = time.monotonic() - started
+        finally:
+            bot_module.RESPONSE_BUDGET_SECONDS = old_budget
+            bot_module.REACTION_TIMEOUT = old_reaction_timeout
+
+        # The outer wait_for fence protects the reaction deadline even if a
+        # future checker implementation forgets to honour its timeout argument.
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(reactions(message), ["⚠️"])
 
 
 class TestConfigErrors(unittest.TestCase):
