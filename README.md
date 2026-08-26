@@ -92,6 +92,7 @@ it only to that endpoint and never logs it. It never pretends
 ├── bot.py            # the runtime: gateway events, filters, cooldown, reactions
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
 ├── blueprint.md      # technical deep-dive: how every stage works internally
+├── CLOUD_SETUP.md    # detailed 24/7 cloud deployment guide (Render, Railway, Heroku, Fly.io, VPS)
 ├── test_checkers.py  # 22 offline checker tests + 2 optional LIVE=1 network tests
 ├── test_bot.py       # 25 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets
@@ -374,6 +375,11 @@ variable is your Discord setup, not the code.
 A Discord bot only runs while its process is alive, so for always-on behavior
 you run it on a host. Render's free **Background Worker** is the default path
 for this repo; Railway and any Python 3.9+ VPS work the same way.
+
+> **Full walkthroughs for five hosts** (Render, Railway, Heroku, Fly.io, VPS +
+> systemd — including a Dockerfile, a `render.yaml` blueprint, secrets
+> handling, redeploys, and per-host troubleshooting) live in
+> [CLOUD_SETUP.md](CLOUD_SETUP.md). The steps below are the quick Render path.
 
 ### Render, step by step
 
