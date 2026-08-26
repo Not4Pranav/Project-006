@@ -2,15 +2,21 @@
 Offline tests for the Multi-Sniper checkers - no network needed.
 
 Run with plain Python:     python test_checkers.py
+
+Live tests (hit the REAL Mojang / guns.lol endpoints from your machine):
+    LIVE=1 python test_checkers.py
 """
 
 import asyncio
+import os
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
+
+import aiohttp
 
 import checkers
 from checkers import (AVAILABLE, BLOCKED, ERROR, INVALID, SKIPPED, TAKEN,
-                      Result, interpret_discord_probe, interpret_gunslol,
+                      interpret_discord_probe, interpret_gunslol,
                       interpret_minecraft)
 
 
@@ -117,6 +123,34 @@ class TestCheckers(unittest.TestCase):
             _session_with_status(404), "zxqw99182", discord_mode="probe"))
         self.assertEqual(len(results), 3)
         self.assertTrue(all(r.available for r in results))
+
+
+class TestLiveNetwork(unittest.TestCase):
+    """REAL network tests - opt in with LIVE=1 (e.g. from your machine)."""
+
+    def _check(self, coro):
+        async def runner():
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(
+                    headers=checkers.BROWSER_HEADERS,
+                    timeout=timeout) as session:
+                return await coro(session)
+        return asyncio.run(runner())
+
+    @unittest.skipUnless(os.getenv("LIVE") == "1", "set LIVE=1 to run")
+    def test_live_minecraft(self):
+        taken = self._check(lambda s: checkers.check_minecraft(s, "Notch"))
+        free = self._check(
+            lambda s: checkers.check_minecraft(s, "zxqw7k3vlt9m42q"))
+        self.assertEqual(taken.status, TAKEN, taken.detail)
+        self.assertEqual(free.status, AVAILABLE, free.detail)
+
+    @unittest.skipUnless(os.getenv("LIVE") == "1", "set LIVE=1 to run")
+    def test_live_gunslol(self):
+        free = self._check(
+            lambda s: checkers.check_gunslol(s, "zxqw7k3vlt9m42q"))
+        # Cloudflare may wall datacenter IPs, so FREE or BLOCKED are both sane
+        self.assertIn(free.status, (AVAILABLE, BLOCKED), free.detail)
 
 
 if __name__ == "__main__":

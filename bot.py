@@ -121,6 +121,12 @@ class SniperBot(discord.Client):
     def _cooldown_hit(self, user_id: int) -> bool:
         """True if the user exhausted their checks in the current window."""
         now = time.monotonic()
+        # occasional pruning so long-running bots don't accumulate stale users
+        if len(self._buckets) > 1000:
+            self._buckets = defaultdict(
+                deque,
+                {uid: dq for uid, dq in self._buckets.items()
+                 if dq and now - dq[-1] <= USER_WINDOW_SECONDS})
         bucket = self._buckets[user_id]
         while bucket and now - bucket[0] > USER_WINDOW_SECONDS:
             bucket.popleft()
@@ -140,7 +146,7 @@ class SniperBot(discord.Client):
             await message.add_reaction(emoji)
         except discord.Forbidden:
             log.warning("Missing 'Add Reactions' permission in #%s",
-                        message.channel)
+                        getattr(message.channel, "name", message.channel.id))
         except discord.HTTPException as exc:
             log.warning("Reaction %r failed: %s", emoji, exc)
 
@@ -160,8 +166,8 @@ class SniperBot(discord.Client):
 
     async def on_message(self, message: discord.Message) -> None:
         """Core pipeline: filter -> cooldown -> parallel checks -> reactions."""
-        # 1. Never react to bots (prevents loops with ourselves and others).
-        if message.author.bot:
+        # 1. Never react to bots or webhooks (prevents reaction loops).
+        if message.webhook_id or getattr(message.author, "bot", False):
             return
 
         # 2. Only the configured channel, if one was set.
@@ -213,6 +219,11 @@ class SniperBot(discord.Client):
         # 9. Optional: log hits to a private channel.
         if available and LOG_CHANNEL_ID:
             channel = self.get_channel(LOG_CHANNEL_ID)
+            if channel is None:
+                try:  # not in cache yet? ask the API
+                    channel = await self.fetch_channel(LOG_CHANNEL_ID)
+                except discord.HTTPException:
+                    channel = None
             if channel:
                 names = ", ".join(f"{r.platform} {r.emoji}" for r in available)
                 try:

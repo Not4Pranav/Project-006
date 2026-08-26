@@ -15,6 +15,7 @@ Corrected endpoints (the AI Mode draft used malformed URLs like
 "https://mojang.com{username}" - these are the real, verified ones):
 
     Minecraft : https://api.mojang.com/users/profiles/minecraft/<name>
+                fallback: https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>
                 200 = taken (profile JSON returned)
                 204 / 404 = no profile exists -> free
                 (documented on the Mojang API page, minecraft.wiki)
@@ -26,18 +27,19 @@ Corrected endpoints (the AI Mode draft used malformed URLs like
                 availability. Disabled ("off") by default; an optional
                 best-effort "probe" mode is kept for blueprint parity.
 
-You can test every checker from your own machine without Discord:
+Test every checker from your own machine without running the bot:
 
     python checkers.py Notch
-    python checkers.py zxqw99182vlt --proxy http://user:pass@host:port
+    python checkers.py zxqw99182vlt --mode probe --proxy http://user:pass@host:port
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import aiohttp
 
@@ -132,7 +134,7 @@ def interpret_discord_probe(status: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Async checkers
+# Low-level fetch helper
 # ---------------------------------------------------------------------------
 
 async def _fetch_status(
@@ -140,42 +142,75 @@ async def _fetch_status(
     url: str,
     proxy: Optional[str] = None,
 ) -> int:
-    """GET a URL and return only its HTTP status code. Raises on network errors."""
-    async with session.get(url, proxy=proxy, allow_redirects=False) as resp:
+    """GET a URL and return only the final HTTP status code.
+
+    Redirects are followed (aiohttp default) so the *final* page status is
+    interpreted. Raises aiohttp.ClientError / asyncio.TimeoutError on failure.
+    """
+    async with session.get(url, proxy=proxy) as resp:
         return resp.status
 
 
-async def check_minecraft(session, username, proxy=None) -> Result:
+def _safe_url(template: str, username: str) -> str:
+    """Substitute {username} into a URL template without exploding."""
+    try:
+        return template.format(username=username)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+# ---------------------------------------------------------------------------
+# Async checkers
+# ---------------------------------------------------------------------------
+
+# Mojang occasionally throws random 403s at api.mojang.com, so we retry once
+# against the equivalent minecraftservices.com lookup endpoint.
+MINECRAFT_ENDPOINTS: Sequence[str] = (
+    "https://api.mojang.com/users/profiles/minecraft/{username}",
+    "https://api.minecraftservices.com/minecraft/profile/lookup/name/{username}",
+)
+
+
+async def check_minecraft(session, username: str, proxy=None) -> Result:
     """Minecraft (Mojang) - emoji 🕹️."""
+    emoji = "\U0001F579\uFE0F"
     if not MINECRAFT_PATTERN.fullmatch(username):
-        return Result("Minecraft", "\U0001F579\uFE0F", INVALID,
+        return Result("Minecraft", emoji, INVALID,
                       "name must be 3-16 chars of A-Z a-z 0-9 _")
-    url = f"https://api.mojang.com/users/profiles/minecraft/{username}"
-    try:
-        status = await _fetch_status(session, url, proxy)
-        return Result("Minecraft", "\U0001F579\uFE0F",
-                      interpret_minecraft(status), f"HTTP {status}")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        return Result("Minecraft", "\U0001F579\uFE0F", ERROR, str(exc)[:120])
+
+    outcome: Optional[Result] = None
+    for template in MINECRAFT_ENDPOINTS:
+        url = _safe_url(template, username)
+        try:
+            status = await _fetch_status(session, url, proxy)
+            outcome = Result("Minecraft", emoji,
+                             interpret_minecraft(status), f"HTTP {status}")
+            if outcome.status != BLOCKED:
+                return outcome          # definitive answer - stop here
+            # else: rate-limited on this endpoint -> try the fallback
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            outcome = Result("Minecraft", emoji, ERROR, str(exc)[:120])
+    return outcome or Result("Minecraft", emoji, ERROR, "no endpoint attempted")
 
 
-async def check_gunslol(session, username, proxy=None) -> Result:
+async def check_gunslol(session, username: str, proxy=None) -> Result:
     """guns.lol - emoji 🔫."""
+    emoji = "\U0001F52B"
     if not GUNSLOL_PATTERN.fullmatch(username):
-        return Result("guns.lol", "\U0001F52B", INVALID,
+        return Result("guns.lol", emoji, INVALID,
                       "name must be 2-24 chars of A-Z a-z 0-9 - _")
-    url = f"https://guns.lol/{username}"
+    url = _safe_url("https://guns.lol/{username}", username)
     try:
         status = await _fetch_status(session, url, proxy)
-        return Result("guns.lol", "\U0001F52B",
+        return Result("guns.lol", emoji,
                       interpret_gunslol(status), f"HTTP {status}")
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        return Result("guns.lol", "\U0001F52B", ERROR, str(exc)[:120])
+        return Result("guns.lol", emoji, ERROR, str(exc)[:120])
 
 
 async def check_discord(
     session,
-    username,
+    username: str,
     proxy=None,
     mode: str = "off",
     probe_url: Optional[str] = None,
@@ -189,11 +224,12 @@ async def check_discord(
     """
     emoji = "\U0001F408\u200D\u2B1B"
     if mode == "off":
-        return Result("Discord", emoji, SKIPPED, "check disabled (DISCORD_CHECK_MODE=off)")
+        return Result("Discord", emoji, SKIPPED,
+                      "check disabled (DISCORD_CHECK_MODE=off)")
     if not DISCORD_PATTERN.fullmatch(username):
         return Result("Discord", emoji, INVALID,
                       "Discord usernames are 2-32 chars, lowercase a-z 0-9 . _")
-    url = (probe_url or f"https://discord.com/{username}").format(username=username)
+    url = _safe_url(probe_url or "https://discord.com/{username}", username)
     try:
         status = await _fetch_status(session, url, proxy)
         return Result("Discord", emoji,
@@ -218,19 +254,24 @@ async def run_all_checks(
 
 
 # ---------------------------------------------------------------------------
-# CLI self-test:  python checkers.py <username> [--proxy URL]
+# CLI self-test:  python checkers.py <username> [--mode off|probe] [--proxy URL]
 # ---------------------------------------------------------------------------
 
-async def _cli() -> int:
-    args = __import__("argparse").ArgumentParser(
+async def _cli(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
         description="Test the platform checkers without running the bot.")
-    args.add_argument("username", help="name to check, e.g. Notch")
-    args.add_argument("--proxy", default=None, help="optional http(s) proxy URL")
-    ns = args.parse_args()
+    parser.add_argument("username", help="name to check, e.g. Notch")
+    parser.add_argument("--mode", choices=("off", "probe"), default="off",
+                        help="Discord check mode (default: off)")
+    parser.add_argument("--proxy", default=None,
+                        help="optional http(s) proxy URL")
+    ns = parser.parse_args(argv)
 
     timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(headers=BROWSER_HEADERS, timeout=timeout) as session:
-        results = await run_all_checks(session, ns.username, ns.proxy)
+    async with aiohttp.ClientSession(headers=BROWSER_HEADERS,
+                                     timeout=timeout) as session:
+        results = await run_all_checks(session, ns.username, ns.proxy,
+                                       discord_mode=ns.mode)
 
     icon = {AVAILABLE: "[FREE]  ", TAKEN: "[TAKEN]  ", INVALID: "[INVALID]",
             BLOCKED: "[BLOCKED]", SKIPPED: "[SKIP]  ", ERROR: "[ERROR] "}
@@ -239,6 +280,7 @@ async def _cli() -> int:
     for r in results:
         print(f"  {r.emoji} {r.platform:<10} {icon[r.status]} {r.detail}")
     print("-" * 62)
+
     emojis = [r.emoji for r in results if r.available]
     if emojis:
         verdict = " ".join(emojis)
