@@ -102,98 +102,326 @@ it only to that endpoint and never logs it. It never pretends
 
 ---
 
-## 🚀 Quick start
+## 🚀 Quick start (copy-paste version)
+
+**You need three things before you start:**
+
+1. **Python 3.9 or newer** (the bot uses modern type hints; check with `python --version`).
+2. **A Discord bot application + token** from the [Discord Developer Portal](https://discord.com/developers/applications).
+3. **A channel you own** where you want the bot to watch usernames.
+
+Run these from the repo root:
 
 ```bash
+# 1. Clone / enter the repo
 git clone <this repo> && cd Project-006
-python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+
+# 2. Create an isolated environment (keeps packages out of your system Python)
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
-cp .env.example .env        # then paste your bot token into .env
+
+# 4. Create your private config file
+cp .env.example .env
+
+# 5. Open .env, paste your bot token into DISCORD_TOKEN=, then start the bot
 python bot.py
 ```
 
-Detailed phases below.
+> **Do not skip the virtual environment.** `requirements.txt` constrains the
+> Discord, aiohttp, and dotenv versions; an isolated `venv` avoids conflicts
+> with other projects.
+>
+> **`venv` and `.env` are already git-ignored** — go ahead and use them locally
+> without worrying about committing secrets.
 
-## Phase 1 — Local setup
+If you want to see the bot work in a channel, continue with the numbered phases
+below. Each phase is deliberately small so you can verify it before moving on.
+
+### The two-minute "no Discord token" smoke test
+
+You do not **need** a Discord token to verify the install. The checkers and the
+full offline test suite run without connecting to Discord at all:
 
 ```bash
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python checkers.py Notch                # live: Minecraft + guns.lol, Discord skipped
+python test_checkers.py                 # 22 offline tests (+ 2 LIVE tests skipped)
+python test_bot.py                      # 25 end-to-end pipeline tests
 ```
 
-## Phase 2 — Discord Developer Portal
+If those print `OK`, the Python environment is set up correctly; the only thing
+left is the Discord token and intents described in [Phase 2](#phase-2--discord-developer-portal).
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → name it (e.g. *Multi-Sniper*) → **Create**.
-2. **Bot** tab → **Reset Token** → copy the token into `.env` as `DISCORD_TOKEN`. Never share it.
-3. Same tab → **Privileged Gateway Intents** → turn **Message Content Intent ON** (the bot cannot read messages without it).
-4. **OAuth2 → URL Generator** → tick the `bot` scope → tick permissions:
-   - `Read Messages/View Channels`
-   - `Send Messages`
-   - `Add Reactions`
-   *(+ `Manage Messages` if you later add auto-clean features)*
-5. Open the generated URL in a browser → pick your server → **Authorise**.
+## Phase 1 — Local setup (do this once)
 
-## Phase 3 — Configure
+The fast path above is enough, but here is what each command does so you can
+troubleshoot it:
+
+```bash
+# 1. Create a virtual environment named "venv" (only needed once).
+python -m venv venv
+
+# 2. Activate it. Every shell you use for this project must be activated first.
+source venv/bin/activate          # macOS / Linux
+venv\Scripts\activate             # Windows (cmd)
+venv\Scripts\Activate.ps1         # Windows (PowerShell)
+
+# 3. Confirm you are using the venv (should print a venv path, not /usr/bin/python).
+python --version
+which python                       # macOS/Linux
+where python                       # Windows
+
+# 4. Install the runtime dependencies (version constraints are in requirements.txt).
+pip install -r requirements.txt
+
+# 5. (Optional but useful) fast byte-code compilation check of every file.
+python -m py_compile bot.py checkers.py test_bot.py test_checkers.py && echo "compile OK"
+```
+
+**What gets installed (from `requirements.txt`):**
+
+| Package | Why it is here |
+| ------- | -------------- |
+| `discord.py>=2.3,<3` | Discord gateway + `messageCreate` events, REST reactions |
+| `aiohttp>=3.9,<4` | Async HTTP clients for the Minecraft / guns.lol / probe checks |
+| `python-dotenv>=1.0,<2` | Loads `.env` into environment variables at startup |
+
+### Common Phase 1 problems
+
+| Problem | Fix |
+| ------- | --- |
+| `command not found: python` (macOS) | Use `python3`, or install Python 3.9+ from [python.org](https://www.python.org). |
+| `No module named pip` | Reinstall Python with pip, or run `python -m ensurepip`. |
+| `ERROR: Could not install packages` | Try `python -m pip install --upgrade pip`, then re-run `pip install -r requirements.txt`. |
+| Command still uses the old Python | Re-activate the venv (`source venv/bin/activate`) and run `which python`. |
+
+## Phase 2 — Create the Discord application (do this once)
+
+The bot needs a Discord "application" with a **bot user**, a **token**, and the
+**Message Content intent**. It also needs to be **invited** to your server with
+the right permissions.
+
+1. **Create the application**
+   Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+   → **New Application** → name it (e.g. *Multi-Sniper*) → **Create**. You'll
+   land on the application's *General Information* page.
+
+2. **Create the bot user**
+   In the left sidebar → **Bot** → **Add Bot** → confirm. You now have a bot
+   account with a name and icon.
+
+3. **Copy the token**
+   On the same **Bot** page → **Reset Token** → copy it. This is your
+   `DISCORD_TOKEN`. **Never** share it, commit it, or paste it into this README;
+   it is the password to the bot.
+
+4. **Enable the Message Content intent (critical)**
+   On the same **Bot** page, scroll to **Privileged Gateway Intents** and turn
+   **Message Content Intent ON**. Without this the bot receives messages as
+   empty content and will never react. (You do **not** need *Presence* or *Server
+   Members*.)
+
+5. **Generate an invite link**
+   Left sidebar → **OAuth2 → URL Generator**:
+   - **Scopes**: tick `bot`
+   - **Bot permissions**: tick
+     - `Read Messages/View Channels`
+     - `Send Messages`
+     - `Add Reactions`
+     - *(optional, for future auto-clean features): `Manage Messages`*
+   - Copy the generated URL at the bottom.
+
+6. **Invite the bot**
+   Open the copied URL in a browser → select your server → **Authorise** →
+   complete any CAPTCHA. The bot should now appear in your server's member list.
+
+7. **Find the channel IDs (optional but recommended)**
+   Discord → **Settings → Advanced → Developer Mode ON**.
+   - Right-click the target channel → **Copy Channel ID** → put it in
+     `TARGET_CHANNEL_ID`.
+   - If you want hit logging, copy the log channel ID into `LOG_CHANNEL_ID`.
+
+> **Common mistake:** creating the app but never clicking **Add Bot**. There is
+> no token to copy until the bot user exists.
+> **Checklist:** Bot exists → token copied → Message Content Intent ON → bot is
+> actually in your server.
+
+## Phase 3 — Configure the bot
+
+`bot.py` reads its settings from environment variables. Locally these come from a
+file named `.env`, which the bot loads automatically at startup (via
+`python-dotenv`). Create it from the tracked template:
 
 ```bash
 cp .env.example .env
 ```
 
-> The tracked template contains **blank credential fields**. Put bot tokens,
-> external-checker tokens, and proxy credentials only in your ignored `.env` or
-> your deployment provider's secret manager.
+> **Never** commit `.env`. The template `DISCORD_TOKEN=` is deliberately blank —
+> it is not secret and is safe to keep in git. Any real token, probe token, or
+> proxy credential belongs only in your private `.env` (or your host's secret
+> vault).
 
-| Variable | Required | Default | What it does |
-| -------- | -------- | ------- | ------------ |
-| `DISCORD_TOKEN` | ✅ | — | Bot token from the Developer Portal |
-| `TARGET_CHANNEL_ID` | — | *(all channels)* | Only react in this channel |
-| `LOG_CHANNEL_ID` | — | off | Post every "free" hit to this channel |
-| `DISCORD_CHECK_MODE` | — | `off` | `off`, or `probe` with an authorized external checker |
-| `DISCORD_PROBE_URL` | — | blank | Required HTTP(S) `{username}` URL template when `probe` is enabled; never defaults to Discord's homepage |
-| `DISCORD_PROBE_TOKEN` | — | blank | Optional credential sent **only** to `DISCORD_PROBE_URL`; never logged or stored in tracked files |
-| `DISCORD_PROBE_TOKEN_HEADER` | — | `Authorization` | Header used for the optional probe token (for example `X-API-Key`) |
-| `DISCORD_PROBE_TOKEN_SCHEME` | — | `Bearer` | Prefix before the optional token; set blank to send the raw token |
-| `PROXY_URL` | — | direct | User-supplied HTTP(S) proxy for outbound checks; validated at startup and never stored in the repo |
-| `CHECK_TIMEOUT` | — | `3` | Per-outbound-request timeout (seconds; clamped below the response budget) |
-| `RESPONSE_BUDGET_SECONDS` | — | `4.5` | Hard budget for checks **and** reactions after a valid message; clamped below 5 seconds |
-| `REACTION_TIMEOUT` | — | `0.75` | Cap for each Discord reaction REST call; platform reactions run concurrently |
-| `USER_MAX_CHECKS` | — | `3` | Checks allowed per user per window |
-| `USER_WINDOW_SECONDS` | — | `60` | Cooldown window (seconds) |
-| `RESULT_CACHE_TTL` | — | `300` | Cache repeat lookups (seconds) |
+### The absolute minimum `.env` for a working bot
 
-> Startup rejects malformed `PROXY_URL` values, external-checker URL templates,
-> and configured auth-header names before connecting. Malformed/non-finite numeric settings
-> safely fall back to defaults; credential values are never printed.
+```dotenv
+DISCORD_TOKEN=your-bot-token-here          # REQUIRED
+TARGET_CHANNEL_ID=123456789012345678      # optional; blank = every channel
+```
 
-> To copy a channel ID: Discord **Settings → Advanced → Developer Mode ON**,
-> then right-click the channel → **Copy Channel ID**.
+That is all the bot needs. Everything below has a safe default.
+
+### Every setting (with defaults and how the bot validates them)
+
+| Variable | Required | Default | Allowed / clamped values | What it does |
+| -------- | :------: | ------- | ------------------------ | ------------ |
+| `DISCORD_TOKEN` | ✅ | — | non-empty, no line break | Bot token from Phase 2, step 3. Missing/blank → bot exits at startup. |
+| `TARGET_CHANNEL_ID` | — | *(all channels)* | Snowflake ID (dev mode → *Copy Channel ID*) | Only react to messages in this channel. Blank = watch every channel the bot can see. |
+| `LOG_CHANNEL_ID` | — | off | Snowflake ID, or blank | When set, every name found free is posted to this channel. Blank = off. |
+| `DISCORD_CHECK_MODE` | — | `off` | `off` or `probe` (case-insensitive) | `off` = skip Discord. `probe` = query your own authorized checker URL. `probe` without a URL is treated as skipped. |
+| `DISCORD_PROBE_URL` | — | blank | HTTP(S) URL template containing `{username}` | The external checker used with `DISCORD_CHECK_MODE=probe`; *never* defaults to `discord.com`. |
+| `DISCORD_PROBE_TOKEN` | — | blank | any string, no CR/LF | Optional credential sent **only** to `DISCORD_PROBE_URL`. Never logged or written to tracked files. |
+| `DISCORD_PROBE_TOKEN_HEADER` | — | `Authorization` | valid HTTP header name (e.g. `X-API-Key`) | Header that carries the probe token. |
+| `DISCORD_PROBE_TOKEN_SCHEME` | — | `Bearer` | string or blank | Prefix before the probe token; blank sends the raw token with no scheme. |
+| `PROXY_URL` | — | direct | valid http/https/https-with-credentials URL | Route all outbound checks through this proxy. Validated at startup; rejected before connecting if malformed. |
+| `CHECK_TIMEOUT` | — | `3` | float, clamped to `[0.05, RESPONSE_BUDGET_SECONDS]` | Per-outbound-request timeout (seconds) for each platform check. |
+| `RESPONSE_BUDGET_SECONDS` | — | `4.5` | float, clamped to `[0.5, 4.8]` | Hard wall-clock budget from a valid message through checks **and** reactions. Kept under 5 s on purpose. |
+| `REACTION_TIMEOUT` | — | `0.75` | float, clamped to `[0.05, budget − 0.05]` | Cap for each Discord reaction REST call; free-platform reactions run concurrently. |
+| `USER_MAX_CHECKS` | — | `3` | int, `1`–`10000` | Most checks one user may fire in a cooldown window before getting ⏳. |
+| `USER_WINDOW_SECONDS` | — | `60` | float ≥ `0.1` | Length of the per-user cooldown window. |
+| `RESULT_CACHE_TTL` | — | `300` | float ≥ `0` | Reuse a previous answer for a name for this many seconds (rate-limit shield). |
+
+**How validation works:** startup checks the *required* token, the
+`DISCORD_CHECK_MODE` value, `PROXY_URL`, the probe URL template, and any
+configured auth header **before** connecting to Discord. Malformed or non-finite
+numeric values fall back to a safe default rather than crashing mid-run.
+Credential-containing values are redacted from log output.
+
+### Example: enable the optional Discord probe
+
+```dotenv
+DISCORD_CHECK_MODE=probe
+DISCORD_PROBE_URL=https://my-checker.example/name/{username}
+DISCORD_PROBE_TOKEN=keep-me-private
+DISCORD_PROBE_TOKEN_HEADER=X-API-Key
+DISCORD_PROBE_TOKEN_SCHEME=
+```
+
+> Only set these if you actually run an authorized checker service. See
+> [the honest bit](#-the-honest-bit-limitations) for why Discord is off by default.
 
 ## Phase 4 — Run & test
 
+### 4a. First run (and what you should see)
+
 ```bash
+source venv/bin/activate     # if you opened a new terminal
 python bot.py
 ```
 
-Then, in the watched channel:
+On success you'll get a startup banner listing what the bot is configured to do:
 
-| You send | Expected reaction |
-| -------- | ----------------- |
-| `Notch` | ❌ (taken on Minecraft and guns.lol) |
-| `zxqw_99182vlt` | 🕹️ 🔫 (free on both) |
-| two words / a sentence | *(ignored — no reaction)* |
-| spamming more than 3 names in 60s | ⏳ |
+```
+==========================================================
+🟢 MULTI-SNIPER ONLINE as Multi-Sniper
+🔒 Watching channel : 123456789012345678
+🕹️ Platforms        : Minecraft | guns.lol | Discord (mode: off)
+🧊 Proxy            : off (direct)
+⏳ User cooldown    : 3 checks / 60s
+⚡ Response budget  : 4.50s (reaction cap 0.75s)
+==========================================================
+```
+
+Keep it running while you test. Stop it with `Ctrl+C`.
+
+### 4b. Behavior in your channel
+
+Type a single bare username (no spaces) in the watched channel:
+
+| You send | Expected reaction | Why |
+| -------- | ----------------- | --- |
+| `Notch` | ❌ | Taken on Minecraft and guns.lol |
+| `zxqw_99182vlt` | 🕹️ 🔫 | Free on both |
+| two words / a sentence | *(no reaction)* | Not a bare username — filtered out |
+| same user again within 60 s (past 3 checks) | ⏳ | Cooldown reached |
+
+A name that one platform rejects as impossible (e.g. Minecraft names shorter
+than 3 chars) never sends an HTTP request and is treated as **invalid** for that
+platform.
+
+### 4c. Run the offline test suite
+
+The tests need **no Discord token and make no network calls** (except the two
+live tests that are skipped by default):
+
+```bash
+python test_checkers.py      # 22 offline checker tests (+ 2 live tests skipped)
+python test_bot.py           # 25 end-to-end pipeline tests
+```
+
+Both should end with `OK`. The two live tests run only when you ask for them:
+
+```bash
+LIVE=1 python test_checkers.py
+```
+
+If every test prints `OK`, the environment is correct and the only remaining
+variable is your Discord setup, not the code.
 
 ## Phase 5 — 24/7 hosting on Render (free tier)
 
-1. Push this project to a **private** GitHub repo (`.env` is already git-ignored — keep it that way).
-2. On [Render](https://render.com) → **New + → Background Worker** → connect the repo.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `python bot.py`  *(the included `Procfile` already declares this)*
-5. **Advanced → Environment Variables** — add `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`, and any optional vars. Do **not** commit them to git.
-6. **Deploy** — watch the live logs; you should see the startup banner.
+A Discord bot only runs while its process is alive, so for always-on behavior
+you run it on a host. Render's free **Background Worker** is the default path
+for this repo; Railway and any Python 3.9+ VPS work the same way.
 
-Railway/Fly.io/any VPS with Python 3.9+ works identically.
+### Render, step by step
+
+1. **Push to a private repo.**
+   Create a private GitHub repo and push this project (`.env` is already
+   git-ignored; the tracked `.env.example` contains *no* credentials).
+
+2. **Create the service.**
+   On [Render](https://render.com) → **New + → Background Worker** → connect
+   your private repo.
+
+3. **Build command**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Start command**
+   ```bash
+   python bot.py
+   ```
+   The included `Procfile` already declares exactly this (`worker: python bot.py`),
+   so you can also leave the start command field on its Procfile default.
+
+5. **Set environment variables.**
+   In Render's **Environment** tab, add at minimum:
+   - `DISCORD_TOKEN` → your bot token
+   - `TARGET_CHANNEL_ID` → the channel to watch (optional; blank = all channels)
+
+   Add any optional vars from [Phase 3](#phase-3--configure-the-bot)
+   (`LOG_CHANNEL_ID`, `PROXY_URL`, timeouts, etc.) there too. Never put these in
+   git.
+
+6. **Deploy & observe.**
+   Trigger **Deploy**, then open the **Logs** tab. You should see the startup
+   banner and, after you type a name in Discord, one line per platform check.
+   Background workers have no public URL; the logs are where you watch it.
+
+### Other hosts (same pattern)
+
+| Host | Service type | Start command | Notes |
+| ---- | ------------ | ------------- | ----- |
+| [Render](https://render.com) | Background Worker | `python bot.py` | Free tier; use the `Procfile` |
+| [Railway](https://railway.app) | Service | `python bot.py` | Add env vars in the dashboard |
+| [Fly.io](https://fly.io) | `fly launch` + `fly deploy` | `python bot.py` | Add `[processes] app = "python bot.py"` |
+| Any VPS | systemd / tmux / screen | `python bot.py` | `pip install -r requirements.txt` first |
+
+> **Do not** use a host that requires a listening HTTP port for a background
+> worker — this is a long-running *worker*, not a web service.
 
 ---
 
