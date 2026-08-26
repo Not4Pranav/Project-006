@@ -201,6 +201,10 @@ class Result:
 | 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed; status **and** narrow response markers interpreted) | 404, 410, or a 200 “username not found”/unclaimed-title page | 200 profile page with no unclaimed/challenge marker | not `^[A-Za-z0-9._-]{2,24}$` | 403, 429, 503, or 200 Cloudflare challenge page |
 | 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` with optional private auth header; blank URL also skips | custom checker 404 | custom checker 200 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 401, 403, 429, malformed URL |
 
+> **Naming clarification:** [http://Gung.lol](http://Gung.lol) was a parked domain
+> when this implementation was verified, not a profile-availability service. The checker
+> deliberately targets the active `https://guns.lol/<name>` platform instead.
+
 Every other status code maps to `ERROR` (treated as "unknown", never silently
 reported as taken or free).
 

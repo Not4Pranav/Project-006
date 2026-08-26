@@ -60,6 +60,11 @@ is missing its `/` and isn't the real API). These are the verified ones:
 | guns.lol | 🔫 | `https://guns.lol/<name>` | **404/410**, or a 200 page with the specific “username not found”/unclaimed title marker | **200** profile page without a challenge/unclaimed marker | 403 / 429 / 503, or a 200 Cloudflare challenge page |
 | Discord | 🐈‍⬛ | *no public API exists* — disabled unless you provide an authorized checker URL | custom checker: **404** | custom checker: **200** | 401 / 403 / 429, malformed endpoint, or network failure |
 
+> **Target naming note:** At implementation time, [http://Gung.lol](http://Gung.lol)
+> is a parked domain rather than a profile-availability service. This project therefore
+> checks the active [guns.lol](https://guns.lol) profile platform; it does not
+> pretend that the parked `Gung.lol` domain can answer username availability.
+
 Every check also validates the name against the platform's rules *before*
 sending a request (Minecraft: `3–16` chars `A-Za-z0-9_`; guns.lol: `2–24` chars
 `A-Za-z0-9._-`; Discord: `2–32` chars lowercase `a-z0-9._`), so impossible names
