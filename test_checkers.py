@@ -98,9 +98,19 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_discord_account_api(200, {"available": True}), AVAILABLE)
         self.assertEqual(interpret_discord_account_api(200, {"available": False}), TAKEN)
         self.assertEqual(interpret_discord_account_api(
+            200, {"taken": False, "available": True}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"taken": False, "available": False}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"taken": "false"}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
             200, {"data": {"check": {"status": 2}}}), AVAILABLE)
         self.assertEqual(interpret_discord_account_api(
             200, {"data": {"check": {"status": 3}}}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": False}}}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 2.0}}}), ERROR)
         self.assertEqual(interpret_discord_account_api(403, {"taken": False}), BLOCKED)
         self.assertEqual(interpret_discord_account_api(200, {}), ERROR)
 
@@ -133,6 +143,8 @@ class TestValidators(unittest.TestCase):
                                                         "PROXY_URL"))
         self.assertIn("port", checkers.validate_http_url(
             "https://proxy.example:not-a-port", "PROXY_URL") or "")
+        self.assertIn("valid URL", checkers.validate_http_url(
+            "https://[invalid", "PROXY_URL") or "")
         self.assertIsNone(checkers.validate_probe_url_template(
             "https://checker.example/lookup/{username}"))
         self.assertIn("placeholder", checkers.validate_probe_url_template(
@@ -152,6 +164,7 @@ class TestValidators(unittest.TestCase):
         self.assertNotIn("private-value", detail)
         self.assertNotIn("private-header-value", detail)
         self.assertIn("***", detail)
+        self.assertNotIn("\n", checkers._redact_sensitive_text("remote\nerror"))
 
 
 class TestCheckers(unittest.TestCase):
@@ -256,6 +269,14 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_discord(
             _session_with_status(404), "vortex", mode="probe"))
         self.assertEqual(r.status, SKIPPED)
+
+    def test_account_api_mode_alias_uses_json_post(self):
+        session = _session_with_json(200, {"taken": True})
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="account_api",
+            account_api_url="https://discord.example/api/account"))
+        self.assertEqual(r.status, TAKEN)
+        session.post.assert_called_once()
 
     def test_network_error_handled(self):
         broken = MagicMock()

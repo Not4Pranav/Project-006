@@ -214,32 +214,58 @@ def interpret_discord_account_api(
     if status != 200 or not isinstance(payload, Mapping):
         return ERROR
 
-    for key in ("taken", "available"):
-        value = payload.get(key)
-        if isinstance(value, bool):
-            # ``available`` has the opposite meaning to ``taken``.
-            return (TAKEN if value else AVAILABLE) if key == "taken" else (
-                AVAILABLE if value else TAKEN)
-
     data = payload.get("data")
+    mappings = [payload]
     if isinstance(data, Mapping):
+        mappings.append(data)
+
+    boolean_outcomes: list[str] = []
+    for mapping in mappings:
         for key in ("taken", "available"):
-            value = data.get(key)
-            if isinstance(value, bool):
-                return (TAKEN if value else AVAILABLE) if key == "taken" else (
-                    AVAILABLE if value else TAKEN)
+            if key not in mapping:
+                continue
+            value = mapping[key]
+            if type(value) is not bool:
+                # A recognized field with a string/number/null is malformed;
+                # do not let a second compatibility field hide that problem.
+                return ERROR
+            # ``available`` has the opposite meaning to ``taken``.
+            boolean_outcomes.append(
+                (TAKEN if value else AVAILABLE) if key == "taken" else (
+                    AVAILABLE if value else TAKEN))
 
+    boolean_outcome: str | None = None
+    if boolean_outcomes:
+        if len(set(boolean_outcomes)) != 1:
+            # Contradictory fields are an unknown response, not an answer.
+            return ERROR
+        boolean_outcome = boolean_outcomes[0]
+
+    numeric_outcome: str | None = None
+    if isinstance(data, Mapping):
         check = data.get("check")
-        if isinstance(check, Mapping):
-            account_status = check.get("status")
-            if account_status == 0:
-                return INVALID
-            if account_status == 2:
-                return AVAILABLE
-            if account_status in (3, 4, 5, 6):
-                return TAKEN
+        if isinstance(check, Mapping) and "status" in check:
+            account_status = check["status"]
+            # JSON booleans and floating-point lookalikes must not be accepted
+            # as the compatibility service's integer status codes.
+            if type(account_status) is not int:
+                return ERROR
+            numeric_outcome = {
+                0: INVALID,
+                2: AVAILABLE,
+                3: TAKEN,
+                4: TAKEN,
+                5: TAKEN,
+                6: TAKEN,
+            }.get(account_status, ERROR)
+            if numeric_outcome == ERROR:
+                return ERROR
 
-    return ERROR
+    if numeric_outcome is not None:
+        if boolean_outcome is not None and boolean_outcome != numeric_outcome:
+            return ERROR
+        return numeric_outcome
+    return boolean_outcome or ERROR
 
 
 # Backwards-friendly short name for callers that do not need to distinguish
@@ -339,12 +365,13 @@ def validate_http_url(url: str, label: str = "URL") -> str | None:
 
     try:
         parsed = urlsplit(url)
-    except ValueError:
+        hostname = parsed.hostname  # may raise for malformed bracketed IPv6
+    except (TypeError, ValueError):
         return f"{label} is not a valid URL"
-    if parsed.scheme.lower() not in _HTTP_SCHEMES or not parsed.hostname:
+    if parsed.scheme.lower() not in _HTTP_SCHEMES or not hostname:
         return f"{label} must be an absolute http:// or https:// URL"
     try:
-        _ = parsed.port  # force validation of a malformed numeric port, if supplied
+        _ = parsed.port  # force validation of a malformed numeric port
     except ValueError:
         return f"{label} has an invalid port"
     if any(char.isspace() for char in url):
@@ -399,6 +426,9 @@ def _redact_sensitive_text(value: object) -> str:
     text = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1=***", text)
     text = _SENSITIVE_HEADER_PATTERN.sub(r"\1***", text)
     text = _BEARER_PATTERN.sub(r"\1***", text)
+    # Keep exception details to one log line even if a remote service returns
+    # control characters in an error message.
+    text = " ".join(text.split())
     return text[:120] or type(value).__name__
 
 
@@ -560,7 +590,7 @@ async def check_discord(
     if mode != "probe":
         return Result(
             "Discord", DISCORD_EMOJI, ERROR,
-            "DISCORD_CHECK_MODE must be off, account, or probe",
+            "DISCORD_CHECK_MODE must be off, account, account_api, or probe",
         )
     if not probe_url:
         return Result(
@@ -655,7 +685,7 @@ async def run_all_checks(
 
 
 # ---------------------------------------------------------------------------
-# CLI self-test: python checkers.py <username> [--mode off|account|probe]
+# CLI self-test: python checkers.py <username> [--mode off|account|account_api|probe]
 # ---------------------------------------------------------------------------
 
 async def _cli(argv: list[str] | None = None) -> int:
@@ -663,8 +693,8 @@ async def _cli(argv: list[str] | None = None) -> int:
         description="Test the platform checkers without running the bot.")
     parser.add_argument("username", help="name to check, e.g. Notch")
     parser.add_argument(
-        "--mode", choices=("off", "account", "probe"), default="off",
-        help="Discord check mode (default: off)")
+        "--mode", choices=("off", "account", "account_api", "probe"), default="off",
+        help="Discord check mode (default: off; account_api is a compatibility alias)")
     parser.add_argument("--discord-probe-url", default=None,
                         help="explicit authorized checker URL template for probe mode")
     parser.add_argument(

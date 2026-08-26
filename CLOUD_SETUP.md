@@ -81,8 +81,8 @@ cp .env.example .env
 #    edit .env now — see README Phase 2 for how to get the token
 
 # 3. The full offline test suite must print OK
-python test_checkers.py             # 27 offline tests (+ 2 live, skipped)
-python test_bot.py                  # 26 pipeline tests
+python test_checkers.py             # 28 offline tests (+ 2 live, skipped)
+python test_bot.py                  # 28 pipeline tests
 
 # 4. Live smoke test of the real endpoints from your machine
 python checkers.py Notch            # Minecraft + guns.lol, Discord skipped

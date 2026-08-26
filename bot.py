@@ -22,7 +22,7 @@ Configuration lives in .env (see .env.example):
     TARGET_CHANNEL_ID         channel to watch (blank = every channel)
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 optional HTTP(S) proxy for outbound checks
-    DISCORD_CHECK_MODE        off (default) | account | probe
+    DISCORD_CHECK_MODE        off (default) | account | account_api | probe
     DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
     DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
@@ -271,10 +271,26 @@ class SniperBot(discord.Client):
         if cap <= 0:
             log.warning("Skipping reaction %r: response deadline exhausted", emoji)
             return
+        reaction_task = asyncio.create_task(message.add_reaction(emoji))
         try:
-            await asyncio.wait_for(message.add_reaction(emoji), timeout=cap)
-        except asyncio.TimeoutError:
+            done, _ = await asyncio.wait({reaction_task}, timeout=cap)
+        except asyncio.CancelledError:
+            reaction_task.cancel()
+            reaction_task.add_done_callback(self._consume_cancelled_reaction_task)
+            raise
+
+        if reaction_task not in done:
+            # Do not use wait_for here: it waits for cancellation cleanup, so a
+            # non-cooperative Discord client mock or adapter could consume the
+            # entire response budget. The callback consumes the eventual task
+            # outcome without keeping this handler on the critical path.
+            reaction_task.cancel()
+            reaction_task.add_done_callback(self._consume_cancelled_reaction_task)
             log.warning("Reaction %r exceeded the %.2fs response cap", emoji, cap)
+            return
+
+        try:
+            reaction_task.result()
         except discord.Forbidden:
             log.warning("Missing 'Add Reactions' permission in #%s",
                         getattr(message.channel, "name", message.channel.id))
@@ -307,6 +323,18 @@ class SniperBot(discord.Client):
             self._react(message, emoji, timeout=per_reaction_cap)
             for emoji in emojis
         ))
+
+    @staticmethod
+    def _consume_cancelled_reaction_task(task: asyncio.Task) -> None:
+        """Consume a late reaction outcome after the response budget expires."""
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - consume any late task failure
+            log.debug("Late reaction task exited after deadline: %s",
+                      checkers._redact_sensitive_text(exc))
 
     @staticmethod
     def _consume_cancelled_checker_task(task: asyncio.Task) -> None:
@@ -472,9 +500,11 @@ def main() -> None:
         raise SystemExit(
             "❌ DISCORD_TOKEN missing. Copy .env.example to .env and paste "
             "your bot token from the Discord Developer Portal.")
+    if "\r" in TOKEN or "\n" in TOKEN:
+        raise SystemExit("❌ DISCORD_TOKEN must not contain a line break.")
     if DISCORD_CHECK_MODE not in ("off", "account", "account_api", "probe"):
         raise SystemExit(
-            "❌ DISCORD_CHECK_MODE must be 'off', 'account', or 'probe'.")
+            "❌ DISCORD_CHECK_MODE must be 'off', 'account', 'account_api', or 'probe'.")
     if PROXY_URL:
         proxy_error = checkers.validate_http_url(PROXY_URL, "PROXY_URL")
         if proxy_error:

@@ -14,7 +14,7 @@ share it and reactions run in parallel.
 | -------- | ------- |
 | 🕹️ | **Free on Minecraft** (Mojang has no profile with that name) |
 | 🔫 | **Free on guns.lol** (404/410, or its semantic “username not found” page) |
-| 🐈‍⬛ | Free on Discord *(only when the opt-in Account API confirms it — see [the honest bit](#-the-honest-bit-limitations))* |
+| 🐈‍⬛ | **Free on Discord** (opt-in Account API, or an explicit authorized probe, confirms it) |
 | ❌ | Not available on any checked platform |
 | ⚠️ | No free result can be confirmed because every check — or a required check — failed/was blocked |
 | ⏳ | User is checking too fast (cooldown) |
@@ -56,7 +56,7 @@ is missing its `/` and isn't the real API). These are the verified ones:
 
 | Platform | Emoji | Real endpoint | FREE | TAKEN | Blocked / unknown |
 | -------- | :---: | ------------- | ---- | ----- | ----------------- |
-| Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback for blocked/transient primary calls) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 429 (Mojang rate limit) |
+| Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback for blocked/transient primary calls) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 405 / 429 (Mojang rate limit or method block) |
 | guns.lol | 🔫 | `https://guns.lol/<name>` | **404/410**, or a 200 page with the specific “username not found”/unclaimed title marker | **200** profile page without a challenge/unclaimed marker | 403 / 429 / 503, or a 200 Cloudflare challenge page |
 | Discord | 🐈‍⬛ | Account API: `POST https://discord.com/api/v10/unique-username/username-attempt-unauthed` (or an authorized compatible endpoint) | JSON `{"taken": false}` | JSON `{"taken": true}` | 401 / 403 / 429, malformed response, or network failure |
 
@@ -106,8 +106,8 @@ and never logs it.
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
 ├── blueprint.md      # technical deep-dive: how every stage works internally
 ├── CLOUD_SETUP.md    # detailed 24/7 cloud deployment guide (Render, Railway, Heroku, Fly.io, VPS)
-├── test_checkers.py  # 27 offline checker tests + 2 optional LIVE=1 network tests
-├── test_bot.py       # 26 end-to-end pipeline tests (simulated Discord messages)
+├── test_checkers.py  # 28 offline checker tests + 2 optional LIVE=1 network tests
+├── test_bot.py       # 28 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets
 ├── requirements.txt  # discord.py, aiohttp, python-dotenv
 ├── Procfile          # cloud deployment start command
@@ -161,8 +161,8 @@ full offline test suite run without connecting to Discord at all:
 
 ```bash
 python checkers.py Notch                # live: Minecraft + guns.lol, Discord skipped by default
-python test_checkers.py                 # 27 offline tests (+ 2 LIVE tests skipped)
-python test_bot.py                      # 26 end-to-end pipeline tests
+python test_checkers.py                 # 28 offline tests (+ 2 LIVE tests skipped)
+python test_bot.py                      # 28 end-to-end pipeline tests
 ```
 
 If those print `OK`, the Python environment is set up correctly; the only thing
@@ -199,7 +199,7 @@ python -m py_compile bot.py checkers.py test_bot.py test_checkers.py && echo "co
 | Package | Why it is here |
 | ------- | -------------- |
 | `discord.py>=2.3,<3` | Discord gateway + `messageCreate` events, REST reactions |
-| `aiohttp>=3.9,<4` | Async HTTP clients for the Minecraft / guns.lol / probe checks |
+| `aiohttp>=3.9,<4` | Async HTTP clients for the Minecraft / guns.lol / Account API / probe checks |
 | `python-dotenv>=1.0,<2` | Loads `.env` into environment variables at startup |
 
 ### Common Phase 1 problems
@@ -293,7 +293,7 @@ That is all the bot needs. Everything below has a safe default.
 | `DISCORD_TOKEN` | ✅ | — | non-empty, no line break | Bot token from Phase 2, step 3. Missing/blank → bot exits at startup. |
 | `TARGET_CHANNEL_ID` | — | *(all channels)* | Snowflake ID (dev mode → *Copy Channel ID*) | Only react to messages in this channel. Blank = watch every channel the bot can see. |
 | `LOG_CHANNEL_ID` | — | off | Snowflake ID, or blank | When set, every name found free is posted to this channel. Blank = off. |
-| `DISCORD_CHECK_MODE` | — | `off` | `off`, `account`, or `probe` (case-insensitive) | `off` = skip Discord. `account` = POST the account API JSON contract. `probe` = query your own authorized checker URL. |
+| `DISCORD_CHECK_MODE` | — | `off` | `off`, `account`, `account_api` (compatibility alias), or `probe` (case-insensitive) | `off` = skip Discord. `account` = POST the account API JSON contract. `probe` = query your own authorized checker URL. |
 | `DISCORD_ACCOUNT_API_URL` | — | Discord first-party eligibility route | absolute HTTP(S) URL | Optional override for the account API; it must accept `{"username": "..."}` and return a strict boolean result. |
 | `DISCORD_ACCOUNT_API_TOKEN` | — | blank | any string, no CR/LF | Optional credential sent **only** to `DISCORD_ACCOUNT_API_URL`; never reuse `DISCORD_TOKEN` or a personal client token. |
 | `DISCORD_ACCOUNT_API_TOKEN_HEADER` | — | `Authorization` | valid HTTP header name | Header that carries the authorized account API credential. |
@@ -389,8 +389,8 @@ The tests need **no Discord token and make no network calls** (except the two
 live tests that are skipped by default):
 
 ```bash
-python test_checkers.py      # 27 offline checker tests (+ 2 live tests skipped)
-python test_bot.py           # 26 end-to-end pipeline tests
+python test_checkers.py      # 28 offline checker tests (+ 2 live tests skipped)
+python test_bot.py           # 28 end-to-end pipeline tests
 ```
 
 Both should end with `OK`. The two live tests run only when you ask for them:
@@ -504,9 +504,9 @@ Availability report for 'Notch':
 **Test suite (`python test_checkers.py && python test_bot.py`):**
 
 ```
-Ran 29 tests in 0.03s
+Ran 30 tests in 0.03s
 OK (skipped=2)      <- the 2 live tests run only with LIVE=1
-Ran 26 tests in 0.14s
+Ran 28 tests in 0.14s
 OK
 ```
 
@@ -573,8 +573,8 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 ## 🧪 Verifying your install (summary)
 
 ```bash
-python test_checkers.py      # 27 offline tests (+ 2 skipped live tests) — should print OK
-python test_bot.py           # 26 pipeline tests — should print OK
+python test_checkers.py      # 28 offline tests (+ 2 skipped live tests) — should print OK
+python test_bot.py           # 28 pipeline tests — should print OK
 python checkers.py Notch           # live endpoints; Discord is skipped by default
 python checkers.py vortex --mode account  # opt-in Account API check
 LIVE=1 python test_checkers.py   # enables the 2 real-network tests

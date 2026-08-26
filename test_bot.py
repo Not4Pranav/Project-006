@@ -252,6 +252,36 @@ class TestLatencyBudget(unittest.TestCase):
         self.assertLess(elapsed, 0.15)
         self.assertEqual(reactions(message), ["⚠️"])
 
+    def test_reaction_deadline_does_not_wait_for_non_cooperative_client(self):
+        async def hangs_after_cancellation(_emoji):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Simulate an adapter that delays cancellation cleanup. The
+                # handler must return before this sleep completes.
+                await asyncio.sleep(0.2)
+
+        async def scenario():
+            b = make_bot()
+            message = make_message("vortex")
+            message.add_reaction = hangs_after_cancellation
+            started = time.monotonic()
+            await b._react(message, "⚠️", timeout=0.01)
+            return time.monotonic() - started
+
+        loop = asyncio.new_event_loop()
+        try:
+            elapsed = loop.run_until_complete(scenario())
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+        self.assertLess(elapsed, 0.1)
+
 
 class TestConfigErrors(unittest.TestCase):
     def test_non_finite_number_uses_safe_default(self):
@@ -329,6 +359,16 @@ class TestConfigErrors(unittest.TestCase):
         try:
             with self.assertRaises(SystemExit):
                 bot_module.main()
+        finally:
+            bot_module.TOKEN = old
+
+    def test_token_line_break_rejected(self):
+        old = bot_module.TOKEN
+        bot_module.TOKEN = "test-bot-token\nextra"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("line break", str(raised.exception))
         finally:
             bot_module.TOKEN = old
 
