@@ -15,9 +15,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 
 import checkers
-from checkers import (AVAILABLE, BLOCKED, ERROR, INVALID, SKIPPED, TAKEN,
-                      interpret_discord_probe, interpret_gunslol,
-                      interpret_minecraft)
+from checkers import (
+    AVAILABLE,
+    BLOCKED,
+    ERROR,
+    INVALID,
+    SKIPPED,
+    TAKEN,
+    interpret_discord_probe,
+    interpret_gunslol,
+    interpret_minecraft,
+)
 
 
 def _session_with_status(status: int, body: str = ""):
@@ -65,8 +73,9 @@ class TestInterpreters(unittest.TestCase):
 
     def test_discord_probe(self):
         self.assertEqual(interpret_discord_probe(200), TAKEN)
-        self.assertEqual(interpret_discord_probe(401), TAKEN)
         self.assertEqual(interpret_discord_probe(404), AVAILABLE)
+        self.assertEqual(interpret_discord_probe(401), BLOCKED)
+        self.assertEqual(interpret_discord_probe(403), BLOCKED)
         self.assertEqual(interpret_discord_probe(429), BLOCKED)
 
 
@@ -90,6 +99,29 @@ class TestValidators(unittest.TestCase):
         self.assertIsNotNone(checkers.GUNSLOL_PATTERN.fullmatch("id.search"))
         self.assertIsNone(checkers.DISCORD_PATTERN.fullmatch("Notch"))      # uppercase
         self.assertIsNotNone(checkers.DISCORD_PATTERN.fullmatch("notch.dev"))
+
+    def test_user_supplied_endpoint_validation(self):
+        self.assertIsNone(checkers.validate_http_url("https://proxy.example:8443",
+                                                     "PROXY_URL"))
+        self.assertIsNotNone(checkers.validate_http_url("socks5://proxy.example",
+                                                        "PROXY_URL"))
+        self.assertIn("port", checkers.validate_http_url(
+            "https://proxy.example:not-a-port", "PROXY_URL") or "")
+        self.assertIsNone(checkers.validate_probe_url_template(
+            "https://checker.example/lookup/{username}"))
+        self.assertIn("placeholder", checkers.validate_probe_url_template(
+            "https://checker.example/lookup") or "")
+        self.assertTrue(checkers.is_valid_header_name("X-API-Key"))
+        self.assertFalse(checkers.is_valid_header_name("Bad\nHeader"))
+
+    def test_sensitive_error_text_is_redacted(self):
+        detail = checkers._redact_sensitive_text(
+            "proxy=http://person:secret@proxy.example?token=private-value "
+            "Authorization: Bearer private-header-value")
+        self.assertNotIn("secret", detail)
+        self.assertNotIn("private-value", detail)
+        self.assertNotIn("private-header-value", detail)
+        self.assertIn("***", detail)
 
 
 class TestCheckers(unittest.TestCase):
@@ -132,10 +164,22 @@ class TestCheckers(unittest.TestCase):
         self.assertEqual(r.status, SKIPPED)
 
     def test_discord_probe(self):
+        session = _session_with_status(404)
+        headers = {"X-Checker-Token": "not-a-real-secret"}
         r = self.run_async(checkers.check_discord(
-            _session_with_status(404), "vortex", mode="probe",
-            probe_url="https://checker.example/{username}"))
+            session, "vortex", mode="probe",
+            probe_url="https://checker.example/{username}",
+            probe_headers=headers))
         self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(session.get.call_args.kwargs["headers"], headers)
+
+    def test_discord_probe_rejects_bad_template_without_request(self):
+        session = _session_with_status(404)
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="probe",
+            probe_url="file:///tmp/{username}"))
+        self.assertEqual(r.status, ERROR)
+        session.get.assert_not_called()
 
     def test_discord_probe_requires_explicit_url(self):
         r = self.run_async(checkers.check_discord(
@@ -155,6 +199,24 @@ class TestCheckers(unittest.TestCase):
             discord_probe_url="https://checker.example/{username}"))
         self.assertEqual(len(results), 3)
         self.assertTrue(all(r.available for r in results))
+
+    def test_probe_token_is_sent_only_to_external_checker(self):
+        session = _session_with_status(404)
+        headers = {"Authorization": "Bearer not-a-real-secret"}
+        self.run_async(checkers.run_all_checks(
+            session, "zxqw99182", discord_mode="probe",
+            discord_probe_url="https://checker.example/{username}",
+            discord_probe_headers=headers))
+
+        checker_calls = []
+        platform_calls = []
+        for call in session.get.call_args_list:
+            url = call.args[0]
+            (checker_calls if "checker.example" in url else platform_calls).append(call)
+        self.assertEqual(len(checker_calls), 1)
+        self.assertEqual(checker_calls[0].kwargs["headers"], headers)
+        for call in platform_calls:
+            self.assertNotEqual(call.kwargs.get("headers"), headers)
 
     def test_shared_deadline_returns_honest_error_results(self):
         async def slow_checker(*_args, **_kwargs):

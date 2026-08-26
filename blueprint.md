@@ -40,7 +40,7 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | :---: | --- |
 | 🕹️ | free on Minecraft |
 | 🔫 | free on guns.lol |
-| 🐈‍⬛ | free on Discord *(probe mode only)* |
+| 🐈‍⬛ | free on Discord *(only through a user-supplied authorized checker)* |
 | ❌ | not available anywhere that answered |
 | ⚠️ | no free result can be confirmed: every check, or a required check, is unknown |
 | ⏳ | user exceeded their check cooldown |
@@ -72,9 +72,9 @@ Discord reactions run concurrently so retries cannot serialize past it:
              │
              ├──► [Worker A] 🕹️ Mojang primary ──blocked/error──► fallback endpoint
              ├──► [Worker B] 🔫 guns.lol profile page (status + narrow page markers)
-             └──► [Worker C] 🐈‍⬛ Discord probe  (mode=off ⇒ instant SKIPPED)
+             └──► [Worker C] 🐈‍⬛ Authorized Discord checker (mode=off ⇒ SKIPPED)
              │        each worker: validate name → GET (3 s default request
-             │        cap, browser headers, optional proxy) → normalize result
+             │        cap, browser headers, optional user-supplied proxy) → normalize result
              │        all workers share the remaining response-deadline budget
              ▼
   STAGE 5  aggregate ....... list[Result] → cache only if at least one answer is definitive
@@ -100,8 +100,8 @@ Discord reactions run concurrently so retries cannot serialize past it:
 | --- | --- | --- |
 | `bot.py` | Discord runtime: gateway events, filtering, cooldown, cache, reactions, logging | `SniperBot`, `on_message`, `_cooldown_hit`, `_cached`, `_react` |
 | `checkers.py` | Platform knowledge: endpoints, name rules, status-code interpretation, parallel fan-out, CLI | `run_all_checks`, `check_minecraft/gunslol/discord`, `interpret_*`, `Result`, `BROWSER_HEADERS` |
-| `test_bot.py` | 20 end-to-end pipeline tests with simulated Discord messages | — |
-| `test_checkers.py` | 18 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
+| `test_bot.py` | 25 end-to-end pipeline tests with simulated Discord messages | — |
+| `test_checkers.py` | 22 offline checker tests + 2 optional `LIVE=1` real-network tests | — |
 | `.env` / `.env.example` | All runtime configuration; secrets never enter git | see §9 |
 | `requirements.txt` | `discord.py` (gateway+REST), `aiohttp` (platform HTTP), `python-dotenv` | — |
 | `Procfile` | Cloud start command (`worker: python bot.py`) | — |
@@ -134,28 +134,31 @@ popped lazily. Buckets are pruned when >1000 users accumulate.
 **Stage 3 — Cache**
 `{ "vortex": (monotonic_time, [Result×3]) }`, keyed on the *lowercased* name,
 TTL `RESULT_CACHE_TTL` (default 300 s). Expired entries are evicted on read,
-plus a sweep when >5000 entries. Re-checking a name inside the TTL costs
-**zero** outbound requests.
+plus a sweep when >5000 entries. Only complete, definitive result sets enter
+the cache—timeouts, blocks, and partial outages are deliberately retried.
 
 **Stage 4 — Parallel fan-out**
 ```python
-results = await asyncio.gather(
-    check_minecraft(session, name, proxy),
-    check_gunslol(session, name, proxy),
-    check_discord(session, name, proxy, mode, probe_url),
+results = await run_all_checks(
+    session, name, proxy=proxy,
+    discord_mode=mode,
+    discord_probe_url=probe_url,
+    discord_probe_headers=authorized_checker_headers,
+    timeout=remaining_check_budget,
 )
 ```
 All three checks run **concurrently** on the event loop; total wall-time ≈ the
 *slowest* check, not the sum. Every HTTP call goes through `aiohttp`
 (async-native) — never blocking `requests` — so the gateway heartbeat keeps
-flowing while checks are in flight.
+flowing while checks are in flight. An outer `asyncio.wait` deadline fence
+cancels late work without waiting for a faulty custom checker to clean up.
 
 **Stage 5 — Aggregate & cache** — the `Result` list is logged one line per
-platform and stored in the cache.
+platform and cached only if no platform is unknown/blocked.
 
 **Stage 6 — React (the answer)**
-One `message.add_reaction(emoji)` per AVAILABLE platform, in fixed platform
-order (🕹️ → 🔫 → 🐈‍⬛). `Forbidden` (missing permission) is logged, never fatal.
+One `message.add_reaction(emoji)` per AVAILABLE platform is dispatched
+concurrently. `Forbidden` (missing permission) is logged, never fatal.
 
 **Stage 7 — Fallback reactions** — see the decision table in §6.
 
@@ -196,7 +199,7 @@ class Result:
 | --- | --- | --- | --- | --- | --- |
 | 🕹️ Minecraft | `GET https://api.mojang.com/users/profiles/minecraft/<name>` → on blocked/transient error, retry `GET https://api.minecraftservices.com/minecraft/profile/lookup/name/<name>` | 204, 404 | 200 (profile JSON) | not `^[A-Za-z0-9_]{3,16}$` | 403, 405, 429 |
 | 🔫 guns.lol | `GET https://guns.lol/<name>` (redirects followed; status **and** narrow response markers interpreted) | 404, 410, or a 200 “username not found”/unclaimed-title page | 200 profile page with no unclaimed/challenge marker | not `^[A-Za-z0-9._-]{2,24}$` | 403, 429, 503, or 200 Cloudflare challenge page |
-| 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <explicit authorized DISCORD_PROBE_URL>`; blank URL also skips | custom checker 404 | custom checker 200, 401, 403 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 429 |
+| 🐈‍⬛ Discord | `off` → SKIPPED instantly. `probe` → `GET <authorized HTTP(S) DISCORD_PROBE_URL>` with optional private auth header; blank URL also skips | custom checker 404 | custom checker 200 | not `^[a-z0-9._]{2,32}$` (lowercase-only!) | 401, 403, 429, malformed URL |
 
 Every other status code maps to `ERROR` (treated as "unknown", never silently
 reported as taken or free).
@@ -222,18 +225,22 @@ becomes `ERROR` rather than making the member wait beyond the reaction budget.
 
 ### 5.4 Request profile (identical for every platform)
 
-- **Method:** `GET`, redirects followed. Minecraft and the optional Discord
-  probe map the final status code; guns.lol also reads its small semantic error
-  page because an unclaimed name can be served as HTTP 200.
+- **Method:** `GET`, redirects followed. Minecraft and the authorized external
+  Discord checker map the final status code; guns.lol also reads its small
+  semantic error page because an unclaimed name can be served as HTTP 200.
 - **Headers:** realistic browser `User-Agent`, `Accept`, `Accept-Language`
-  (`BROWSER_HEADERS`) so ordinary profile pages are requested consistently.
+  (`BROWSER_HEADERS`) are used for ordinary pages. An optional
+  `DISCORD_PROBE_TOKEN` header is sent **only** to the authorized external
+  checker, never to Minecraft or guns.lol, and is never logged.
 - **Timeouts:** `CHECK_TIMEOUT` defaults to 3 s per outbound request, while the
   three workers also share the remaining `RESPONSE_BUDGET_SECONDS` deadline
   (4.5 s default). The bot reserves `REACTION_TIMEOUT` (0.75 s default) for
   the Discord REST reactions.
-- **Proxy:** every request can optionally use `PROXY_URL`
-  (`http://user:pass@host:port`). A challenge/rate-limit response remains
-  `BLOCKED`; the bot never claims it proves availability.
+- **Proxy:** every request can optionally use a user-supplied HTTP(S)
+  `PROXY_URL`. It is validated at startup, remains only in private environment
+  configuration, and any credential-like text is redacted from error details.
+  A challenge/rate-limit response remains `BLOCKED`; the bot never claims it
+  proves availability.
 - **Concurrency:** the three checks share **one** `aiohttp.ClientSession`
   created once in `setup_hook()` (connection pooling, no per-message setup).
 
@@ -298,11 +305,12 @@ DEFAULT HANDLER CEILING ...............................       4.5 s
 
 With defaults, the fan-out has roughly **3.75 s** and reactions retain **0.75
 s**. `run_all_checks` applies that same wall-clock cap to all workers; the bot
-wraps it in a second outer timeout as a safety fence. If the checker budget is
-exhausted, workers become `ERROR` and the bot can still add ⚠️ in the reserved
-reaction time. Availability outcomes cannot guarantee Discord's own network
-or API uptime, but the application never intentionally waits past its internal
-4.5-second handler budget.
+adds an outer `asyncio.wait` fence that cancels late work without waiting for
+cancellation cleanup. If the checker budget is exhausted, workers become
+`ERROR` and the bot can still add ⚠️ in the reserved reaction time. Availability
+outcomes cannot guarantee Discord's own network or API uptime, but the
+application never intentionally waits past its internal 4.5-second handler
+budget.
 
 ---
 
@@ -316,8 +324,11 @@ Loaded once at startup from `.env` (see `.env.example`):
 | `TARGET_CHANNEL_ID` | all channels | Stage 1 | watch exactly one channel |
 | `LOG_CHANNEL_ID` | off | Stage 8 | 🎯 hits posted here |
 | `DISCORD_CHECK_MODE` | `off` | checker | `off` \| `probe` |
-| `DISCORD_PROBE_URL` | blank | checker | explicit authorized `{username}` template required for probe mode; Discord homepage is never used |
-| `PROXY_URL` | direct | all requests | `http://user:pass@host:port` |
+| `DISCORD_PROBE_URL` | blank | checker | authorized HTTP(S) `{username}` template required for probe mode; Discord homepage is never used |
+| `DISCORD_PROBE_TOKEN` | blank | Discord checker only | optional private auth token; never logged or sent to Minecraft/guns.lol |
+| `DISCORD_PROBE_TOKEN_HEADER` | `Authorization` | Discord checker only | optional token header name (for example `X-API-Key`) |
+| `DISCORD_PROBE_TOKEN_SCHEME` | `Bearer` | Discord checker only | optional token prefix; blank sends the raw token |
+| `PROXY_URL` | direct | all requests | user-supplied HTTP(S) proxy, validated at startup; credentials stay in private env config |
 | `CHECK_TIMEOUT` | `3` | aiohttp session | seconds, hard cap per outbound request (clamped below response budget) |
 | `RESPONSE_BUDGET_SECONDS` | `4.5` | stages 4–7 | total valid-message checker + reaction budget; clamped below 5 seconds |
 | `REACTION_TIMEOUT` | `0.75` | Stage 6 | cap for each concurrent Discord reaction REST call |
@@ -331,13 +342,13 @@ Loaded once at startup from `.env` (see `.env.example`):
 
 | What breaks | What the bot does | Member sees |
 | --- | --- | --- |
-| One platform times out | other platforms still answer | partial emojis or ❌ |
-| Shared checker deadline expires | outstanding workers become ERROR; reaction reserve remains | ⚠️ or a definitive partial answer |
+| One platform times out | other platforms still answer | partial emojis or ⚠️ (never a misleading ❌) |
+| Shared checker deadline expires | late work is cancelled; reaction reserve remains | ⚠️ or a definitive partial answer |
 | All platforms unreachable | every check returns ERROR | ⚠️ |
 | guns.lol Cloudflare wall (403/503 or 200 challenge page) | status BLOCKED, logged | ⚠️ or ❌ (with guns.lol omitted) |
 | Mojang rate limit | automatic retry on fallback endpoint while deadline remains | normal emojis or an honest partial/⚠️ answer |
 | Missing Add-Reactions permission | logged warning, checks continue | nothing (check server logs) |
-| Bad/missing token | clean `SystemExit` with instructions | bot offline, console explains |
+| Missing bot token / malformed proxy / malformed checker URL | clean `SystemExit` before Discord connects | bot offline, console explains without exposing secrets |
 | Webhook mirrors channel content | ignored at Stage 1 — no reaction loops | — |
 | Message Content Intent off in portal | bot runs but receives no content | silence (README troubleshooting) |
 | User floods names | bucket refuses, ⏳ once per message | ⏳ |
@@ -404,7 +415,7 @@ Render Background Worker
   env:    DISCORD_TOKEN, TARGET_CHANNEL_ID, …  set in dashboard
         │
         ├── wss ──► Discord gateway (auto-reconnect handled by discord.py)
-        └── https ─► platforms (PROXY_URL recommended for datacenter IPs)
+        └── https ─► platforms (direct, or a privately supplied PROXY_URL)
 ```
 
 The worker keeps a single long-lived process — no web server, no port. Logs
@@ -414,8 +425,12 @@ stream in the Render dashboard; the startup banner confirms config at a glance.
 
 ## 13. Security model
 
-- **Secrets**: the token lives only in `.env` (git-ignored) or host env vars.
-  `.env.example` ships placeholders only.
+- **Secrets**: bot tokens, external-checker tokens, and proxy credentials live
+  only in ignored `.env` files or host secret variables. `.env.example` ships
+  blank credential fields—no usable token, proxy, or API key is committed.
+- **Secret scope and logs**: `DISCORD_PROBE_TOKEN` is attached only to the
+  authorized checker request. Error details redact URL user-info and common
+  token/key query fragments before they reach logs or the checker CLI.
 - **Least privilege**: the invite URL requests exactly `Read Messages/View
   Channels`, `Send Messages`, `Add Reactions` — no admin, no manage-guild.
 - **Loop-safety**: bots *and* webhooks are ignored at Stage 1; the bot never
@@ -452,13 +467,13 @@ you're done.
 
 ## 15. Known limitations (the honest bit)
 
-- **Discord has no public username-availability API.** `probe` mode re-creates
-  the original blueprint's URL trick, but `discord.com/<name>` serves the web
-  app — its answers are advisory at best. Checking for real requires a
-  logged-in user session → violates Discord ToS → not implemented, on purpose.
+- **Discord has no public username-availability API.** `probe` mode does not
+  call Discord's homepage. It is available only when you supply an authorized
+  external checker with the documented `200 = taken`, `404 = free` contract;
+  otherwise Discord is honestly skipped.
 - **guns.lol sits behind Cloudflare**; datacenter hosts (like Render) may see
-  403 challenges. Status is reported as *blocked/unknown*, never faked.
-  Residential/rotating proxies mitigate.
+  403 challenges. Status is reported as *blocked/unknown*, never faked. If you
+  use a proxy, supply it privately through `PROXY_URL`; none is bundled.
 - **Minecraft "available" ≠ "claimable"**: the Mojang endpoint proves no
   profile exists; blocked/reserved words and migration edge cases can still
   refuse registration.
@@ -475,12 +490,12 @@ you're done.
 | --- | --- | --- | --- |
 | Status interpretation | `test_checkers.py` | every HTTP code maps to the right status | no |
 | Name validation | `test_checkers.py` | platform rules accept/reject correctly | no |
-| Checker I/O (mocked HTTP) | `test_checkers.py` | checkers handle 200/404/403/errors | no |
-| Full pipeline (simulated messages) | `test_bot.py` | filters, cooldown ⏳, cache reuse, all reaction paths, config guards | no |
+| Checker I/O (mocked HTTP) | `test_checkers.py` | status/page parsing, auth-header scope, URL validation, redaction, 200/404/403/errors | no |
+| Full pipeline (simulated messages) | `test_bot.py` | filters, cooldown ⏳, cache reuse, deadline fence, reaction paths, config guards | no |
 | Real endpoints | `LIVE=1 python test_checkers.py` | actual Mojang/guns.lol behaviour | yes |
 | Live platform probe | `python checkers.py <name>` | endpoint truth from your machine | yes |
 | Production | Render logs + banner | correct config, gateway connected | yes |
 
-**40 tests in the suite; 38 run offline** — `python test_checkers.py &&
+**49 tests in the suite; 47 run offline** — `python test_checkers.py &&
 python test_bot.py` must print `OK` before every deploy. The two remaining
 live-network tests run only when `LIVE=1` is set.

@@ -23,6 +23,8 @@ Configuration lives in .env (see .env.example):
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 optional HTTP(S) proxy for outbound checks
     DISCORD_CHECK_MODE        off (default) | probe
+    DISCORD_PROBE_URL         authorized external checker URL template (optional)
+    DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
     CHECK_TIMEOUT             per outbound HTTP request (default 3)
     RESPONSE_BUDGET_SECONDS   checks + reactions after MESSAGE_CREATE (default 4.5)
     REACTION_TIMEOUT          cap for each Discord reaction call (default .75)
@@ -37,10 +39,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import defaultdict, deque
-from typing import Optional
 
 import aiohttp
 import discord
@@ -57,16 +59,19 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
 
-def _opt_int(name: str) -> Optional[int]:
+def _opt_int(name: str) -> int | None:
     raw = os.getenv(name, "").strip()
     return int(raw) if raw.isdigit() else None
 
 
 def _opt_float(name: str, default: float) -> float:
+    """Read a finite float, falling back safely for malformed env values."""
+
     try:
-        return float(os.getenv(name, "").strip() or default)
+        value = float(os.getenv(name, "").strip() or default)
     except ValueError:
         return default
+    return value if math.isfinite(value) else default
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -75,11 +80,37 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return min(max(_opt_float(name, default), minimum), maximum)
 
 
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer without crashing on ``nan``/``inf`` input."""
+
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _discord_probe_headers() -> dict[str, str] | None:
+    """Build the optional auth header without ever logging its token value."""
+
+    if not DISCORD_PROBE_TOKEN:
+        return None
+    value = (f"{DISCORD_PROBE_TOKEN_SCHEME} {DISCORD_PROBE_TOKEN}".strip()
+             if DISCORD_PROBE_TOKEN_SCHEME else DISCORD_PROBE_TOKEN)
+    return {DISCORD_PROBE_TOKEN_HEADER: value}
+
+
 TARGET_CHANNEL_ID = _opt_int("TARGET_CHANNEL_ID")
 LOG_CHANNEL_ID = _opt_int("LOG_CHANNEL_ID")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DISCORD_CHECK_MODE = os.getenv("DISCORD_CHECK_MODE", "off").strip().lower()
 DISCORD_PROBE_URL = os.getenv("DISCORD_PROBE_URL", "").strip() or None
+DISCORD_PROBE_TOKEN = os.getenv("DISCORD_PROBE_TOKEN", "").strip()
+DISCORD_PROBE_TOKEN_HEADER = os.getenv(
+    "DISCORD_PROBE_TOKEN_HEADER", "Authorization").strip() or "Authorization"
+DISCORD_PROBE_TOKEN_SCHEME = os.getenv("DISCORD_PROBE_TOKEN_SCHEME", "Bearer").strip()
+DISCORD_PROBE_HEADERS = _discord_probe_headers()
 
 # The event handler starts after Discord delivers MESSAGE_CREATE. Reserving a
 # little room beneath five seconds means the checker fan-out cannot consume all
@@ -93,7 +124,7 @@ REACTION_TIMEOUT = _bounded_float(
     maximum=max(0.05, RESPONSE_BUDGET_SECONDS - 0.05))
 CHECK_TIMEOUT = _bounded_float(
     "CHECK_TIMEOUT", 3.0, minimum=0.05, maximum=RESPONSE_BUDGET_SECONDS)
-USER_MAX_CHECKS = max(int(_opt_float("USER_MAX_CHECKS", 3)), 1)
+USER_MAX_CHECKS = _bounded_int("USER_MAX_CHECKS", 3, minimum=1, maximum=10_000)
 USER_WINDOW_SECONDS = max(_opt_float("USER_WINDOW_SECONDS", 60), 0.1)
 RESULT_CACHE_TTL = max(_opt_float("RESULT_CACHE_TTL", 300), 0.0)
 
@@ -123,7 +154,7 @@ class SniperBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True  # also enable it in the Developer Portal
         super().__init__(intents=intents)
-        self.http_sniper: Optional[aiohttp.ClientSession] = None
+        self.http_sniper: aiohttp.ClientSession | None = None
         # Per-user token bucket: {user_id: deque[timestamps]}
         self._buckets: dict[int, deque[float]] = defaultdict(deque)
         # Recent results cache: {username_lower: (timestamp, [Result, ...])}
@@ -163,7 +194,7 @@ class SniperBot(discord.Client):
         bucket.append(now)
         return False
 
-    def _cached(self, username: str) -> Optional[list[checkers.Result]]:
+    def _cached(self, username: str) -> list[checkers.Result] | None:
         key = username.lower()
         hit = self._cache.get(key)
         if hit is None:
@@ -197,7 +228,7 @@ class SniperBot(discord.Client):
         self,
         message: discord.Message,
         emoji: str,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
     ) -> None:
         """Add one reaction without allowing Discord REST to stall the bot."""
 
@@ -214,7 +245,7 @@ class SniperBot(discord.Client):
                         getattr(message.channel, "name", message.channel.id))
         except discord.HTTPException as exc:
             log.warning("Reaction %r failed: %s", emoji, exc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - intentionally isolate one reaction
             # Keep one malformed/failed reaction from aborting the remaining
             # reactions or the optional hit log. asyncio.CancelledError is a
             # BaseException, so shutdown cancellation still propagates.
@@ -241,6 +272,61 @@ class SniperBot(discord.Client):
             self._react(message, emoji, timeout=per_reaction_cap)
             for emoji in emojis
         ))
+
+    @staticmethod
+    def _consume_cancelled_checker_task(task: asyncio.Task) -> None:
+        """Consume a late task outcome so cancellation never emits a warning."""
+
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - consume any late task failure
+            log.debug("Late checker task exited after deadline: %s",
+                      checkers._redact_sensitive_text(exc))
+
+    async def _run_checks_with_deadline(
+        self,
+        username: str,
+        check_budget: float,
+    ) -> list[checkers.Result]:
+        """Return checker results without waiting for a bad task to cancel.
+
+        ``asyncio.wait_for`` waits for cancellation cleanup. That is normally
+        correct, but a future/custom checker that swallows cancellation could
+        otherwise consume the reaction reserve. This fence cancels late work,
+        consumes its eventual outcome, and immediately leaves time for Discord
+        reactions.
+        """
+
+        checker_task = asyncio.create_task(checkers.run_all_checks(
+            self.http_sniper, username,
+            proxy=PROXY_URL,
+            discord_mode=DISCORD_CHECK_MODE,
+            discord_probe_url=DISCORD_PROBE_URL,
+            discord_probe_headers=DISCORD_PROBE_HEADERS,
+            timeout=check_budget,
+        ))
+        try:
+            done, _ = await asyncio.wait({checker_task}, timeout=check_budget)
+        except asyncio.CancelledError:
+            checker_task.cancel()
+            checker_task.add_done_callback(self._consume_cancelled_checker_task)
+            raise
+
+        if checker_task not in done:
+            checker_task.cancel()
+            checker_task.add_done_callback(self._consume_cancelled_checker_task)
+            return checkers.timeout_results("response deadline reached")
+
+        try:
+            return checker_task.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - checker faults must not kill the handler
+            log.warning("Checker task failed before its deadline: %s",
+                        checkers._redact_sensitive_text(exc))
+            return checkers.timeout_results("checker task failed")
 
     # -- events -------------------------------------------------------------
 
@@ -295,23 +381,7 @@ class SniperBot(discord.Client):
             if check_budget <= 0:
                 results = checkers.timeout_results("response deadline reached")
             else:
-                try:
-                    # run_all_checks independently enforces this deadline. The
-                    # outer fence keeps the message promise true if a
-                    # future/custom checker accidentally ignores its own timeout
-                    # parameter.
-                    results = await asyncio.wait_for(
-                        checkers.run_all_checks(
-                            self.http_sniper, username,
-                            proxy=PROXY_URL,
-                            discord_mode=DISCORD_CHECK_MODE,
-                            discord_probe_url=DISCORD_PROBE_URL,
-                            timeout=check_budget,
-                        ),
-                        timeout=check_budget,
-                    )
-                except asyncio.TimeoutError:
-                    results = checkers.timeout_results("response deadline reached")
+                results = await self._run_checks_with_deadline(username, check_budget)
 
             if self._cacheable(results):
                 self._cache[username.lower()] = (time.monotonic(), results)
@@ -359,12 +429,29 @@ class SniperBot(discord.Client):
 
 
 def main() -> None:
-    if not TOKEN or TOKEN == "your_bot_token_here":
+    """Validate user-supplied configuration before connecting to Discord."""
+
+    if not TOKEN:
         raise SystemExit(
             "❌ DISCORD_TOKEN missing. Copy .env.example to .env and paste "
             "your bot token from the Discord Developer Portal.")
     if DISCORD_CHECK_MODE not in ("off", "probe"):
         raise SystemExit("❌ DISCORD_CHECK_MODE must be 'off' or 'probe'.")
+    if PROXY_URL:
+        proxy_error = checkers.validate_http_url(PROXY_URL, "PROXY_URL")
+        if proxy_error:
+            raise SystemExit(f"❌ {proxy_error}")
+    if DISCORD_PROBE_TOKEN:
+        if not checkers.is_valid_header_name(DISCORD_PROBE_TOKEN_HEADER):
+            raise SystemExit("❌ DISCORD_PROBE_TOKEN_HEADER is not a valid HTTP header name.")
+        if "\r" in DISCORD_PROBE_TOKEN or "\n" in DISCORD_PROBE_TOKEN:
+            raise SystemExit("❌ DISCORD_PROBE_TOKEN must not contain a line break.")
+        if "\r" in DISCORD_PROBE_TOKEN_SCHEME or "\n" in DISCORD_PROBE_TOKEN_SCHEME:
+            raise SystemExit("❌ DISCORD_PROBE_TOKEN_SCHEME must not contain a line break.")
+    if DISCORD_CHECK_MODE == "probe" and DISCORD_PROBE_URL:
+        probe_error = checkers.validate_probe_url_template(DISCORD_PROBE_URL)
+        if probe_error:
+            raise SystemExit(f"❌ {probe_error}")
     SniperBot().run(TOKEN)
 
 

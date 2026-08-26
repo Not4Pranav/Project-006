@@ -12,8 +12,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import checkers
 import bot as bot_module
+import checkers
 from test_checkers import _session_with_status
 
 WATCHED = 42  # pretend channel id
@@ -216,6 +216,16 @@ class TestCache(unittest.TestCase):
 
 
 class TestLatencyBudget(unittest.TestCase):
+    def test_checker_crash_still_reacts_with_warning(self):
+        async def crashes(*_args, **_kwargs):
+            raise RuntimeError("unexpected checker crash")
+
+        b = make_bot()
+        message = make_message("vortex")
+        with patch.object(checkers, "run_all_checks", crashes):
+            asyncio.run(b.on_message(message))
+        self.assertEqual(reactions(message), ["⚠️"])
+
     def test_outer_deadline_stops_a_non_cooperative_checker(self):
         old_budget = bot_module.RESPONSE_BUDGET_SECONDS
         old_reaction_timeout = bot_module.REACTION_TIMEOUT
@@ -237,13 +247,19 @@ class TestLatencyBudget(unittest.TestCase):
             bot_module.RESPONSE_BUDGET_SECONDS = old_budget
             bot_module.REACTION_TIMEOUT = old_reaction_timeout
 
-        # The outer wait_for fence protects the reaction deadline even if a
+        # The outer asyncio.wait fence protects the reaction deadline even if a
         # future checker implementation forgets to honour its timeout argument.
         self.assertLess(elapsed, 0.15)
         self.assertEqual(reactions(message), ["⚠️"])
 
 
 class TestConfigErrors(unittest.TestCase):
+    def test_non_finite_number_uses_safe_default(self):
+        with patch.dict(bot_module.os.environ, {"CHECK_TIMEOUT": "nan"}, clear=False):
+            self.assertEqual(bot_module._opt_float("CHECK_TIMEOUT", 3.0), 3.0)
+        with patch.dict(bot_module.os.environ, {"USER_MAX_CHECKS": "inf"}, clear=False):
+            self.assertEqual(bot_module._bounded_int("USER_MAX_CHECKS", 3, 1, 10), 3)
+
     def test_bad_discord_mode_rejected(self):
         old_token, old_mode = bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE
         bot_module.TOKEN = "fake_token_so_token_check_passes"
@@ -253,6 +269,45 @@ class TestConfigErrors(unittest.TestCase):
                 bot_module.main()   # must reject the bad mode before .run()
         finally:
             bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE = old_token, old_mode
+
+    def test_bad_proxy_rejected_before_connecting(self):
+        old_token, old_proxy = bot_module.TOKEN, bot_module.PROXY_URL
+        bot_module.TOKEN = "test-bot-token"
+        bot_module.PROXY_URL = "socks5://proxy.example"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("PROXY_URL", str(raised.exception))
+        finally:
+            bot_module.TOKEN, bot_module.PROXY_URL = old_token, old_proxy
+
+    def test_bad_probe_url_rejected_before_connecting(self):
+        old = (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+               bot_module.DISCORD_PROBE_URL)
+        bot_module.TOKEN = "test-bot-token"
+        bot_module.DISCORD_CHECK_MODE = "probe"
+        bot_module.DISCORD_PROBE_URL = "https://checker.example/static"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("placeholder", str(raised.exception))
+        finally:
+            (bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE,
+             bot_module.DISCORD_PROBE_URL) = old
+
+    def test_invalid_probe_header_rejected_before_connecting(self):
+        old = (bot_module.TOKEN, bot_module.DISCORD_PROBE_TOKEN,
+               bot_module.DISCORD_PROBE_TOKEN_HEADER)
+        bot_module.TOKEN = "test-bot-token"
+        bot_module.DISCORD_PROBE_TOKEN = "not-a-real-secret"
+        bot_module.DISCORD_PROBE_TOKEN_HEADER = "Bad\nHeader"
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                bot_module.main()
+            self.assertIn("HEADER", str(raised.exception))
+        finally:
+            (bot_module.TOKEN, bot_module.DISCORD_PROBE_TOKEN,
+             bot_module.DISCORD_PROBE_TOKEN_HEADER) = old
 
     def test_missing_token_rejected(self):
         old = bot_module.TOKEN

@@ -31,8 +31,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -141,7 +142,7 @@ def interpret_minecraft(status: int) -> str:
     return ERROR
 
 
-def interpret_gunslol(status: int, page: Optional[str] = None) -> str:
+def interpret_gunslol(status: int, page: str | None = None) -> str:
     """Interpret guns.lol's status plus its small semantic error page.
 
     A 200 status by itself normally means a claimed profile, but the service
@@ -167,12 +168,18 @@ def interpret_gunslol(status: int, page: Optional[str] = None) -> str:
 
 
 def interpret_discord_probe(status: int) -> str:
-    # Best-effort semantics only; this is NOT an official Discord API.
-    if status in (200, 401, 403):
+    """Interpret the documented contract for an authorized external checker.
+
+    The custom endpoint must use 200 for a claimed username and 404 for a
+    free one. Authentication and rate-limit responses are *not* availability
+    answers, so they remain unknown instead of being misreported as TAKEN.
+    """
+
+    if status == 200:
         return TAKEN
     if status == 404:
         return AVAILABLE
-    if status == 429:
+    if status in (401, 403, 429):
         return BLOCKED
     return ERROR
 
@@ -182,23 +189,35 @@ def interpret_discord_probe(status: int) -> str:
 # ---------------------------------------------------------------------------
 
 _REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ValueError)
+_HTTP_SCHEMES = {"http", "https"}
+_HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_URL_USERINFO_PATTERN = re.compile(r"(?i)(https?://)[^/\s@]+@")
+_SENSITIVE_QUERY_PATTERN = re.compile(
+    r"(?i)([?&](?:access[_-]?token|api[_-]?key|authorization|password|secret|token)=)[^&#\s]+")
+_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(access[_-]?token|api[_-]?key|authorization|password|secret|token)="
+    r"([^\s,&]+)")
+_SENSITIVE_HEADER_PATTERN = re.compile(
+    r"(?i)\b((?:proxy-)?authorization:\s*(?:bearer|token)?\s*)[^\s,]+")
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
 async def _fetch_status(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> int:
     """GET a URL and return its final HTTP status (following redirects)."""
 
-    async with session.get(url, proxy=proxy) as response:
+    async with session.get(url, proxy=proxy, headers=headers) as response:
         return response.status
 
 
 async def _fetch_page(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
 ) -> tuple[int, str]:
     """GET a URL and return its final status and decoded HTML.
 
@@ -217,12 +236,66 @@ def _safe_url(template: str, username: str) -> str:
     try:
         return template.format(username=username)
     except (KeyError, IndexError, ValueError) as exc:
-        raise ValueError("URL template must contain only a {username} placeholder") from exc
+        raise ValueError("URL template has invalid braces; use {username}") from exc
+
+
+def validate_http_url(url: str, label: str = "URL") -> str | None:
+    """Return an actionable error for a non-HTTP(S) URL, otherwise ``None``."""
+
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return f"{label} is not a valid URL"
+    if parsed.scheme.lower() not in _HTTP_SCHEMES or not parsed.hostname:
+        return f"{label} must be an absolute http:// or https:// URL"
+    try:
+        _ = parsed.port  # force validation of a malformed numeric port, if supplied
+    except ValueError:
+        return f"{label} has an invalid port"
+    if any(char.isspace() for char in url):
+        return f"{label} must not contain whitespace"
+    return None
+
+
+def validate_probe_url_template(template: str) -> str | None:
+    """Validate the user-supplied external-checker URL template.
+
+    The checker must receive the submitted username, so a static URL is not a
+    valid template. Only HTTP(S) endpoints are accepted; this avoids accidental
+    ``file:``/other schemes when configuration is supplied by a user.
+    """
+
+    if not template:
+        return "DISCORD_PROBE_URL is blank"
+    if "{username}" not in template:
+        return "DISCORD_PROBE_URL must include a {username} placeholder"
+    try:
+        rendered = _safe_url(template, "example")
+    except ValueError as exc:
+        return str(exc)
+    return validate_http_url(rendered, "DISCORD_PROBE_URL")
+
+
+def is_valid_header_name(value: str) -> bool:
+    """Whether ``value`` is safe to use as an HTTP header name."""
+
+    return bool(_HEADER_NAME_PATTERN.fullmatch(value))
+
+
+def _redact_sensitive_text(value: object) -> str:
+    """Make exception details useful without leaking proxy/API credentials."""
+
+    text = str(value).strip()
+    text = _URL_USERINFO_PATTERN.sub(r"\1***@", text)
+    text = _SENSITIVE_QUERY_PATTERN.sub(r"\1***", text)
+    text = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1=***", text)
+    text = _SENSITIVE_HEADER_PATTERN.sub(r"\1***", text)
+    text = _BEARER_PATTERN.sub(r"\1***", text)
+    return text[:120] or type(value).__name__
 
 
 def _request_error(platform: str, emoji: str, exc: Exception) -> Result:
-    detail = str(exc).strip() or type(exc).__name__
-    return Result(platform, emoji, ERROR, detail[:120])
+    return Result(platform, emoji, ERROR, _redact_sensitive_text(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +320,7 @@ async def check_minecraft(session, username: str, proxy=None) -> Result:
             "name must be 3-16 chars of A-Z a-z 0-9 _",
         )
 
-    outcome: Optional[Result] = None
+    outcome: Result | None = None
     for template in MINECRAFT_ENDPOINTS:
         try:
             status = await _fetch_status(session, _safe_url(template, username), proxy)
@@ -293,7 +366,8 @@ async def check_discord(
     username: str,
     proxy=None,
     mode: str = "off",
-    probe_url: Optional[str] = None,
+    probe_url: str | None = None,
+    probe_headers: Mapping[str, str] | None = None,
 ) -> Result:
     """Check Discord in explicitly unofficial probe mode (emoji 🐈‍⬛).
 
@@ -301,7 +375,8 @@ async def check_discord(
     ``off`` is the honest default. Probe mode is only useful when the deployer
     supplies an explicit, authorized checker URL of their own. The old idea of
     requesting ``discord.com/<username>`` is not a username-availability API,
-    so this module never uses it as a default.
+    so this module never uses it as a default. The external endpoint contract
+    is 200 = taken and 404 = available; 401/403/429 are unknown.
     """
 
     if mode == "off":
@@ -309,11 +384,19 @@ async def check_discord(
             "Discord", DISCORD_EMOJI, SKIPPED,
             "check disabled (DISCORD_CHECK_MODE=off)",
         )
+    if mode != "probe":
+        return Result(
+            "Discord", DISCORD_EMOJI, ERROR,
+            "DISCORD_CHECK_MODE must be off or probe",
+        )
     if not probe_url:
         return Result(
             "Discord", DISCORD_EMOJI, SKIPPED,
             "probe requires an explicit DISCORD_PROBE_URL",
         )
+    template_error = validate_probe_url_template(probe_url)
+    if template_error:
+        return Result("Discord", DISCORD_EMOJI, ERROR, template_error)
     if not DISCORD_PATTERN.fullmatch(username):
         return Result(
             "Discord", DISCORD_EMOJI, INVALID,
@@ -322,7 +405,7 @@ async def check_discord(
 
     try:
         url = _safe_url(probe_url, username)
-        status = await _fetch_status(session, url, proxy)
+        status = await _fetch_status(session, url, proxy, headers=probe_headers)
         return Result(
             "Discord", DISCORD_EMOJI,
             interpret_discord_probe(status), f"HTTP {status}",
@@ -348,7 +431,7 @@ def timeout_results(detail: str = "check deadline reached") -> list[Result]:
 async def _run_bounded(
     checker,
     fallback: Result,
-    timeout: Optional[float],
+    timeout: float | None,
 ) -> Result:
     """Run one checker without allowing it to break or outlive the fan-out."""
 
@@ -358,7 +441,7 @@ async def _run_bounded(
         return await asyncio.wait_for(checker, timeout=max(0.0, timeout))
     except asyncio.TimeoutError:
         return Result(fallback.platform, fallback.emoji, ERROR, "check deadline reached")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - one checker must not cancel all results
         # Checkers already handle normal network failures. This final guard
         # isolates malformed optional configuration or unforeseen errors so one
         # platform can never cancel every result/reaction.
@@ -368,10 +451,11 @@ async def _run_bounded(
 async def run_all_checks(
     session: aiohttp.ClientSession,
     username: str,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     discord_mode: str = "off",
-    discord_probe_url: Optional[str] = None,
-    timeout: Optional[float] = None,
+    discord_probe_url: str | None = None,
+    discord_probe_headers: Mapping[str, str] | None = None,
+    timeout: float | None = None,
 ) -> list[Result]:
     """Fan out every platform check in parallel.
 
@@ -385,7 +469,9 @@ async def run_all_checks(
         _run_bounded(check_minecraft(session, username, proxy), fallbacks[0], timeout),
         _run_bounded(check_gunslol(session, username, proxy), fallbacks[1], timeout),
         _run_bounded(
-            check_discord(session, username, proxy, discord_mode, discord_probe_url),
+            check_discord(
+                session, username, proxy, discord_mode, discord_probe_url,
+                discord_probe_headers),
             fallbacks[2], timeout,
         ),
     )
@@ -396,7 +482,7 @@ async def run_all_checks(
 # CLI self-test: python checkers.py <username> [--mode off|probe] [--proxy URL]
 # ---------------------------------------------------------------------------
 
-async def _cli(argv: Optional[list[str]] = None) -> int:
+async def _cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Test the platform checkers without running the bot.")
     parser.add_argument("username", help="name to check, e.g. Notch")

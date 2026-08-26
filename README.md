@@ -14,7 +14,7 @@ share it and reactions run in parallel.
 | -------- | ------- |
 | 🕹️ | **Free on Minecraft** (Mojang has no profile with that name) |
 | 🔫 | **Free on guns.lol** (404/410, or its semantic “username not found” page) |
-| 🐈‍⬛ | Free on Discord *(best-effort probe only — see [the honest bit](#-the-honest-bit-limitations))* |
+| 🐈‍⬛ | Free on Discord *(only through your authorized external checker — see [the honest bit](#-the-honest-bit-limitations))* |
 | ❌ | Not available on any checked platform |
 | ⚠️ | No free result can be confirmed because every check — or a required check — failed/was blocked |
 | ⏳ | User is checking too fast (cooldown) |
@@ -58,7 +58,7 @@ is missing its `/` and isn't the real API). These are the verified ones:
 | -------- | :---: | ------------- | ---- | ----- | ----------------- |
 | Minecraft | 🕹️ | `https://api.mojang.com/users/profiles/minecraft/<name>` (+ `api.minecraftservices.com/minecraft/profile/lookup/name/<name>` fallback for blocked/transient primary calls) | **204 or 404** (no profile exists) | **200** (profile JSON returned) | 403 / 429 (Mojang rate limit) |
 | guns.lol | 🔫 | `https://guns.lol/<name>` | **404/410**, or a 200 page with the specific “username not found”/unclaimed title marker | **200** profile page without a challenge/unclaimed marker | 403 / 429 / 503, or a 200 Cloudflare challenge page |
-| Discord | 🐈‍⬛ | *no public API exists* — disabled unless you provide an authorized probe URL | (custom probe: 404) | (custom probe: 200/401) | 429 |
+| Discord | 🐈‍⬛ | *no public API exists* — disabled unless you provide an authorized checker URL | custom checker: **404** | custom checker: **200** | 401 / 403 / 429, malformed endpoint, or network failure |
 
 Every check also validates the name against the platform's rules *before*
 sending a request (Minecraft: `3–16` chars `A-Za-z0-9_`; guns.lol: `2–24` chars
@@ -73,8 +73,12 @@ API (it just serves Discord's homepage). Attempting to claim-check names
 requires a logged-in user session, which violates Discord's ToS. So this bot
 ships the Discord check **disabled** (`DISCORD_CHECK_MODE=off`). If you have
 an authorized checker service of your own, set `DISCORD_CHECK_MODE=probe` **and**
-provide its `{username}` URL template in `DISCORD_PROBE_URL`; the bot otherwise
-skips Discord. It never pretends `discord.com/<username>` is a valid checker.
+provide an HTTP(S) `{username}` URL template in `DISCORD_PROBE_URL`; the bot
+otherwise skips Discord. Its explicit contract is **200 = taken**, **404 =
+free**, and **401/403/429 = unknown**. If that service needs credentials, put
+them only in your private `DISCORD_PROBE_TOKEN` environment value; the bot sends
+it only to that endpoint and never logs it. It never pretends
+`discord.com/<username>` is a valid checker.
 
 ## 📁 Project layout
 
@@ -83,8 +87,8 @@ skips Discord. It never pretends `discord.com/<username>` is a valid checker.
 ├── bot.py            # the runtime: gateway events, filters, cooldown, reactions
 ├── checkers.py       # platform registry + parallel HTTP checks (+ CLI self-test)
 ├── blueprint.md      # technical deep-dive: how every stage works internally
-├── test_checkers.py  # 18 offline checker tests + 2 optional LIVE=1 network tests
-├── test_bot.py       # 20 end-to-end pipeline tests (simulated Discord messages)
+├── test_checkers.py  # 22 offline checker tests + 2 optional LIVE=1 network tests
+├── test_bot.py       # 25 end-to-end pipeline tests (simulated Discord messages)
 ├── .env.example      # copy to .env and fill in your secrets
 ├── requirements.txt  # discord.py, aiohttp, python-dotenv
 ├── Procfile          # cloud deployment start command
@@ -131,20 +135,31 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+> The tracked template contains **blank credential fields**. Put bot tokens,
+> external-checker tokens, and proxy credentials only in your ignored `.env` or
+> your deployment provider's secret manager.
+
 | Variable | Required | Default | What it does |
 | -------- | -------- | ------- | ------------ |
 | `DISCORD_TOKEN` | ✅ | — | Bot token from the Developer Portal |
 | `TARGET_CHANNEL_ID` | — | *(all channels)* | Only react in this channel |
 | `LOG_CHANNEL_ID` | — | off | Post every "free" hit to this channel |
 | `DISCORD_CHECK_MODE` | — | `off` | `off`, or `probe` with an authorized external checker |
-| `DISCORD_PROBE_URL` | — | blank | Required `{username}` URL template when `probe` is enabled; never defaults to Discord's homepage |
-| `PROXY_URL` | — | direct | Route checks via `http://user:pass@host:port` |
+| `DISCORD_PROBE_URL` | — | blank | Required HTTP(S) `{username}` URL template when `probe` is enabled; never defaults to Discord's homepage |
+| `DISCORD_PROBE_TOKEN` | — | blank | Optional credential sent **only** to `DISCORD_PROBE_URL`; never logged or stored in tracked files |
+| `DISCORD_PROBE_TOKEN_HEADER` | — | `Authorization` | Header used for the optional probe token (for example `X-API-Key`) |
+| `DISCORD_PROBE_TOKEN_SCHEME` | — | `Bearer` | Prefix before the optional token; set blank to send the raw token |
+| `PROXY_URL` | — | direct | User-supplied HTTP(S) proxy for outbound checks; validated at startup and never stored in the repo |
 | `CHECK_TIMEOUT` | — | `3` | Per-outbound-request timeout (seconds; clamped below the response budget) |
 | `RESPONSE_BUDGET_SECONDS` | — | `4.5` | Hard budget for checks **and** reactions after a valid message; clamped below 5 seconds |
 | `REACTION_TIMEOUT` | — | `0.75` | Cap for each Discord reaction REST call; platform reactions run concurrently |
 | `USER_MAX_CHECKS` | — | `3` | Checks allowed per user per window |
 | `USER_WINDOW_SECONDS` | — | `60` | Cooldown window (seconds) |
 | `RESULT_CACHE_TTL` | — | `300` | Cache repeat lookups (seconds) |
+
+> Startup rejects malformed `PROXY_URL` values, external-checker URL templates,
+> and configured auth-header names before connecting. Malformed/non-finite numeric settings
+> safely fall back to defaults; credential values are never printed.
 
 > To copy a channel ID: Discord **Settings → Advanced → Developer Mode ON**,
 > then right-click the channel → **Copy Channel ID**.
@@ -218,9 +233,9 @@ Availability report for 'Notch':
 **Test suite (`python test_checkers.py && python test_bot.py`):**
 
 ```
-Ran 20 tests in 0.03s
+Ran 24 tests in 0.03s
 OK (skipped=2)      <- the 2 live tests run only with LIVE=1
-Ran 20 tests in 0.14s
+Ran 25 tests in 0.14s
 OK
 ```
 
@@ -236,9 +251,9 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 
 ## 🔧 Optional features
 
-- **Rotating proxy** — set `PROXY_URL=http://user:pass@backconnect-host:port`
-  and every outbound check rides a fresh exit IP. HTTP(S) proxies are built in;
-  SOCKS needs `pip install aiohttp-socks` plus a small code change.
+- **User-supplied proxy** — set `PROXY_URL` only in your private `.env` or host
+  secret manager. Every outbound check uses it; HTTP(S) URLs are validated at
+  startup. SOCKS needs `pip install aiohttp-socks` plus a small code change.
 - **Hits logging** — set `LOG_CHANNEL_ID` and every name found free is posted
   to that channel with the finder's mention.
 - **Tuning** — `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`,
@@ -254,8 +269,8 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 - **Mojang rate-limits hard.** The cooldown + cache + fallback endpoint exist
   so your server IP doesn't get blocked. Don't lower them for a busy server.
 - **guns.lol sits behind Cloudflare** and may answer `403` to datacenter IPs —
-  the bot reports that as *unknown* rather than lying to you. A residential/
-  rotating proxy usually helps.
+  the bot reports that as *unknown* rather than lying to you. If you choose to
+  use a proxy, supply it privately through `PROXY_URL`; no proxy is bundled.
 - **Discord availability is not publicly checkable** (see matrix above). The
   `🐈‍⬛` reaction only appears when you explicitly configure an authorized
   external `probe` URL; its semantics are your checker's responsibility.
@@ -277,8 +292,8 @@ python checkers.py zxqw7k3vlt9m42q # inspect a random candidate name
 ## 🧪 Verifying your install (summary)
 
 ```bash
-python test_checkers.py      # 18 offline tests (+ 2 skipped live tests) — should print OK
-python test_bot.py           # 20 pipeline tests — should print OK
+python test_checkers.py      # 22 offline tests (+ 2 skipped live tests) — should print OK
+python test_bot.py           # 25 pipeline tests — should print OK
 python checkers.py Notch     # live endpoints from your machine
 LIVE=1 python test_checkers.py   # enables the 2 real-network tests
 python bot.py                # startup banner, then post names in Discord
