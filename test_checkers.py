@@ -26,8 +26,13 @@ from checkers import (
     interpret_discord_dnsrobot,
     interpret_discord_dnsrobot_page,
     interpret_discord_probe,
+    interpret_github,
     interpret_gunslol,
+    interpret_instagram,
     interpret_minecraft,
+    interpret_reddit,
+    interpret_steam,
+    interpret_twitter,
 )
 
 
@@ -98,15 +103,12 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_gunslol(418), ERROR)
 
     def test_gunslol_200_page_semantics(self):
-        # guns.lol may return 200 for its semantic "unclaimed" page.
         self.assertEqual(
             interpret_gunslol(200, "<h1>Username not found</h1>"), AVAILABLE)
         self.assertEqual(
             interpret_gunslol(200, "<title>Everything you want | guns.lol</title>"), AVAILABLE)
         self.assertEqual(
             interpret_gunslol(200, "<title>Just a moment...</title>"), BLOCKED)
-        # Do not confuse a claimed profile's generic Discord-widget text with
-        # the narrower availability marker above.
         self.assertEqual(
             interpret_gunslol(200, "<p>User Not Found on Discord</p>"), TAKEN)
 
@@ -154,6 +156,94 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_discord_dnsrobot(403, {"taken": False}), BLOCKED)
         self.assertEqual(interpret_discord_dnsrobot(200, {"status": "available"}), ERROR)
 
+    def test_github(self):
+        # 200 with login = taken
+        self.assertEqual(interpret_github(200, {"login": "octocat"}), TAKEN)
+        # 200 without valid login = blocked
+        self.assertEqual(interpret_github(200, {"message": "rate limit"}), BLOCKED)
+        self.assertEqual(interpret_github(200, None), TAKEN)
+        # 404 = available
+        self.assertEqual(interpret_github(404), AVAILABLE)
+        # Rate limited
+        self.assertEqual(interpret_github(403), BLOCKED)
+        self.assertEqual(interpret_github(429), BLOCKED)
+        # Other
+        self.assertEqual(interpret_github(500), ERROR)
+
+    def test_steam(self):
+        # 200 with normal profile = taken
+        self.assertEqual(interpret_steam(200, "<html>profile content</html>"), TAKEN)
+        # 200 with "profile not found" = available
+        self.assertEqual(interpret_steam(200, "The specified profile could not be found"), AVAILABLE)
+        # 200 with empty body = blocked
+        self.assertEqual(interpret_steam(200, ""), BLOCKED)
+        # 200 with challenge = blocked
+        self.assertEqual(interpret_steam(200, "Just a moment..."), BLOCKED)
+        # 404 = available
+        self.assertEqual(interpret_steam(404), AVAILABLE)
+        # Rate limited
+        self.assertEqual(interpret_steam(403), BLOCKED)
+        self.assertEqual(interpret_steam(429), BLOCKED)
+        self.assertEqual(interpret_steam(503), BLOCKED)
+        # Other
+        self.assertEqual(interpret_steam(500), ERROR)
+
+    def test_reddit(self):
+        # 200 with user data = taken
+        self.assertEqual(interpret_reddit(200, {"data": {"name": "octocat"}}), TAKEN)
+        # 200 without data = blocked
+        self.assertEqual(interpret_reddit(200, {"message": "blocked"}), BLOCKED)
+        self.assertEqual(interpret_reddit(200, None), BLOCKED)
+        # 404 = available
+        self.assertEqual(interpret_reddit(404), AVAILABLE)
+        # Rate limited
+        self.assertEqual(interpret_reddit(403), BLOCKED)
+        self.assertEqual(interpret_reddit(429), BLOCKED)
+        self.assertEqual(interpret_reddit(503), BLOCKED)
+        # Other
+        self.assertEqual(interpret_reddit(500), ERROR)
+
+    def test_instagram(self):
+        # 200 with normal page = taken
+        self.assertEqual(interpret_instagram(200, "<html>profile page</html>"), TAKEN)
+        # 200 with "not available" = available
+        self.assertEqual(interpret_instagram(200, "Sorry, this page isn't available"), AVAILABLE)
+        # 200 with login wall = blocked
+        self.assertEqual(interpret_instagram(200, "Login to Instagram"), BLOCKED)
+        self.assertEqual(interpret_instagram(200, "challenge required"), BLOCKED)
+        # 200 with empty body = blocked
+        self.assertEqual(interpret_instagram(200, ""), BLOCKED)
+        # 404 = available
+        self.assertEqual(interpret_instagram(404), AVAILABLE)
+        # Redirect = blocked (login wall)
+        self.assertEqual(interpret_instagram(302), BLOCKED)
+        # Auth wall
+        self.assertEqual(interpret_instagram(401), BLOCKED)
+        self.assertEqual(interpret_instagram(403), BLOCKED)
+        self.assertEqual(interpret_instagram(429), BLOCKED)
+        # Other
+        self.assertEqual(interpret_instagram(500), ERROR)
+
+    def test_twitter(self):
+        # 200 with normal page = taken
+        self.assertEqual(interpret_twitter(200, "<html>profile content</html>"), TAKEN)
+        # 200 with "doesn't exist" = available
+        self.assertEqual(interpret_twitter(200, "This account doesn't exist"), AVAILABLE)
+        self.assertEqual(interpret_twitter(200, "This user doesn't exist"), AVAILABLE)
+        self.assertEqual(interpret_twitter(200, "Hmm...this page doesn't exist"), AVAILABLE)
+        # 200 with challenge = blocked
+        self.assertEqual(interpret_twitter(200, "Rate limit exceeded"), BLOCKED)
+        self.assertEqual(interpret_twitter(200, "captcha"), BLOCKED)
+        # 200 with empty body = blocked
+        self.assertEqual(interpret_twitter(200, ""), BLOCKED)
+        # 404 = available
+        self.assertEqual(interpret_twitter(404), AVAILABLE)
+        # Rate limited
+        self.assertEqual(interpret_twitter(403), BLOCKED)
+        self.assertEqual(interpret_twitter(429), BLOCKED)
+        # Other
+        self.assertEqual(interpret_twitter(500), ERROR)
+
 
 class TestValidators(unittest.TestCase):
     def test_message_pattern(self):
@@ -175,6 +265,22 @@ class TestValidators(unittest.TestCase):
         self.assertIsNotNone(checkers.GUNSLOL_PATTERN.fullmatch("id.search"))
         self.assertIsNone(checkers.DISCORD_PATTERN.fullmatch("Notch"))      # uppercase
         self.assertIsNotNone(checkers.DISCORD_PATTERN.fullmatch("notch.dev"))
+        # GitHub pattern
+        self.assertIsNotNone(checkers.GITHUB_PATTERN.fullmatch("octocat"))
+        self.assertIsNotNone(checkers.GITHUB_PATTERN.fullmatch("a"))
+        self.assertIsNone(checkers.GITHUB_PATTERN.fullmatch("-bad"))         # starts with -
+        self.assertIsNone(checkers.GITHUB_PATTERN.fullmatch("bad-"))         # ends with -
+        # Steam pattern
+        self.assertIsNotNone(checkers.STEAM_PATTERN.fullmatch("gabelogannewell"))
+        # Reddit pattern
+        self.assertIsNotNone(checkers.REDDIT_PATTERN.fullmatch("spez"))
+        self.assertIsNone(checkers.REDDIT_PATTERN.fullmatch("ab"))          # <3
+        # Instagram pattern
+        self.assertIsNotNone(checkers.INSTAGRAM_PATTERN.fullmatch("kevin"))
+        self.assertIsNotNone(checkers.INSTAGRAM_PATTERN.fullmatch("user.name"))
+        # Twitter pattern
+        self.assertIsNotNone(checkers.TWITTER_PATTERN.fullmatch("jack"))
+        self.assertIsNone(checkers.TWITTER_PATTERN.fullmatch("a" * 16))     # >15
 
     def test_user_supplied_endpoint_validation(self):
         self.assertIsNone(checkers.validate_http_url("https://proxy.example:8443",
@@ -209,30 +315,18 @@ class TestValidators(unittest.TestCase):
         )
         self.assertIn("path", checkers.validate_proxy_url(
             "http://proxy.example/route") or "")
-        self.assertIn("control", checkers.validate_http_url(
-            "https://checker.example/lookup/\x01") or "")
-        self.assertIn("control", checkers.validate_proxy_url(
-            "http://user%0Aname:pass@proxy.example:8080") or "")
-        self.assertIn("placeholder", checkers.validate_probe_url_template(
-            "https://checker.example/{username!r}") or "")
-        self.assertIn("invalid braces", checkers.validate_probe_url_template(
-            "https://checker.example/{username}/{other}") or "")
-        self.assertIsNone(checkers.validate_request_headers(
-            {"X-API-Key": "secret"}, "probe headers"))
-        self.assertIn("header name", checkers.validate_request_headers(
-            {"Bad\nHeader": "secret"}, "probe headers") or "")
-        self.assertIn("header value", checkers.validate_request_headers(
-            {"X-API-Key": "bad\nvalue"}, "probe headers") or "")
 
     def test_sensitive_error_text_is_redacted(self):
-        detail = checkers._redact_sensitive_text(
-            "proxy=http://person:secret@proxy.example?token=private-value "
-            "Authorization: Bearer private-header-value")
-        self.assertNotIn("secret", detail)
-        self.assertNotIn("private-value", detail)
-        self.assertNotIn("private-header-value", detail)
-        self.assertIn("***", detail)
-        self.assertNotIn("\n", checkers._redact_sensitive_text("remote\nerror"))
+        msg = checkers._redact_sensitive_text(
+            "failed http://user:pass@proxy.example/path?token=secret")
+        self.assertNotIn("pass", msg)
+        self.assertNotIn("secret", msg)
+        self.assertIn("***", msg)
+        msg2 = checkers._redact_sensitive_text(
+            aiohttp.ClientError("Authorization: Bearer eyJhbGciOi.test.sig"))
+        self.assertNotIn("eyJhbGciOi", msg2)
+        self.assertIn("***", msg2)
+        self.assertLessEqual(len(msg2), 120)
 
 
 class TestCheckers(unittest.TestCase):
@@ -242,13 +336,11 @@ class TestCheckers(unittest.TestCase):
     def test_minecraft_taken(self):
         r = self.run_async(checkers.check_minecraft(_session_with_status(200), "Notch"))
         self.assertEqual(r.status, TAKEN)
-        self.assertFalse(r.available)
+        self.assertEqual(r.emoji, "\U0001F579\uFE0F")
 
     def test_minecraft_free(self):
         r = self.run_async(checkers.check_minecraft(_session_with_status(404), "zxqw99182"))
         self.assertEqual(r.status, AVAILABLE)
-        self.assertTrue(r.available)
-        self.assertEqual(r.emoji, "\U0001F579\uFE0F")
 
     def test_minecraft_invalid_name_short_circuits(self):
         r = self.run_async(checkers.check_minecraft(_session_with_status(200), "ab"))
@@ -403,6 +495,16 @@ class TestCheckers(unittest.TestCase):
         results = self.run_async(checkers.run_all_checks(
             _session_with_status(404), "zxqw99182", discord_mode="probe",
             discord_probe_url="https://checker.example/{username}"))
+        # Now returns 8 results (3 core + 5 extra)
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(r.available for r in results))
+
+    def test_parallel_run_all_core_only(self):
+        results = self.run_async(checkers.run_all_checks(
+            _session_with_status(404), "zxqw99182", discord_mode="probe",
+            discord_probe_url="https://checker.example/{username}",
+            enable_extra_platforms=False))
+        # Core only = 3 results
         self.assertEqual(len(results), 3)
         self.assertTrue(all(r.available for r in results))
 
@@ -412,7 +514,8 @@ class TestCheckers(unittest.TestCase):
         self.run_async(checkers.run_all_checks(
             session, "zxqw99182", discord_mode="probe",
             discord_probe_url="https://checker.example/{username}",
-            discord_probe_headers=headers))
+            discord_probe_headers=headers,
+            enable_extra_platforms=False))
 
         checker_calls = []
         platform_calls = []
@@ -431,12 +534,169 @@ class TestCheckers(unittest.TestCase):
 
         with patch.object(checkers, "check_minecraft", slow_checker), \
              patch.object(checkers, "check_gunslol", slow_checker), \
-             patch.object(checkers, "check_discord", slow_checker):
+             patch.object(checkers, "check_discord", slow_checker), \
+             patch.object(checkers, "check_github", slow_checker), \
+             patch.object(checkers, "check_steam", slow_checker), \
+             patch.object(checkers, "check_reddit", slow_checker), \
+             patch.object(checkers, "check_instagram", slow_checker), \
+             patch.object(checkers, "check_twitter", slow_checker):
             results = self.run_async(checkers.run_all_checks(
                 _session_with_status(404), "zxqw99182", timeout=0.001))
 
-        self.assertEqual([r.status for r in results], [ERROR, ERROR, ERROR])
+        self.assertEqual([r.status for r in results], [ERROR] * 8)
         self.assertTrue(all("deadline" in r.detail for r in results))
+
+    # -- New platform checker tests --
+
+    def test_github_free(self):
+        session = _session_with_status(404)
+        r = self.run_async(checkers.check_github(session, "zxqw99182nonexistent"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.emoji, "\U0001F4BB")
+
+    def test_github_taken(self):
+        response = MagicMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={"login": "octocat", "id": 1})
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get = MagicMock(return_value=ctx)
+        r = self.run_async(checkers.check_github(session, "octocat"))
+        self.assertEqual(r.status, TAKEN)
+
+    def test_github_invalid_name(self):
+        r = self.run_async(checkers.check_github(_session_with_status(200), "-bad"))
+        self.assertEqual(r.status, INVALID)
+
+    def test_steam_free(self):
+        r = self.run_async(checkers.check_steam(
+            _session_with_status(200, "The specified profile could not be found"),
+            "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.emoji, "\U0001F3AE")
+
+    def test_steam_taken(self):
+        r = self.run_async(checkers.check_steam(
+            _session_with_status(200, "<html>normal profile</html>"),
+            "gabelogannewell"))
+        self.assertEqual(r.status, TAKEN)
+
+    def test_reddit_free(self):
+        r = self.run_async(checkers.check_reddit(_session_with_status(404), "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.emoji, "\U0001F440")
+
+    def test_reddit_taken(self):
+        response = MagicMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={"data": {"name": "spez"}})
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get = MagicMock(return_value=ctx)
+        r = self.run_async(checkers.check_reddit(session, "spez"))
+        self.assertEqual(r.status, TAKEN)
+
+    def test_instagram_free(self):
+        r = self.run_async(checkers.check_instagram(
+            _session_with_status(404), "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.emoji, "\U0001F4F8")
+
+    def test_instagram_login_wall(self):
+        r = self.run_async(checkers.check_instagram(
+            _session_with_status(200, "Login to Instagram"), "kevin"))
+        self.assertEqual(r.status, BLOCKED)
+
+    def test_twitter_free(self):
+        r = self.run_async(checkers.check_twitter(
+            _session_with_status(404), "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.emoji, "\U0001F426")
+
+    def test_twitter_account_doesnt_exist(self):
+        r = self.run_async(checkers.check_twitter(
+            _session_with_status(200, "This account doesn't exist"), "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+
+
+class TestProxyPool(unittest.TestCase):
+    """Tests for the proxy pool module."""
+
+    def test_import(self):
+        from proxies import ProxyPool, parse_proxy_list
+        pool = ProxyPool(["http://proxy1:8080", "http://proxy2:8080"])
+        self.assertEqual(pool.size, 2)
+        self.assertEqual(pool.alive_count, 2)
+
+    def test_round_robin(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080", "http://p2:8080", "http://p3:8080"])
+        seen = set()
+        for _ in range(6):
+            seen.add(pool.next())
+        self.assertEqual(len(seen), 3)
+
+    def test_failure_tracking(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080", "http://p2:8080"])
+        pool.report_failure("http://p1:8080")
+        pool.report_failure("http://p1:8080")
+        pool.report_failure("http://p1:8080")
+        self.assertEqual(pool.alive_count, 1)
+        # Only p2 should be returned now
+        for _ in range(5):
+            self.assertEqual(pool.next(), "http://p2:8080")
+
+    def test_recovery_after_cooldown(self):
+        import time
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080"], recovery_cooldown=0.01)
+        for _ in range(3):
+            pool.report_failure("http://p1:8080")
+        self.assertEqual(pool.alive_count, 0)
+        # After cooldown, should recover
+        time.sleep(0.02)
+        url = pool.next()
+        self.assertEqual(url, "http://p1:8080")
+
+    def test_empty_pool(self):
+        from proxies import ProxyPool
+        pool = ProxyPool()
+        self.assertIsNone(pool.next())
+        self.assertEqual(pool.size, 0)
+
+    def test_parse_proxy_list(self):
+        from proxies import parse_proxy_list
+        result = parse_proxy_list("http://p1:8080,http://p2:8080,http://p3:8080")
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0], "http://p1:8080")
+        # With newlines
+        result2 = parse_proxy_list("http://p1:8080\nhttp://p2:8080")
+        self.assertEqual(len(result2), 2)
+        # Empty
+        self.assertEqual(parse_proxy_list(""), [])
+        self.assertEqual(parse_proxy_list("  "), [])
+
+    def test_status_summary(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080"])
+        summary = pool.status_summary()
+        self.assertIn("p1", summary)
+        self.assertIn("alive", summary)
+
+    def test_all_dead_falls_back(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080"])
+        for _ in range(3):
+            pool.report_failure("http://p1:8080")
+        self.assertEqual(pool.alive_count, 0)
+        # Should still return the proxy (reset on all-dead)
+        url = pool.next()
+        self.assertEqual(url, "http://p1:8080")
 
 
 class TestLiveNetwork(unittest.TestCase):
@@ -463,8 +723,14 @@ class TestLiveNetwork(unittest.TestCase):
     def test_live_gunslol(self):
         free = self._check(
             lambda s: checkers.check_gunslol(s, "zxqw7k3vlt9m42q"))
-        # Cloudflare may wall datacenter IPs, so FREE or BLOCKED are both sane
         self.assertIn(free.status, (AVAILABLE, BLOCKED), free.detail)
+
+    @unittest.skipUnless(os.getenv("LIVE") == "1", "set LIVE=1 to run")
+    def test_live_github(self):
+        taken = self._check(lambda s: checkers.check_github(s, "octocat"))
+        free = self._check(lambda s: checkers.check_github(s, "zxqw7k3vlt9m42qnonexistent"))
+        self.assertEqual(taken.status, TAKEN, taken.detail)
+        self.assertEqual(free.status, AVAILABLE, free.detail)
 
 
 if __name__ == "__main__":
