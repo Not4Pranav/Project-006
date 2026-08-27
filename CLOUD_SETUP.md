@@ -125,6 +125,10 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# Startup proxy verification probes 1,000 proxies at once, and each in-flight
+# probe holds a file descriptor. systemd's default is often 1,024.
+LimitNOFILE=16384
+
 # Hardening: the bot needs no privileges beyond outbound HTTPS.
 NoNewPrivileges=true
 PrivateTmp=true
@@ -283,7 +287,29 @@ HTTP_POOL_LIMIT_PER_HOST=40
 
 # Lower memory / fewer outbound requests on a tiny instance
 # ENABLE_EXTRA_PLATFORMS=false
+
+# Proxy pool size. The default aims for 1,000 working proxies, which means
+# ~100,000 probes and about 4 minutes of background CPU at every boot -
+# too much for the smallest free tiers, and on a host that sleeps (Render
+# free) it is repeated on every cold start. Scale it to the instance:
+#   512 MB / 0.1 CPU (Render, Replit):  200 / 200
+#   1 GB shared (Koyeb, Fly):           500 / 500
+#   Oracle Ampere or any real VPS:      leave the defaults
+PROXY_MIN_POOL=200
+PROXY_VERIFY_CONCURRENCY=200
 ```
+
+The pool itself is cheap — a thousand proxies is a few hundred kilobytes of
+strings. What costs CPU is *finding* them, because a free list is ~99 % dead
+and each dead entry has to time out. That cost is paid in the background,
+after the bot is already answering messages, so it never delays a reply; it
+only competes for CPU on an instance that has very little.
+
+On a VPS, also raise the open-file limit if you keep the default width — 1,000
+concurrent probes need 1,000 descriptors (`LimitNOFILE=16384` in the unit file
+above, or `ulimit -n 8192` before launching by hand). The bot raises its own
+soft limit where it is allowed to, and narrows the probe width with a warning
+where it is not, so a low limit slows the search down rather than breaking it.
 
 If you use proxies, upload `proxies.txt` alongside `.env` (same secrecy rules — it holds credentials, and it is gitignored). On PaaS hosts with no persistent filesystem, put the list in the `PROXY_URLS` environment variable instead; the same formats are accepted.
 
@@ -330,6 +356,8 @@ curl -s https://your-app.onrender.com/health
 | Bot online, then dies after ~15 min | Free service slept. Add the UptimeRobot ping (B2). |
 | `ModuleNotFoundError` on deploy | Build command missing or wrong: `pip install -r requirements.txt`. |
 | `DISCORD_TOKEN missing` | Environment variable not set in the host's dashboard (a committed `.env` will not exist there). |
+| Boot is busy for a few minutes, then settles | Normal: that is the background proxy search probing ~100,000 entries to reach `PROXY_MIN_POOL`. Lower it (see above) if the instance is small. |
+| `Only N of the requested 1000 proxies are working` | The list is too stale to supply that many. Point `PROXY_LIST_URL` at a fresher one, lower `PROXY_MIN_POOL`, or add paid proxies to `proxies.txt` — those are never dropped. |
 | Killed with exit code 137 | Out of memory — set `DISCORD_CHECK_MODE=off` and `ENABLE_EXTRA_PLATFORMS=false`. |
 | Works locally, all ⚠️ in the cloud | The host's IP is rate-limited by Instagram/X. Add `PROXY_URLS`, or disable extra platforms. |
 | Oracle "Out of capacity" | Try another availability domain, another region, or the AMD micro shape. |

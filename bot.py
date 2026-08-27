@@ -68,7 +68,7 @@ from proxies import (
     DEFAULT_PROXY_CACHE, DEFAULT_PROXY_FILE, ProxyPool, ProxyProvider,
     drop_socks_ports, fetch_proxy_list, load_proxy_file, parse_proxy_list,
     probe_proxies, read_proxy_cache, sample_proxies, short_proxy_url,
-    write_proxy_cache,
+    usable_concurrency, write_proxy_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -194,18 +194,24 @@ PROXY_LIST_TTL = _bounded_float(
     "PROXY_LIST_TTL", 6 * 3600, minimum=0.0, maximum=30 * 86400)
 PROXY_LIST_TIMEOUT = _bounded_float(
     "PROXY_LIST_TIMEOUT", 20.0, minimum=1.0, maximum=120.0)
-# Upper bound on how many proxies enter the rotation. A pool of thousands
-# costs memory, file descriptors and health-check time for no benefit: the
-# rotation only needs enough IPs to spread one lookup's eight requests.
-PROXY_MAX_POOL = _bounded_int("PROXY_MAX_POOL", 300, minimum=1, maximum=20_000)
+# Upper bound on how many proxies enter the rotation. Every entry costs a
+# little memory and a slice of each health sweep, so this is a ceiling, not a
+# goal - but a big pool is genuinely useful against per-IP rate limits, and a
+# scraped list is cheap, so the ceiling sits well above the floor.
+PROXY_MAX_POOL = _bounded_int(
+    "PROXY_MAX_POOL", 2_000, minimum=1, maximum=50_000)
 # How many *working* proxies the bot tries to end up with. Verification keeps
 # pulling fresh candidates from the list until it has this many, because a
-# public list is mostly dead and one sample of it will not be enough.
-PROXY_MIN_POOL = _bounded_int("PROXY_MIN_POOL", 100, minimum=0, maximum=20_000)
+# public list is mostly dead and one sample of it will not be enough. At the
+# ~1% hit rate a free list gives, reaching 1,000 means probing most of a
+# 169,000-entry list - which is why the search is wide, chunked and runs in
+# the background while the bot is already answering.
+PROXY_MIN_POOL = _bounded_int(
+    "PROXY_MIN_POOL", 1_000, minimum=0, maximum=50_000)
 # Wall-clock ceiling for that search. It runs in the background, so the bot is
 # already answering while it works; this only stops it hunting forever.
 PROXY_VERIFY_MAX_SECONDS = _bounded_float(
-    "PROXY_VERIFY_MAX_SECONDS", 300.0, minimum=1.0, maximum=3600.0)
+    "PROXY_VERIFY_MAX_SECONDS", 900.0, minimum=1.0, maximum=21_600.0)
 if PROXY_MAX_POOL < PROXY_MIN_POOL:
     # A maximum below the minimum is a typo, not an instruction to keep fewer.
     PROXY_MAX_POOL = PROXY_MIN_POOL
@@ -219,7 +225,7 @@ PROXY_VERIFY_ON_START = os.getenv(
 # timeouts, so a wide-and-short probe finds working ones far faster than a
 # narrow-and-patient one.
 PROXY_VERIFY_CONCURRENCY = _bounded_int(
-    "PROXY_VERIFY_CONCURRENCY", 400, minimum=1, maximum=5_000)
+    "PROXY_VERIFY_CONCURRENCY", 1_000, minimum=1, maximum=10_000)
 PROXY_VERIFY_TIMEOUT = _bounded_float(
     "PROXY_VERIFY_TIMEOUT", 5.0, minimum=0.5, maximum=60.0)
 # What a proxy must be able to fetch to count as working. It is deliberately
@@ -227,9 +233,11 @@ PROXY_VERIFY_TIMEOUT = _bounded_float(
 # cannot CONNECT is no use even if it serves plain HTTP happily.
 PROXY_PROBE_URL = os.getenv(
     "PROXY_PROBE_URL", "https://api.mojang.com").strip() or "https://api.mojang.com"
-# The periodic sweep of the (small, already-verified) live pool stays gentle.
+# The periodic sweep of the already-verified live pool. It has to get through
+# a pool that can now hold thousands, so it is wider than it was - but still
+# far gentler than startup verification, because these proxies already work.
 PROXY_HEALTH_CONCURRENCY = _bounded_int(
-    "PROXY_HEALTH_CONCURRENCY", 50, minimum=1, maximum=1_000)
+    "PROXY_HEALTH_CONCURRENCY", 200, minimum=1, maximum=5_000)
 # Skip entries on well-known SOCKS ports: aiohttp cannot speak SOCKS, so on a
 # scraped list they are just wasted probes.
 PROXY_SKIP_SOCKS_PORTS = os.getenv(
@@ -634,22 +642,24 @@ class SniperBot(discord.Client):
             return
         started = time.monotonic()
         deadline = started + PROXY_VERIFY_MAX_SECONDS
+        # What this host can actually sustain, which may be less than asked
+        # for: every in-flight probe holds a file descriptor.
+        width = usable_concurrency(PROXY_VERIFY_CONCURRENCY)
         log.info("Verifying %d proxies (%d at a time) against %s, "
                  "aiming for %d working...",
-                 pool.size, PROXY_VERIFY_CONCURRENCY, PROXY_PROBE_URL,
-                 PROXY_MIN_POOL)
+                 pool.size, width, PROXY_PROBE_URL, PROXY_MIN_POOL)
 
         # Its own connector: hundreds of doomed proxy connections must not
         # queue behind - or evict - the connections live lookups are using.
         connector = aiohttp.TCPConnector(
-            limit=PROXY_VERIFY_CONCURRENCY, force_close=True,
+            limit=width, force_close=True,
             enable_cleanup_closed=True)
         session = aiohttp.ClientSession(connector=connector)
         try:
             working = await probe_proxies(
                 session, pool.urls, PROXY_PROBE_URL,
                 timeout=PROXY_VERIFY_TIMEOUT,
-                concurrency=PROXY_VERIFY_CONCURRENCY)
+                concurrency=width)
             tested = pool.size
 
             # A public list is mostly dead, so one sample rarely yields
@@ -662,15 +672,15 @@ class SniperBot(discord.Client):
                 wanted = PROXY_MIN_POOL - len(working)
                 batch_size = min(
                     len(self._proxy_reserve),
-                    max(PROXY_VERIFY_CONCURRENCY, int(wanted / hit_rate) + 1),
-                    5000,
+                    max(width, int(wanted / hit_rate) + 1),
+                    10_000,
                 )
                 batch = self._proxy_reserve[:batch_size]
                 del self._proxy_reserve[:batch_size]
                 found = await probe_proxies(
                     session, batch, PROXY_PROBE_URL,
                     timeout=PROXY_VERIFY_TIMEOUT,
-                    concurrency=PROXY_VERIFY_CONCURRENCY)
+                    concurrency=width)
                 tested += len(batch)
                 working.extend(found)
                 log.info("Proxy search: %d/%d working after testing %d "

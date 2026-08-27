@@ -55,6 +55,28 @@ async def start_proxy(seen: list | None = None) -> tuple[web.AppRunner, str]:
     return runner, f"127.0.0.1:{port}"
 
 
+async def start_wide_proxy() -> tuple[web.AppRunner, int]:
+    """A forward proxy bound to every interface.
+
+    Bound wide so it can be reached through any 127.x.y.z alias, which lets a
+    handful of real servers stand in for a thousand distinct proxy addresses
+    without opening a thousand listening sockets.
+    """
+
+    async def handler(_request: web.Request) -> web.Response:
+        return web.json_response({"id": "uuid", "name": "Notch"})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    # A deep accept queue: this one process stands in for hundreds of
+    # separate proxy hosts, so it sees a burst no single real proxy would.
+    site = web.TCPSite(runner, "0.0.0.0", 0, backlog=4096)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1]
+
+
 async def start_list_server(text: str) -> tuple[web.AppRunner, str]:
     """Serves a proxy list at /list.txt."""
 
@@ -82,6 +104,11 @@ class IntegrationCase(unittest.IsolatedAsyncioTestCase):
         runner, url = await start_proxy(seen)
         self._runners.append(runner)
         return url
+
+    async def wide_proxy_port(self) -> int:
+        runner, port = await start_wide_proxy()
+        self._runners.append(runner)
+        return port
 
     async def list_server(self, text: str) -> str:
         runner, url = await start_list_server(text)
@@ -249,6 +276,47 @@ class TestMinimumPoolSearch(IntegrationCase):
         self.assertGreaterEqual(pool.size, 10)
         self.assertTrue(set(pool.urls) <= set(working),
                         "a dead proxy survived verification")
+
+    async def test_pool_of_a_thousand_from_a_mostly_dead_list(self):
+        """The real target: 1,000 verified proxies out of a big dead list."""
+
+        random.seed(11)
+        ports = [await self.wide_proxy_port() for _ in range(24)]
+
+        # 1,056 distinct proxy addresses served by 8 real listeners.
+        alive = [f"http://127.0.{block}.{host}:{port}"
+                 for port in ports
+                 for block in range(1, 8)
+                 for host in range(1, 8)]
+        # Closed loopback ports: refused immediately, so the suite stays quick.
+        dead = [f"http://127.0.0.1:{p}" for p in range(2, 4002)]
+        everything = alive + dead
+        random.shuffle(everything)
+
+        bot = bot_module.SniperBot.__new__(bot_module.SniperBot)
+        bot.http_sniper = MagicMock()
+        bot.proxy_provider = proxies_module.ProxyProvider(static_url=None)
+        bot.proxy_provider.pool = proxies_module.ProxyPool(everything[:2000])
+        bot._proxy_reserve = everything[2000:]
+        bot._curated_proxies = set()
+
+        with patch.multiple(
+            bot_module,
+            PROXY_MIN_POOL=1000, PROXY_MAX_POOL=2000,
+            PROXY_VERIFY_MAX_SECONDS=180.0, PROXY_VERIFY_CONCURRENCY=500,
+            PROXY_VERIFY_TIMEOUT=5.0,
+            PROXY_PROBE_URL="http://example.invalid/",
+        ):
+            await bot._verify_proxies()
+
+        pool = bot.proxy_provider.pool
+        self.assertGreaterEqual(pool.size, 1000,
+                                "the search stopped short of 1,000")
+        self.assertTrue(set(pool.urls) <= set(alive),
+                        "a dead proxy survived verification")
+        # And the rotation really hands out that many distinct addresses.
+        handed_out = {pool.next() for _ in range(1000)}
+        self.assertGreaterEqual(len(handed_out), 1000)
 
     async def test_curated_proxies_survive_a_failed_probe(self):
         """A proxy the operator configured is never dropped on one miss."""

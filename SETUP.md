@@ -93,13 +93,13 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 134 offline tests
+python test_checkers.py     # 138 offline tests
 python test_bot.py          # 63 pipeline tests
 python test_stress.py       # 17 stress tests
-python test_integration.py  # 12 integration tests (real local sockets)
+python test_integration.py  # 13 integration tests (real local sockets)
 ```
 
-All four suites must end in `OK` (226 tests). Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
+All four suites must end in `OK` (231 tests). None of them needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
 
 Smoke-test the real checkers without touching Discord:
 
@@ -178,12 +178,18 @@ Formats are normalised for you — `host:port`, `host:port:user:pass`, `user:pas
 PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
 ```
 
-It is downloaded at startup, cached in `.proxy-cache.txt` for 6 hours, filtered of SOCKS-only ports, and probed — only proxies that actually answer end up serving traffic, and the bot keeps testing further batches until **`PROXY_MIN_POOL` (100) are working**, up to `PROXY_VERIFY_MAX_SECONDS` (300 s). The search runs in the background, so the bot answers messages while it works. Expect most of a free list to be dead; on a 0.74 %-alive list it found 102 working proxies in 66 seconds.
+It is downloaded at startup, cached in `.proxy-cache.txt` for 6 hours, filtered of SOCKS-only ports, and probed — only proxies that actually answer end up serving traffic, and the bot keeps testing further batches until **`PROXY_MIN_POOL` (1,000) are working**, up to `PROXY_VERIFY_MAX_SECONDS` (15 min). The search runs in the background, so the bot answers messages while it works.
+
+Expect most of a free list to be dead. Rehearsed at a realistic 1 % alive rate, reaching **1,004 working proxies took 100,201 probes and 3 minutes 45 seconds** — 1,000 probes in flight at a time. Two consequences worth planning for:
+
+- **Small hosts should aim lower.** On 512 MB / 0.1 CPU (Render free, Replit), set `PROXY_MIN_POOL=200` and `PROXY_VERIFY_CONCURRENCY=200`. The search is what costs CPU; the pool itself is nearly free.
+- **1,000 concurrent probes need 1,000 file descriptors.** The bot raises its own soft limit (the usual default is 1,024). If your host forbids that, it narrows the probe width to what fits and logs a warning — nothing crashes, the search just takes longer. On a VPS you can lift it yourself with `ulimit -n 8192` before starting the bot.
 
 To build a verified list up front instead:
 
 ```bash
-python proxies.py "<list url>" --want 100 --skip-socks --keep proxies.txt
+python proxies.py "<list url>" --want 1000 --skip-socks --keep proxies.txt
+# probes until 1,000 answer (several minutes on a free list), then writes them
 ```
 
 Environment variables work too, and are merged with the file:

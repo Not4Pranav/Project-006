@@ -1618,6 +1618,86 @@ class TestPoolVerification(unittest.TestCase):
         self.assertEqual(pool.size, 1)
 
 
+class TestConcurrencyLimits(unittest.TestCase):
+    """Probing 1,000 at a time needs 1,000 file descriptors."""
+
+    def test_concurrency_is_clamped_to_the_open_file_limit(self):
+        import resource
+        import proxies as proxies_module
+
+        with patch.object(proxies_module, "_fd_limit_raised", True), \
+             patch.object(resource, "getrlimit", return_value=(512, 512)):
+            self.assertEqual(proxies_module.usable_concurrency(5000),
+                             512 - proxies_module._FD_HEADROOM)
+            # Comfortably under the limit: honoured as asked.
+            self.assertEqual(proxies_module.usable_concurrency(100), 100)
+
+    def test_soft_limit_is_raised_when_it_is_too_low(self):
+        import resource
+        import proxies as proxies_module
+
+        raised = []
+
+        def fake_setrlimit(_which, limits):
+            raised.append(limits)
+
+        with patch.object(proxies_module, "_fd_limit_raised", False), \
+             patch.object(resource, "getrlimit", return_value=(1024, 500_000)), \
+             patch.object(resource, "setrlimit", fake_setrlimit):
+            width = proxies_module.usable_concurrency(2000)
+
+        self.assertEqual(raised, [(2000 + proxies_module._FD_HEADROOM,
+                                   500_000)])
+        self.assertEqual(width, 2000)
+
+    def test_a_refused_raise_still_returns_a_usable_width(self):
+        import resource
+        import proxies as proxies_module
+
+        def refuse(*_args):
+            raise OSError("nope")
+
+        with patch.object(proxies_module, "_fd_limit_raised", False), \
+             patch.object(resource, "getrlimit", return_value=(256, 256)), \
+             patch.object(resource, "setrlimit", refuse):
+            width = proxies_module.usable_concurrency(4000)
+
+        self.assertEqual(width, 256 - proxies_module._FD_HEADROOM)
+        self.assertGreater(width, 0)
+
+    def test_probing_a_huge_list_does_not_build_a_task_per_entry(self):
+        """169,000 coroutines at once would cost hundreds of megabytes."""
+        import proxies as proxies_module
+
+        urls = [f"http://10.0.0.1:{8000 + i}" for i in range(5000)]
+        in_flight = 0
+        peak = 0
+
+        class FakeResponse:
+            status = 200
+
+            async def __aenter__(self):
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0)
+                return self
+
+            async def __aexit__(self, *_exc):
+                nonlocal in_flight
+                in_flight -= 1
+                return False
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=FakeResponse())
+
+        alive = asyncio.run(proxies_module.probe_proxies(
+            session, urls, "http://example.invalid/", timeout=1.0,
+            concurrency=50))
+
+        self.assertEqual(len(alive), 5000)
+        self.assertLessEqual(peak, 50)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

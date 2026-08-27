@@ -29,6 +29,7 @@ import logging
 import os
 import random
 import re
+import resource
 import time
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
@@ -215,7 +216,8 @@ class ProxyPool:
             return
 
         request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
-        gate = asyncio.Semaphore(max(1, concurrency))
+        width = usable_concurrency(concurrency)
+        gate = asyncio.Semaphore(width)
 
         async def probe(proxy: ProxyHealth) -> None:
             async with gate:
@@ -235,7 +237,13 @@ class ProxyPool:
                 except Exception:  # noqa: BLE001 - any failure means "unusable"
                     proxy.record_failure()
 
-        await asyncio.gather(*(probe(p) for p in self._proxies))
+        # Chunked for the same reason as probe_proxies: the pool can hold
+        # thousands, and one coroutine per proxy up front is wasted memory.
+        chunk_size = max(width * 4, 256)
+        proxies = list(self._proxies)
+        for start in range(0, len(proxies), chunk_size):
+            await asyncio.gather(
+                *(probe(p) for p in proxies[start:start + chunk_size]))
         self._last_health_check = time.monotonic()
 
     def add(self, urls: list[str]) -> int:
@@ -564,6 +572,56 @@ short_proxy_url = _short_url
 # ---------------------------------------------------------------------------
 
 
+# Every in-flight probe holds a socket, and the default soft limit on Linux is
+# 1024 - low enough that probing 1,000 proxies at once fails with "too many
+# open files" instead of finishing faster. The soft limit can be raised to the
+# hard limit (usually enormous) without privileges, so do that once, lazily,
+# and tell the caller what concurrency the process can actually sustain.
+_FD_HEADROOM = 128
+_fd_limit_raised = False
+
+
+def usable_concurrency(concurrency: int) -> int:
+    """Raise the file-descriptor soft limit if needed; clamp to what fits.
+
+    Returns the concurrency the process can really support. Never raises:
+    on a platform without ``RLIMIT_NOFILE`` semantics the request is simply
+    honoured as asked.
+    """
+
+    global _fd_limit_raised
+
+    wanted = max(1, concurrency)
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):  # pragma: no cover - not POSIX
+        return wanted
+
+    if soft == resource.RLIM_INFINITY:
+        return wanted
+
+    need = wanted + _FD_HEADROOM
+    if soft < need and not _fd_limit_raised:
+        target = need if hard == resource.RLIM_INFINITY else min(need, hard)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            soft = target
+            log.debug("Raised the open-file limit to %d for proxy probing",
+                      target)
+        except (ValueError, OSError):
+            log.debug("Could not raise the open-file limit above %d", soft)
+        _fd_limit_raised = True
+
+    room = max(1, soft - _FD_HEADROOM)
+    if wanted > room:
+        log.warning(
+            "Probing %d at a time needs more open files than this host "
+            "allows (limit %d); using %d instead. Raise it with "
+            "'ulimit -n' if you want to go wider.", wanted, soft, room)
+        return room
+    return wanted
+
+
 async def probe_proxies(
     session: aiohttp.ClientSession,
     urls: list[str],
@@ -582,7 +640,8 @@ async def probe_proxies(
         return []
 
     request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
-    gate = asyncio.Semaphore(max(1, concurrency))
+    width = usable_concurrency(concurrency)
+    gate = asyncio.Semaphore(width)
 
     async def probe(url: str) -> bool:
         async with gate:
@@ -599,8 +658,18 @@ async def probe_proxies(
             except Exception:  # noqa: BLE001 - any failure means "unusable"
                 return False
 
-    outcomes = await asyncio.gather(*(probe(url) for url in urls))
-    return [url for url, ok in zip(urls, outcomes) if ok]
+    # Build tasks in chunks rather than one task per URL up front: a 169,000
+    # entry list would otherwise allocate 169,000 coroutines before the first
+    # probe runs, which costs hundreds of megabytes on a host that may only
+    # have 512 MB. The semaphore still governs how many are actually in
+    # flight; this only governs how many exist at once.
+    alive: list[str] = []
+    chunk_size = max(width * 4, 256)
+    for start in range(0, len(urls), chunk_size):
+        chunk = urls[start:start + chunk_size]
+        outcomes = await asyncio.gather(*(probe(url) for url in chunk))
+        alive.extend(url for url, ok in zip(chunk, outcomes) if ok)
+    return alive
 
 
 # ---------------------------------------------------------------------------
@@ -918,14 +987,17 @@ def _main() -> int:
         "--limit", type=int, default=0,
         help="probe at most N proxies, sampled across the list")
     parser.add_argument(
-        "--concurrency", type=int, default=100,
-        help="how many proxies to probe at once (default: 100)")
+        "--concurrency", type=int, default=500,
+        help="how many proxies to probe at once (default: 500; narrowed "
+             "automatically if the open-file limit is lower)")
     parser.add_argument(
         "--keep", default="",
         help="write the proxies that answered to this file")
     parser.add_argument(
         "--want", type=int, default=0,
-        help="keep testing until this many proxies work (for a big list)")
+        help="keep testing until this many proxies work (for a big list; "
+             "at the ~1%% alive rate of a free list, --want 1000 means "
+             "probing ~100,000 entries, so allow several minutes)")
     parser.add_argument(
         "--skip-socks", action="store_true",
         help="ignore entries on well-known SOCKS ports")

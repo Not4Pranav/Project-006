@@ -20,7 +20,7 @@
 # Check your list any time with:   python proxies.py
 #
 # Distil a huge public list into 100 verified working proxies:
-#   python proxies.py "<list url>" --want 100 --skip-socks --keep proxies.txt
+#   python proxies.py "<list url>" --want 1000 --skip-socks --keep proxies.txt
 
 # gate.example-vendor.com:7000:myuser:mypassword
 # gate.example-vendor.com:7001:myuser:mypassword
