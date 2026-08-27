@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -200,39 +201,125 @@ class ProxyPool:
         session: aiohttp.ClientSession,
         target_url: str = "https://api.mojang.com",
         timeout: float = 3.0,
+        concurrency: int = 100,
     ) -> None:
-        """Probe every proxy concurrently with one lightweight request each."""
+        """Probe every proxy with one lightweight request each.
+
+        Probes run in parallel but *bounded*: a large public list can hold
+        thousands of proxies, and firing thousands of sockets at once would
+        exhaust the connector (and the host's file descriptors) rather than
+        finish faster.
+        """
 
         if not self._proxies:
             return
 
         request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
+        gate = asyncio.Semaphore(max(1, concurrency))
 
         async def probe(proxy: ProxyHealth) -> None:
-            try:
-                async with session.get(
-                    target_url,
-                    proxy=proxy.url,
-                    timeout=request_timeout,
-                    allow_redirects=False,
-                ) as response:
-                    if response.status < 500:
-                        proxy.record_success()
-                    else:
-                        proxy.record_failure()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - any failure means "unusable"
-                proxy.record_failure()
+            async with gate:
+                try:
+                    async with session.get(
+                        target_url,
+                        proxy=proxy.url,
+                        timeout=request_timeout,
+                        allow_redirects=False,
+                    ) as response:
+                        if response.status < 500:
+                            proxy.record_success()
+                        else:
+                            proxy.record_failure()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - any failure means "unusable"
+                    proxy.record_failure()
 
-        # Concurrent: N proxies cost one timeout, not N timeouts.
         await asyncio.gather(*(probe(p) for p in self._proxies))
         self._last_health_check = time.monotonic()
+
+    async def verify(
+        self,
+        session: aiohttp.ClientSession,
+        target_url: str = "https://api.mojang.com",
+        timeout: float = 6.0,
+        concurrency: int = 100,
+        keep_minimum: int = 1,
+    ) -> tuple[int, int]:
+        """Probe every proxy once and keep only the ones that answered.
+
+        Unlike the running health rules - where a proxy is only benched after
+        three consecutive failures, so a blip does not lose it - a startup
+        probe is pass/fail: one chance, and a public list's corpses are gone
+        before they can slow a single lookup.
+
+        Returns ``(alive, removed)``. If nothing answers, nothing is removed:
+        an empty pool would quietly become direct, unproxied traffic.
+        """
+
+        if not self._proxies:
+            return 0, 0
+
+        request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
+        gate = asyncio.Semaphore(max(1, concurrency))
+
+        async def probe(proxy: ProxyHealth) -> bool:
+            async with gate:
+                try:
+                    async with session.get(
+                        target_url,
+                        proxy=proxy.url,
+                        timeout=request_timeout,
+                        allow_redirects=False,
+                    ) as response:
+                        return response.status < 500
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    return False
+
+        outcomes = await asyncio.gather(*(probe(p) for p in self._proxies))
+        alive = [proxy for proxy, ok in zip(self._proxies, outcomes) if ok]
+        self._last_health_check = time.monotonic()
+
+        if len(alive) < max(1, keep_minimum):
+            for proxy in self._proxies:
+                proxy.consecutive_failures = 0
+            return len(alive), 0
+
+        removed = len(self._proxies) - len(alive)
+        for proxy in alive:
+            proxy.record_success()
+        self._proxies = alive
+        self._by_url = {p.url: p for p in alive}
+        self._index = 0
+        return len(alive), removed
+
+    def drop_dead(self, keep_minimum: int = 1) -> int:
+        """Remove proxies that failed their probe. Returns how many were cut.
+
+        Public proxy lists are mostly dead on arrival. Carrying thousands of
+        corpses makes every rotation step walk past them, so after the first
+        verification sweep the dead ones are dropped for good. If *nothing*
+        answered, the pool is left untouched: an empty pool would silently
+        turn into direct, unproxied traffic.
+        """
+
+        alive = [p for p in self._proxies if p.is_alive]
+        if len(alive) < max(1, keep_minimum):
+            return 0
+        removed = len(self._proxies) - len(alive)
+        if removed:
+            self._proxies = alive
+            self._by_url = {p.url: p for p in alive}
+            self._index = 0
+        return removed
 
     async def periodic_health_check(
         self,
         session: aiohttp.ClientSession,
         target_url: str = "https://api.mojang.com",
+        concurrency: int = 100,
     ) -> None:
         """Background task that periodically refreshes proxy health."""
 
@@ -241,7 +328,8 @@ class ProxyPool:
                 await asyncio.sleep(self._health_check_interval)
                 now = time.monotonic()
                 if now - self._last_health_check >= self._health_check_interval:
-                    await self.health_check(session, target_url)
+                    await self.health_check(
+                        session, target_url, concurrency=concurrency)
                     log.debug("Proxy health check: %d/%d alive",
                               self.alive_count, self.size)
             except asyncio.CancelledError:
@@ -464,6 +552,154 @@ short_proxy_url = _short_url
 
 
 # ---------------------------------------------------------------------------
+# Remote proxy lists
+# ---------------------------------------------------------------------------
+#
+# Public lists are far too large to keep in the repository (the one this bot
+# ships with is ~169,000 entries), and they go stale within hours. So the list
+# is fetched from a URL at startup, cached locally, sampled down to a workable
+# size, and verified before use.
+
+# Where a cached copy of the remote list is kept, so a restart still has
+# proxies when the download is slow or the host is offline.
+DEFAULT_PROXY_CACHE = ".proxy-cache.txt"
+
+# Google Drive "view" links serve an HTML page, not the file. This turns one
+# into the direct-download endpoint automatically.
+_DRIVE_FILE_PATTERN = re.compile(
+    r"https?://drive\.google\.com/file/d/([\w-]+)")
+_DRIVE_OPEN_PATTERN = re.compile(
+    r"https?://drive\.google\.com/(?:open|uc)\?(?:[^#]*&)?id=([\w-]+)")
+
+
+def direct_download_url(url: str) -> str:
+    """Rewrite share links that serve HTML into direct file downloads."""
+
+    for pattern in (_DRIVE_FILE_PATTERN, _DRIVE_OPEN_PATTERN):
+        match = pattern.match(url.strip())
+        if match:
+            return ("https://drive.usercontent.google.com/download"
+                    f"?id={match.group(1)}&export=download")
+    # GitHub blob pages have a raw equivalent.
+    if "github.com/" in url and "/blob/" in url:
+        return url.replace("github.com/", "raw.githubusercontent.com/", 1) \
+                  .replace("/blob/", "/", 1)
+    return url
+
+
+async def fetch_proxy_list(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: float = 20.0,
+    max_bytes: int = 32 * 1024 * 1024,
+) -> list[str]:
+    """Download a proxy list. Returns [] on any failure - never raises."""
+
+    if not url:
+        return []
+    target = direct_download_url(url)
+    request_timeout = aiohttp.ClientTimeout(total=max(1.0, timeout))
+    try:
+        async with session.get(target, timeout=request_timeout) as response:
+            if response.status != 200:
+                log.warning("Proxy list download failed: HTTP %s",
+                            response.status)
+                return []
+            # StreamReader.read(n) returns whatever is buffered, not n
+            # bytes, so a multi-megabyte list must be drained in a loop.
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in response.content.iter_chunked(64 * 1024):
+                chunks.append(chunk)
+                received += len(chunk)
+                if received >= max_bytes:
+                    log.warning("Proxy list exceeded %d MB; using the first "
+                                "part only", max_bytes // (1024 * 1024))
+                    break
+            body = b"".join(chunks)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not download the proxy list: %s", exc)
+        return []
+
+    text = body.decode("utf-8", errors="replace")
+    if "<html" in text[:2048].lower():
+        log.warning("The proxy list URL returned a web page, not a text file. "
+                    "Use a direct/raw download link.")
+        return []
+    proxies = parse_proxy_list(text)
+    log.info("Downloaded %d proxies from the remote list", len(proxies))
+    return proxies
+
+
+def read_proxy_cache(path: str = DEFAULT_PROXY_CACHE) -> tuple[list[str], float]:
+    """Return cached proxies and the cache age in seconds (inf if missing)."""
+
+    if not path or not os.path.exists(path):
+        return [], float("inf")
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        age = float("inf")
+    return load_proxy_file(path), age
+
+
+def write_proxy_cache(proxies: list[str],
+                      path: str = DEFAULT_PROXY_CACHE) -> None:
+    """Persist a downloaded list so the next start does not have to wait."""
+
+    if not path or not proxies:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("# Cached proxy list - regenerated automatically.\n")
+            handle.write("\n".join(proxies) + "\n")
+    except OSError as exc:
+        log.debug("Could not write the proxy cache: %s", exc)
+
+
+def sample_proxies(proxies: list[str], limit: int,
+                   seed: int | None = None) -> list[str]:
+    """Take at most ``limit`` proxies, sampled evenly across the whole list.
+
+    Public lists are ordered by whatever scraper produced them, so taking the
+    first N would over-sample one source. Sampling spreads the choice across
+    the file, which spreads it across countries and providers too.
+    """
+
+    if limit <= 0 or len(proxies) <= limit:
+        return list(proxies)
+    rng = random.Random(seed)
+    return rng.sample(proxies, limit)
+
+
+# Ports that are almost always SOCKS4/SOCKS5 rather than HTTP. aiohttp cannot
+# speak SOCKS, so on a huge scraped list these entries are just probe budget
+# thrown away. They are only skipped when the entry had no explicit scheme.
+SOCKS_LIKELY_PORTS = frozenset({
+    1080, 1081, 1082, 1085, 1090, 4145, 4153, 5678, 9050, 9051, 9150,
+    10808, 10809, 32650, 61234,
+})
+
+
+def drop_socks_ports(proxies: list[str]) -> tuple[list[str], int]:
+    """Split out entries whose port is a well-known SOCKS port."""
+
+    kept, dropped = [], 0
+    for url in proxies:
+        try:
+            port = urlsplit(url).port
+        except ValueError:
+            port = None
+        if port in SOCKS_LIKELY_PORTS:
+            dropped += 1
+            continue
+        kept.append(url)
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
 # CLI: verify a proxy list without starting the bot
 # ---------------------------------------------------------------------------
 
@@ -491,12 +727,30 @@ async def _probe_one(session, url: str, target: str, timeout: float):
         return False, f"{type(exc).__name__}: {exc}"
 
 
-async def _check_list(path: str, target: str, timeout: float) -> int:
-    """Load a proxy file, validate it, and probe every entry concurrently."""
+async def _load_source(source: str, timeout: float) -> list[str]:
+    """Load a proxy list from a file path or an http(s) URL."""
+
+    if source.lower().startswith(("http://", "https://")):
+        async with aiohttp.ClientSession() as session:
+            return await fetch_proxy_list(session, source, timeout=timeout)
+    return load_proxy_file(source)
+
+
+async def _check_list(path: str, target: str, timeout: float,
+                      limit: int = 0, concurrency: int = 100,
+                      keep: str = "", skip_socks: bool = False) -> int:
+    """Load a proxy list, validate it, and probe every entry concurrently."""
 
     import checkers  # local import: the CLI is not on the bot's hot path
 
-    proxies = load_proxy_file(path)
+    proxies = await _load_source(path, timeout=max(timeout, 20.0))
+    if skip_socks:
+        proxies, dropped = drop_socks_ports(proxies)
+        if dropped:
+            print(f"Skipped {dropped} entries on SOCKS-only ports.")
+    if limit and len(proxies) > limit:
+        print(f"Sampling {limit} of {len(proxies)} proxies.")
+        proxies = sample_proxies(proxies, limit)
     if not proxies:
         print(f"No usable proxies found in {path}.")
         print("Expected one proxy per line, for example:")
@@ -522,17 +776,40 @@ async def _check_list(path: str, target: str, timeout: float) -> int:
         return 1
 
     print(f"Probing {target} through each proxy "
-          f"(timeout {timeout:.0f}s, all at once)...\n")
-    async with aiohttp.ClientSession() as session:
+          f"(timeout {timeout:.0f}s, {concurrency} at a time)...\n")
+    gate = asyncio.Semaphore(max(1, concurrency))
+
+    async def probe(session, url):
+        async with gate:
+            return await _probe_one(session, url, target, timeout)
+
+    started = time.monotonic()
+    connector = aiohttp.TCPConnector(limit=max(1, concurrency) * 2)
+    async with aiohttp.ClientSession(connector=connector) as session:
         outcomes = await asyncio.gather(*(
-            _probe_one(session, url, target, timeout) for url in usable))
+            probe(session, url) for url in usable))
+    elapsed = time.monotonic() - started
 
-    alive = 0
+    alive_urls = []
+    quiet = len(usable) > 60
     for url, (ok, detail) in zip(usable, outcomes):
-        alive += ok
-        print(f"  {'✓' if ok else '✗'} {_short_url(url):<40} {detail}")
+        if ok:
+            alive_urls.append(url)
+        if ok or not quiet:
+            print(f"  {'✓' if ok else '✗'} {_short_url(url):<40} {detail}")
+    if quiet:
+        print(f"  ({len(usable) - len(alive_urls)} dead entries not listed)")
 
-    print(f"\n{alive}/{len(usable)} alive.")
+    alive = len(alive_urls)
+    print(f"\n{alive}/{len(usable)} alive, checked in {elapsed:.1f}s.")
+
+    if keep and alive_urls:
+        with open(keep, "w", encoding="utf-8") as handle:
+            handle.write("# Verified working proxies, written by "
+                         "python proxies.py --keep\n")
+            handle.write("\n".join(alive_urls) + "\n")
+        print(f"Wrote {alive} working prox"
+              f"{'y' if alive == 1 else 'ies'} to {keep}")
     if alive == 0:
         print("None of them answered. Check the credentials, the ports, and "
               "whether your vendor allows this machine's IP.")
@@ -550,17 +827,32 @@ def _main() -> int:
         description="Check the proxy list the bot would use.")
     parser.add_argument(
         "path", nargs="?", default=DEFAULT_PROXY_FILE,
-        help=f"proxy list file (default: {DEFAULT_PROXY_FILE})")
+        help=f"proxy list file or http(s) URL (default: {DEFAULT_PROXY_FILE})")
     parser.add_argument(
         "--target", default="https://api.mojang.com",
         help="URL to fetch through each proxy")
     parser.add_argument(
         "--timeout", type=float, default=8.0, help="seconds per probe")
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="probe at most N proxies, sampled across the list")
+    parser.add_argument(
+        "--concurrency", type=int, default=100,
+        help="how many proxies to probe at once (default: 100)")
+    parser.add_argument(
+        "--keep", default="",
+        help="write the proxies that answered to this file")
+    parser.add_argument(
+        "--skip-socks", action="store_true",
+        help="ignore entries on well-known SOCKS ports")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
     try:
-        return asyncio.run(_check_list(args.path, args.target, args.timeout))
+        return asyncio.run(_check_list(
+            args.path, args.target, args.timeout, limit=args.limit,
+            concurrency=args.concurrency, keep=args.keep,
+            skip_socks=args.skip_socks))
     except KeyboardInterrupt:
         return 130
 

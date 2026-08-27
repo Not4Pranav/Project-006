@@ -64,8 +64,9 @@ from dotenv import load_dotenv
 
 import checkers
 from proxies import (
-    DEFAULT_PROXY_FILE, ProxyPool, ProxyProvider, load_proxy_file,
-    parse_proxy_list, short_proxy_url,
+    DEFAULT_PROXY_CACHE, DEFAULT_PROXY_FILE, ProxyPool, ProxyProvider,
+    drop_socks_ports, fetch_proxy_list, load_proxy_file, parse_proxy_list,
+    read_proxy_cache, sample_proxies, short_proxy_url, write_proxy_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,40 @@ PROXY_URLS_RAW = os.getenv("PROXY_URLS", "").strip()
 # needed. PROXY_FILE points somewhere else; PROXY_FILE= (blank) disables it.
 PROXY_FILE = os.getenv("PROXY_FILE", DEFAULT_PROXY_FILE).strip()
 
+# Remote proxy list, downloaded at startup. Public lists are far too large to
+# keep in the repository (this one is ~169,000 entries) and go stale within
+# hours, so the bot fetches it, caches it, samples it down and verifies it.
+# Set PROXY_LIST_URL= (blank) to switch remote loading off entirely.
+DEFAULT_PROXY_LIST_URL = (
+    "https://drive.google.com/file/d/"
+    "1-Go3mD7uZ-2j5-YoytjsHJAKbPA7RDsN/view?usp=drivesdk"
+)
+PROXY_LIST_URL = os.getenv("PROXY_LIST_URL", DEFAULT_PROXY_LIST_URL).strip()
+PROXY_CACHE_FILE = os.getenv("PROXY_CACHE_FILE", DEFAULT_PROXY_CACHE).strip()
+# How long a cached copy is reused before the list is downloaded again.
+PROXY_LIST_TTL = _bounded_float(
+    "PROXY_LIST_TTL", 6 * 3600, minimum=0.0, maximum=30 * 86400)
+PROXY_LIST_TIMEOUT = _bounded_float(
+    "PROXY_LIST_TIMEOUT", 20.0, minimum=1.0, maximum=120.0)
+# Upper bound on how many proxies enter the rotation. A pool of thousands
+# costs memory, file descriptors and health-check time for no benefit: the
+# rotation only needs enough IPs to spread one lookup's eight requests.
+PROXY_MAX_POOL = _bounded_int("PROXY_MAX_POOL", 300, minimum=1, maximum=20_000)
+# Probe every proxy once at startup and keep only the ones that answer.
+# Essential for public lists, where the large majority are already dead.
+PROXY_VERIFY_ON_START = os.getenv(
+    "PROXY_VERIFY_ON_START", "true").strip().lower() in (
+        "true", "1", "yes", "on", "")
+PROXY_VERIFY_CONCURRENCY = _bounded_int(
+    "PROXY_VERIFY_CONCURRENCY", 100, minimum=1, maximum=2_000)
+PROXY_VERIFY_TIMEOUT = _bounded_float(
+    "PROXY_VERIFY_TIMEOUT", 6.0, minimum=0.5, maximum=60.0)
+# Skip entries on well-known SOCKS ports: aiohttp cannot speak SOCKS, so on a
+# scraped list they are just wasted probes.
+PROXY_SKIP_SOCKS_PORTS = os.getenv(
+    "PROXY_SKIP_SOCKS_PORTS", "true").strip().lower() in (
+        "true", "1", "yes", "on", "")
+
 
 # The proxy file is read once per path: startup validation, the pool, and the
 # banner all ask for it, and one log line is enough.
@@ -198,6 +233,8 @@ def _proxy_source_summary() -> str:
         sources.append("PROXY_URLS")
     if PROXY_FILE and _proxy_file_entries():
         sources.append(PROXY_FILE)
+    if PROXY_LIST_URL:
+        sources.append("remote list")
     return " + ".join(sources) if sources else "none"
 
 
@@ -445,18 +482,21 @@ class SniperBot(discord.Client):
         )
 
         # Initialize proxy pool
-        proxy_list = configured_proxies()
+        proxy_list = await self._resolve_proxy_list()
         if proxy_list:
             self.proxy_pool = ProxyPool(
                 proxy_list, allow_direct_fallback=PROXY_ALLOW_DIRECT_FALLBACK)
             # Background health checking, refreshed every 30s.
             self._health_task = asyncio.create_task(
-                self.proxy_pool.periodic_health_check(self.http_sniper))
+                self.proxy_pool.periodic_health_check(
+                    self.http_sniper,
+                    concurrency=PROXY_VERIFY_CONCURRENCY))
             # The first sweep runs in the background: awaiting it here would
             # delay the gateway login by a full probe timeout for no benefit,
             # since live traffic reports health on its own.
             self._initial_health_task = asyncio.create_task(
-                self._initial_health_check())
+                self._verify_proxies() if PROXY_VERIFY_ON_START
+                else self._initial_health_check())
 
         if KEEPALIVE_PORT:
             await self._start_keepalive_server()
@@ -495,6 +535,84 @@ class SniperBot(discord.Client):
         """Keep the pool and the provider handed to the checkers in sync."""
 
         self.proxy_provider.pool = pool
+
+    async def _resolve_proxy_list(self) -> list[str]:
+        """Assemble the rotation: local sources first, then the remote list.
+
+        Anything configured locally (PROXY_URL / PROXY_URLS / proxies.txt) is
+        used as-is and never sampled - it is a deliberate, curated list. The
+        remote list is the bulk source: cached, filtered, sampled down to
+        PROXY_MAX_POOL and verified before anything else touches it.
+        """
+
+        local = configured_proxies()
+        if not PROXY_LIST_URL:
+            return local
+
+        remote, age = read_proxy_cache(PROXY_CACHE_FILE)
+        if remote and age <= PROXY_LIST_TTL:
+            log.info("Using %d cached proxies (%.0f min old)",
+                     len(remote), age / 60)
+        else:
+            downloaded = await fetch_proxy_list(
+                self.http_sniper, PROXY_LIST_URL, timeout=PROXY_LIST_TIMEOUT)
+            if downloaded:
+                remote = downloaded
+                write_proxy_cache(remote, PROXY_CACHE_FILE)
+            elif remote:
+                log.warning("Download failed; falling back to the cached list "
+                            "(%.0f min old)", age / 60)
+
+        if remote and PROXY_SKIP_SOCKS_PORTS:
+            remote, dropped = drop_socks_ports(remote)
+            if dropped:
+                log.info("Skipped %d entries on SOCKS-only ports", dropped)
+
+        budget = max(0, PROXY_MAX_POOL - len(local))
+        sampled = sample_proxies(remote, budget)
+        if remote and len(sampled) < len(remote):
+            log.info("Sampled %d of %d remote proxies (PROXY_MAX_POOL=%d)",
+                     len(sampled), len(remote), PROXY_MAX_POOL)
+
+        merged = list(local)
+        seen = set(local)
+        for url in sampled:
+            if url not in seen:
+                seen.add(url)
+                merged.append(url)
+        return merged
+
+    async def _verify_proxies(self) -> None:
+        """Probe the pool once and drop whatever did not answer.
+
+        A scraped public list is mostly dead on arrival. Without this the
+        rotation would spend its first minutes handing out corpses, and every
+        lookup would pay a timeout before failing over.
+        """
+
+        pool = self.proxy_pool
+        if pool is None or not pool.size:
+            return
+        started = time.monotonic()
+        log.info("Verifying %d proxies (%d at a time)...",
+                 pool.size, PROXY_VERIFY_CONCURRENCY)
+        alive, removed = await pool.verify(
+            self.http_sniper,
+            timeout=PROXY_VERIFY_TIMEOUT,
+            concurrency=PROXY_VERIFY_CONCURRENCY,
+        )
+        elapsed = time.monotonic() - started
+        if alive:
+            log.info("Proxy check: %d alive, %d dropped, in %.1fs",
+                     alive, removed, elapsed)
+        else:
+            # Keep them: an empty pool means direct, unproxied traffic, which
+            # is exactly what proxies were configured to avoid.
+            log.warning(
+                "No proxy answered in %.1fs. Keeping the pool and retrying "
+                "them live - checks may be slow until one recovers. Consider "
+                "a paid proxy provider, or set PROXY_LIST_URL to a fresher "
+                "list.", elapsed)
 
     async def _start_keepalive_server(self) -> None:
         """Serve a small health endpoint so free hosts keep the bot running.

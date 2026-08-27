@@ -245,7 +245,11 @@ Check the list before you rely on it — this loads the file, validates every en
 ```bash
 python proxies.py                     # checks proxies.txt
 python proxies.py /path/to/list.txt --timeout 8
+python proxies.py "https://drive.google.com/file/d/<id>/view" \
+    --limit 500 --skip-socks --keep proxies.txt
 ```
+
+The last form is how you distil a huge public list into a small working one: sample 500, skip SOCKS ports, probe them all, and write only the survivors to `proxies.txt`.
 
 ```
 3 proxies loaded from proxies.txt
@@ -271,6 +275,41 @@ Every common vendor format is accepted and normalised for you:
 | `https://1.2.3.4:3128` | unchanged |
 
 Blank lines and `#` comments are ignored, duplicates are dropped, credentials containing `@ : space` are percent-encoded, and an unreadable line is skipped with a warning instead of taking the bot down. SOCKS proxies are **rejected at startup** with a clear message — silently ignoring them would run the bot with no proxy at all and leak your real IP.
+
+### Big public lists: `PROXY_LIST_URL`
+
+Scraped public lists are far too large to keep in a repo (the one this bot ships with is ~169,000 entries) and go stale within hours, so they are **fetched at startup instead of stored**:
+
+```env
+# Default: the shared list. Set blank to switch remote loading off.
+PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
+```
+
+Google Drive `…/view` links, GitHub `blob` links and plain raw URLs all work — share links are rewritten to their direct-download form automatically, and an HTML sign-in page is detected and rejected rather than parsed as proxies.
+
+What happens on boot, in order:
+
+| Step | Why |
+|---|---|
+| Reuse `.proxy-cache.txt` if younger than `PROXY_LIST_TTL` (6 h) | Restarts are instant and work offline |
+| Otherwise download, then rewrite the cache | Survives the next restart even if the host goes away |
+| Drop entries on SOCKS-only ports (1080, 4145, 9050, …) | aiohttp cannot speak SOCKS — on a scraped list that is ~44% of the file, and every one would be a wasted probe |
+| Sample down to `PROXY_MAX_POOL` (300) | The rotation only needs enough IPs to spread one lookup's 8 requests; thousands cost memory, sockets and probe time for nothing. Sampling is spread across the whole file, not the first N, so it is not all one scraper's block |
+| Probe every remaining proxy once, keep only the ones that answer | Public proxies are mostly dead on arrival; without this the rotation hands out corpses and every lookup pays a timeout first |
+
+Startup verification is **pass/fail on one probe**, unlike the running rule where a proxy is only benched after 3 consecutive failures. If *nothing* answers, the pool is kept anyway and you get a loud warning — an empty pool would silently mean direct, unproxied traffic.
+
+Measured on a 169,000-entry list (3.2 MB) with three working proxies hidden inside it:
+
+```
+parsed 168,997 proxies in 0.3 s
+SOCKS-port filter: dropped 74,996, kept 94,001
+pool built: 300 (sampled)
+verified 300 proxies in 0.2 s -> 3 alive, 297 dropped
+8-request lookup through the verified pool: 3 ms
+```
+
+Anything you configure locally (`PROXY_URL`, `PROXY_URLS`, `proxies.txt`) is treated as curated: it is never sampled away and never filtered.
 
 ### Or via environment variables
 
@@ -386,6 +425,15 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `PROXY_URL` | *(blank)* | Single proxy; also joins the pool if one is configured |
 | `PROXY_URLS` | *(blank)* | Comma/newline separated pool |
 | `PROXY_FILE` | `proxies.txt` | Proxy list file loaded automatically; blank disables it |
+| `PROXY_LIST_URL` | *(shared list)* | Remote list downloaded at startup; blank disables it |
+| `PROXY_CACHE_FILE` | `.proxy-cache.txt` | Where the downloaded list is cached |
+| `PROXY_LIST_TTL` | `21600` | Seconds before the remote list is downloaded again |
+| `PROXY_LIST_TIMEOUT` | `20` | Download timeout in seconds |
+| `PROXY_MAX_POOL` | `300` | Most proxies allowed in the rotation |
+| `PROXY_VERIFY_ON_START` | `true` | Probe once at boot and keep only what answers |
+| `PROXY_VERIFY_CONCURRENCY` | `100` | Proxies probed at the same time |
+| `PROXY_VERIFY_TIMEOUT` | `6` | Seconds allowed per verification probe |
+| `PROXY_SKIP_SOCKS_PORTS` | `true` | Ignore entries on well-known SOCKS ports |
 | `PROXY_ALLOW_DIRECT_FALLBACK` | `false` | Go direct when every proxy is down (leaks the host IP) |
 
 ### Discord check
@@ -407,7 +455,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 ## Development and testing
 
 ```bash
-python test_checkers.py       # 116 offline tests (interpreters, request layer, proxies, fallback)
+python test_checkers.py       # 134 offline tests (interpreters, request layer, proxies, fallback)
 python test_bot.py            # 54 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints

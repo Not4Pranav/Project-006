@@ -93,7 +93,7 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 116 offline tests
+python test_checkers.py     # 134 offline tests
 python test_bot.py          # 54 pipeline tests
 python test_stress.py       # 17 stress tests
 ```
@@ -170,6 +170,14 @@ python proxies.py            # loads proxies.txt and reports which are alive
 That file is read automatically at startup and is gitignored, so credentials never reach a commit. Point somewhere else with `PROXY_FILE=/etc/multi-sniper/proxies.txt`, or set `PROXY_FILE=` to switch it off.
 
 Formats are normalised for you — `host:port`, `host:port:user:pass`, `user:pass@host:port`, `user:pass:host:port` and full `http://` URLs all work, mixed freely in one file. Blank lines and `#` comments are ignored, duplicates dropped, bad lines skipped with a warning.
+
+**Using a big public list?** Point the bot at its URL instead of storing it:
+
+```env
+PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
+```
+
+It is downloaded at startup, cached in `.proxy-cache.txt` for 6 hours, filtered of SOCKS-only ports, sampled down to `PROXY_MAX_POOL` (300), and probed — only proxies that actually answer end up serving traffic. Expect most of a free list to be dead; that is normal and handled.
 
 Environment variables work too, and are merged with the file:
 

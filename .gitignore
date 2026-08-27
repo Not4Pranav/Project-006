@@ -18,3 +18,4 @@ venv/
 proxies.txt
 proxies*.txt
 !proxies.txt.example
+.proxy-cache.txt

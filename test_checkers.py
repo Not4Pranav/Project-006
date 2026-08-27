@@ -1355,5 +1355,269 @@ class TestProxyFile(unittest.TestCase):
 
 
 
+
+class TestRemoteProxyList(unittest.TestCase):
+    """Downloading, caching and sampling a large public proxy list."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    # -- link rewriting ----------------------------------------------------
+
+    def test_share_links_become_direct_downloads(self):
+        from proxies import direct_download_url
+        self.assertEqual(
+            direct_download_url(
+                "https://drive.google.com/file/d/ABC123-xyz/view?usp=drivesdk"),
+            "https://drive.usercontent.google.com/download"
+            "?id=ABC123-xyz&export=download")
+        self.assertEqual(
+            direct_download_url("https://drive.google.com/open?id=ABC123"),
+            "https://drive.usercontent.google.com/download"
+            "?id=ABC123&export=download")
+        self.assertEqual(
+            direct_download_url("https://github.com/o/r/blob/main/p.txt"),
+            "https://raw.githubusercontent.com/o/r/main/p.txt")
+        # Anything already direct is left alone.
+        for url in ("https://pastebin.com/raw/abc",
+                    "https://example.com/proxies.txt"):
+            self.assertEqual(direct_download_url(url), url)
+
+    # -- downloading -------------------------------------------------------
+
+    @staticmethod
+    async def _serve(body, status=200, content_type="text/plain"):
+        from aiohttp import web
+        async def handler(_request):
+            return web.Response(body=body, status=status,
+                                content_type=content_type)
+        app = web.Application()
+        app.router.add_get("/list.txt", handler)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        return runner, f"http://127.0.0.1:{port}/list.txt"
+
+    def _download(self, body, status=200, content_type="text/plain",
+                  max_bytes=32 * 1024 * 1024):
+        from proxies import fetch_proxy_list
+        async def run():
+            import aiohttp as aio
+            runner, url = await self._serve(body, status, content_type)
+            try:
+                async with aio.ClientSession() as session:
+                    return await fetch_proxy_list(
+                        session, url, timeout=10, max_bytes=max_bytes)
+            finally:
+                await runner.cleanup()
+        return asyncio.run(run())
+
+    def test_large_list_is_read_in_full(self):
+        """A multi-megabyte list must not be truncated to one buffer."""
+
+        entries = [f"10.{i // 65536 % 256}.{i // 256 % 256}.{i % 256}:8080"
+                   for i in range(60_000)]
+        body = ("\n".join(entries) + "\n").encode()
+        self.assertGreater(len(body), 1_000_000)
+        loaded = self._download(body)
+        self.assertEqual(len(loaded), len(set(entries)))
+        self.assertEqual(loaded[0], "http://10.0.0.0:8080")
+
+    def test_max_bytes_is_honoured(self):
+        entries = [f"10.0.{i // 256 % 256}.{i % 256}:8080"
+                   for i in range(60_000)]
+        body = ("\n".join(entries) + "\n").encode()
+        loaded = self._download(body, max_bytes=64 * 1024)
+        self.assertTrue(loaded)
+        self.assertLess(len(loaded), len(entries))
+
+    def test_html_page_is_rejected(self):
+        loaded = self._download(
+            b"<!DOCTYPE html><html><body>Sign in to Drive</body></html>",
+            content_type="text/html")
+        self.assertEqual(loaded, [])
+
+    def test_error_status_returns_nothing(self):
+        self.assertEqual(self._download(b"1.2.3.4:8080", status=404), [])
+
+    def test_unreachable_host_returns_nothing(self):
+        from proxies import fetch_proxy_list
+        async def run():
+            import aiohttp as aio
+            async with aio.ClientSession() as session:
+                return await fetch_proxy_list(
+                    session, "http://127.0.0.1:1/list.txt", timeout=2)
+        self.assertEqual(asyncio.run(run()), [])
+
+    def test_blank_url_is_a_no_op(self):
+        from proxies import fetch_proxy_list
+        async def run():
+            return await fetch_proxy_list(MagicMock(), "", timeout=1)
+        self.assertEqual(asyncio.run(run()), [])
+
+    # -- cache -------------------------------------------------------------
+
+    def test_cache_round_trip(self):
+        from proxies import read_proxy_cache, write_proxy_cache
+        path = os.path.join(self.tmp.name, ".proxy-cache.txt")
+        write_proxy_cache(["http://1.2.3.4:8080", "http://5.6.7.8:80"], path)
+        cached, age = read_proxy_cache(path)
+        self.assertEqual(cached,
+                         ["http://1.2.3.4:8080", "http://5.6.7.8:80"])
+        self.assertLess(age, 60)
+
+    def test_missing_cache_is_infinitely_old(self):
+        from proxies import read_proxy_cache
+        cached, age = read_proxy_cache(
+            os.path.join(self.tmp.name, "nope.txt"))
+        self.assertEqual(cached, [])
+        self.assertEqual(age, float("inf"))
+
+    def test_cache_write_is_best_effort(self):
+        from proxies import write_proxy_cache
+        write_proxy_cache(["http://1.2.3.4:8080"],
+                          os.path.join(self.tmp.name, "no", "such", "dir.txt"))
+        write_proxy_cache([], os.path.join(self.tmp.name, "empty.txt"))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tmp.name, "empty.txt")))
+
+    # -- sampling and filtering -------------------------------------------
+
+    def test_sampling_is_bounded_and_deterministic(self):
+        from proxies import sample_proxies
+        pool = [f"http://10.0.0.{i}:8080" for i in range(1, 200)]
+        picked = sample_proxies(pool, 20, seed=7)
+        self.assertEqual(len(picked), 20)
+        self.assertEqual(len(set(picked)), 20)
+        self.assertEqual(picked, sample_proxies(pool, 20, seed=7))
+        self.assertTrue(set(picked) <= set(pool))
+
+    def test_sampling_keeps_short_lists_intact(self):
+        from proxies import sample_proxies
+        pool = ["http://1.2.3.4:8080", "http://5.6.7.8:80"]
+        self.assertEqual(sample_proxies(pool, 10), pool)
+        self.assertEqual(sample_proxies(pool, 0), pool)
+
+    def test_socks_ports_are_filtered(self):
+        from proxies import drop_socks_ports
+        kept, dropped = drop_socks_ports([
+            "http://1.1.1.1:8080", "http://2.2.2.2:1080",
+            "http://3.3.3.3:4145", "http://4.4.4.4:3128",
+            "http://5.5.5.5:9050",
+        ])
+        self.assertEqual(kept, ["http://1.1.1.1:8080", "http://4.4.4.4:3128"])
+        self.assertEqual(dropped, 3)
+
+
+class TestPoolVerification(unittest.TestCase):
+    """Startup verification must keep only proxies that actually answered."""
+
+    @staticmethod
+    async def _live_proxy():
+        from aiohttp import web
+        async def handler(_request):
+            return web.json_response({"ok": True})
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", handler)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        return runner, f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    def test_dead_proxies_are_dropped_after_one_failed_probe(self):
+        from proxies import ProxyPool
+
+        async def run():
+            import aiohttp as aio
+            runner, live = await self._live_proxy()
+            try:
+                pool = ProxyPool([live] + [f"http://127.0.0.1:{p}"
+                                           for p in (1, 2, 3, 4)])
+                async with aio.ClientSession() as session:
+                    alive, removed = await pool.verify(
+                        session, "http://example.invalid/", timeout=2,
+                        concurrency=10)
+                return pool, alive, removed, live
+            finally:
+                await runner.cleanup()
+
+        pool, alive, removed, live = asyncio.run(run())
+        self.assertEqual((alive, removed), (1, 4))
+        self.assertEqual(pool.urls, [live])
+        self.assertEqual(pool.next(), live)
+
+    def test_nothing_is_dropped_when_nothing_answers(self):
+        """An empty pool would silently become direct, unproxied traffic."""
+
+        from proxies import ProxyPool
+
+        async def run():
+            import aiohttp as aio
+            pool = ProxyPool([f"http://127.0.0.1:{p}" for p in (1, 2, 3)])
+            async with aio.ClientSession() as session:
+                alive, removed = await pool.verify(
+                    session, "http://example.invalid/", timeout=1,
+                    concurrency=5)
+            return pool, alive, removed
+
+        pool, alive, removed = asyncio.run(run())
+        self.assertEqual((alive, removed), (0, 0))
+        self.assertEqual(pool.size, 3)
+        self.assertEqual(pool.alive_count, 3)   # counters reset, still usable
+
+    def test_verify_on_an_empty_pool_is_a_no_op(self):
+        from proxies import ProxyPool
+        pool = ProxyPool([])
+        self.assertEqual(
+            asyncio.run(pool.verify(MagicMock(), "http://x.invalid/")), (0, 0))
+
+    def test_verification_is_bounded_by_its_concurrency(self):
+        """Thousands of proxies must not open thousands of sockets at once."""
+
+        from proxies import ProxyPool
+        in_flight = 0
+        peak = 0
+
+        class FakeResponse:
+            status = 200
+            async def __aenter__(self):
+                nonlocal in_flight, peak
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await asyncio.sleep(0.01)
+                return self
+            async def __aexit__(self, *_exc):
+                nonlocal in_flight
+                in_flight -= 1
+                return False
+
+        session = MagicMock()
+        session.get = MagicMock(return_value=FakeResponse())
+        pool = ProxyPool([f"http://10.0.0.{i}:8080" for i in range(1, 121)])
+        alive, removed = asyncio.run(pool.verify(
+            session, "http://x.invalid/", concurrency=10))
+        self.assertEqual((alive, removed), (120, 0))
+        self.assertLessEqual(peak, 10)
+
+    def test_drop_dead_respects_a_minimum(self):
+        from proxies import ProxyPool, FAILURE_THRESHOLD
+        pool = ProxyPool(["http://1.1.1.1:80", "http://2.2.2.2:80"])
+        for _ in range(FAILURE_THRESHOLD):
+            pool.report_failure("http://1.1.1.1:80")
+        self.assertEqual(pool.drop_dead(), 1)
+        self.assertEqual(pool.urls, ["http://2.2.2.2:80"])
+        # Everything dead: keep the pool rather than fall through to direct.
+        for _ in range(FAILURE_THRESHOLD):
+            pool.report_failure("http://2.2.2.2:80")
+        self.assertEqual(pool.drop_dead(), 0)
+        self.assertEqual(pool.size, 1)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
