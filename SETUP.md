@@ -1,33 +1,39 @@
-# Multi‑Sniper: Minimal setup and deployment guide
+# Multi-Sniper — setup and deployment guide
 
-This is a condensed guide for the default **Minecraft + guns.lol only** flow. All optional Discord‑availability modes (dnsrobot, account, probe) and multi‑host deployment details are omitted here but remain in the full `CLOUD_SETUP.md` if needed.
+Complete, copy-pasteable instructions for running the bot locally and keeping it online 24/7. For what the bot *does* and every configuration value, see **[README.md](README.md)**.
+
+The default configuration checks **Minecraft, guns.lol, GitHub, Steam, Reddit, Instagram, and Twitter/X**, with the Discord check switched off. Nothing beyond a bot token is required to get started.
+
+---
 
 ## 1. Prerequisites
 
-- Python 3.10+.
-- Git.
-- A Discord account, a server, and a text channel the bot can watch.
-- Outbound HTTPS (port 443) allowed.
+- **Python 3.10 or newer** (the code uses modern type-hint syntax)
+- **Git**
+- A Discord account, a server you can manage, and a text channel for the bot
+- Outbound HTTPS (port 443) allowed from the host
+- *Only for `DISCORD_CHECK_MODE=dnsrobot`:* a Chromium build installed via Playwright
 
-## 2. Get the source and create the Python environment
+---
+
+## 2. Get the source and create an environment
 
 ```bash
-# 2.1 Clone
 git clone https://github.com/Not4Pranav/Project-006.git
 cd Project-006
 
-# 2.2 Create & activate venv (macOS/Linux)
+# macOS / Linux
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 2.2 (Windows PowerShell)
+# Windows PowerShell
 # py -3 -m venv .venv
 # .venv\Scripts\Activate.ps1
 
-# 2.3 Verify
-python --version          # should be ≥3.10
-which python              # should print .venv path
+python --version      # must be >= 3.10
 ```
+
+---
 
 ## 3. Install dependencies
 
@@ -36,79 +42,264 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-> The `playwright` package is optional; it is only required if you later enable `DISCORD_CHECK_MODE=dnsrobot`.
+| Package | Purpose |
+|---|---|
+| `discord.py` | Gateway client and REST calls |
+| `aiohttp` | Async HTTP for the platform checks |
+| `python-dotenv` | Loads `.env` at startup |
+| `playwright` | Only used by `DISCORD_CHECK_MODE=dnsrobot` |
 
-## 4. Configure the Discord application (minimal)
+Playwright installs the Python package but not a browser. Install Chromium only if you plan to use `dnsrobot` mode:
 
-1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → name it → **Create**.
-2. Open **Bot** → **Add Bot** → **Reset Token** → copy the token.
-3. Enable **Message Content Intent** under **Privileged Gateway Intents**.
-4. Open **OAuth2 → URL Generator** → tick `bot` and **Add Reactions** (plus **Send Messages** if you want hit logging).
-5. Invite the bot to your server using the generated URL.
-6. (Optional) Enable **Developer Mode** → right‑click the channel → **Copy Channel ID** → set `TARGET_CHANNEL_ID` in `.env`.
+```bash
+python -m playwright install chromium
+```
 
-## 5. Create the environment file
+---
+
+## 4. Create the Discord application
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → name it → **Create**.
+2. Go to **Bot** → **Reset Token** → copy it. This is your `DISCORD_TOKEN`; treat it like a password.
+3. Still under **Bot**, enable **Message Content Intent** under *Privileged Gateway Intents*. **The bot cannot read usernames without this** — it is the single most common setup mistake.
+4. Go to **OAuth2 → URL Generator**:
+   - Scopes: `bot`
+   - Bot permissions: **Read Messages/View Channels**, **Add Reactions**, and **Send Messages** (only needed if you want hit logging)
+5. Open the generated URL and invite the bot to your server.
+6. Enable **Settings → Advanced → Developer Mode**, then right-click your channel → **Copy Channel ID** for `TARGET_CHANNEL_ID`.
+
+---
+
+## 5. Configure `.env`
 
 ```bash
 cp .env.example .env
-# Edit .env with a text editor and set at minimum:
+```
+
+Minimum viable configuration:
+
+```env
 DISCORD_TOKEN=paste-your-bot-token-here
 TARGET_CHANNEL_ID=123456789012345678
-# Keep DISCORD_CHECK_MODE=off (default). Do not add other Discord‑mode vars yet.
 ```
 
-> `.env` is git‑ignored. Confirm it is not tracked: `git status --short` should not list `.env`.
+Everything else has a working default. `.env` is git-ignored — confirm with `git status --short`, which must not list it.
 
-## 6. Run local validation
+> **Never commit real tokens or proxy credentials.** On a hosting provider, set these as environment variables in the dashboard rather than shipping a `.env` file.
+
+---
+
+## 6. Validate before going live
 
 ```bash
-python -m py_compile bot.py checkers.py && echo "compile OK"
-python test_checkers.py          # 34 offline tests (live tests skipped)
-python test_bot.py               # 30 pipeline tests
-# Both should end with "OK".
+python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
+python test_checkers.py     # 79 offline tests
+python test_bot.py          # 37 pipeline tests
 ```
 
-## 7. Smoke‑test the checkers (live Minecraft + guns.lol, Discord skipped)
+Both suites must end in `OK`. Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
+
+Smoke-test the real checkers without touching Discord:
 
 ```bash
 python checkers.py Notch
+python checkers.py zxqw99182vlt
 ```
 
-## 8. Start the bot locally
+You should get a per-platform report and the reaction the bot would have added.
+
+---
+
+## 7. Run the bot
 
 ```bash
 python bot.py
 ```
 
-You should see:
+Expected startup banner:
 
 ```
-🟢 MULTI‑SNIPER ONLINE as Multi‑Sniper
-🔒 Watching channel : ALL CHANNELS
-🕹️ Platforms        : Minecraft | guns.lol | Discord (mode: off)
+==============================================================
+🟢 MULTI-SNIPER v2.0 ONLINE as Multi-Sniper#1234
+🔒 Watching channel : 123456789012345678
+🕹️ Platforms        : Minecraft | guns.lol | Discord | GitHub | Steam | Reddit | Instagram | Twitter/X
 🧊 Proxy            : off (direct)
-⏳ User cooldown    : 3 checks / 60s
+⏳ User cooldown    : 5 checks / 0.50s
 ⚡ Response budget  : 4.50s (reaction cap 0.75s)
+💾 Cache TTL        : 120s (free) / 600s (taken)
+==============================================================
 ```
 
-Type a bare username in the watched channel; the bot reacts with 🕹️ and/or 🔫.
-
-Stop with `Ctrl+C`.
-
-## 9. (Optional) Enable a Discord mode later
-
-- **dnsrobot**: set `DISCORD_CHECK_MODE=dnsrobot` in `.env`, install Chromium (`python -m playwright install chromium`), and follow the full `CLOUD_SETUP.md` for browser details.
-- **account / account_api / probe**: set the corresponding mode and add the required `.env` variables (see the original `SETUP.md` for full variable lists).
-
-## 10. Deploy as a background worker (if you need 24/7)
-
-- Use a **Background Worker** on Render, Railway, or a VPS with systemd.
-- Build command: `python -m pip install -r requirements.txt` (add `&& python -m playwright install --with-deps chromium` only if `dnsrobot` is enabled).
-- Start command: `python bot.py`.
-- Set environment variables in the host's dashboard: `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`, and any mode‑specific vars when you enable them.
-
-> **Do not** run this bot as a web service that listens on a `PORT`; it is a long‑running worker.
+Post a bare username in the watched channel. Within a second or two the bot reacts with one emoji per platform where the name is free (or ❌ / ⚠️). Stop with `Ctrl+C`.
 
 ---
 
-*For the complete original guide (all Discord modes, detailed troubleshooting, per‑host steps, security rules, etc.) refer to the full `SETUP.md` that was originally in this repository.*
+## 8. Optional: add proxies
+
+Instagram and X gate unauthenticated traffic hard, and every platform rate-limits by IP. A proxy pool spreads the eight checks in one lookup across eight different IPs.
+
+```env
+PROXY_URLS=http://user:pass@proxy1.example:8080,http://user:pass@proxy2.example:8080
+```
+
+At startup the banner switches to a pool summary, and you can watch health in the logs:
+
+```
+🧊 Proxy pool       : 3 proxies | 3 alive
+   └─ http://proxy1.example:8080 (alive, 0% fail), ...
+```
+
+Behaviour worth knowing:
+
+- A proxy is benched after **3 consecutive failures** and rejoins after a **60 s** cooldown.
+- Failures are recorded from **real check traffic**, not just the 30 s health sweep.
+- When every proxy is down, the pool keeps retrying proxies rather than going direct, so your real IP is not exposed. Set `PROXY_ALLOW_DIRECT_FALLBACK=true` to change that.
+
+Validate proxy URLs before deploying — the bot refuses to start on a malformed one, and a proxy URL must not contain a path, query string, or fragment.
+
+---
+
+## 9. Optional: enable the Discord check
+
+Discord publishes no availability API, so pick a mode consciously.
+
+### `dnsrobot`
+
+```env
+DISCORD_CHECK_MODE=dnsrobot
+```
+
+```bash
+python -m playwright install chromium          # local
+python -m playwright install --with-deps chromium   # Linux servers, pulls system libs
+```
+
+A long-lived Chromium process is started once; each lookup opens a short-lived isolated context. Expect noticeably higher memory use (~300 MB+) — size your host accordingly. If Chromium is missing, the Discord result is reported as an error and every other platform keeps working.
+
+### `account` / `account_api`
+
+```env
+DISCORD_CHECK_MODE=account
+DISCORD_ACCOUNT_API_URL=            # blank uses Discord's eligibility route
+DISCORD_ACCOUNT_API_TOKEN=          # only for an authorised gateway
+```
+
+### `probe`
+
+Point the bot at a checker you control or are authorised to use. `200` = taken, `404` = free.
+
+```env
+DISCORD_CHECK_MODE=probe
+DISCORD_PROBE_URL=https://my-checker.example/name/{username}
+DISCORD_PROBE_TOKEN=optional-credential
+```
+
+The `{username}` placeholder is mandatory, and the URL must be `https://`. Configured credentials are sent only to their own endpoint; the Discord bot token never is.
+
+---
+
+## 10. Deploy for 24/7 operation
+
+This is a **background worker**, not a web service. Do not deploy it as something that must bind a `PORT` — there is no HTTP server, and the platform's health check will kill it.
+
+A `Procfile` is included:
+
+```
+worker: python bot.py
+```
+
+### Render / Railway / Heroku-style
+
+| Field | Value |
+|---|---|
+| Service type | Background Worker |
+| Build command | `python -m pip install -r requirements.txt` |
+| Start command | `python bot.py` |
+| Environment | `DISCORD_TOKEN`, `TARGET_CHANNEL_ID`, plus any optional vars |
+
+Add `&& python -m playwright install --with-deps chromium` to the build command only if `dnsrobot` is enabled.
+
+### VPS with systemd
+
+`/etc/systemd/system/multi-sniper.service`:
+
+```ini
+[Unit]
+Description=Multi-Sniper Discord username checker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+WorkingDirectory=/opt/Project-006
+EnvironmentFile=/opt/Project-006/.env
+ExecStart=/opt/Project-006/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now multi-sniper
+journalctl -u multi-sniper -f
+```
+
+Lock the secrets down: `chmod 600 .env && chown sniper:sniper .env`.
+
+### Docker
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot.py"]
+```
+
+```bash
+docker build -t multi-sniper .
+docker run -d --restart unless-stopped --env-file .env --name multi-sniper multi-sniper
+```
+
+For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` instead so Chromium and its system libraries are present.
+
+---
+
+## 11. Operating notes
+
+- **Logs** print one line per platform per lookup (`Minecraft  taken  HTTP 200  (vortex)`), with credentials redacted.
+- **Reconnects** are normal; the startup banner prints only once, and resumes are logged at INFO.
+- **Tuning latency:** `USER_WINDOW_SECONDS` controls throttling, `CHECK_TIMEOUT` controls how long a slow platform may stall a lookup, and the cache TTLs control how often names are re-fetched.
+- **Reducing load:** set `ENABLE_EXTRA_PLATFORMS=false` to check only Minecraft, guns.lol, and Discord.
+- **Updating:**
+
+  ```bash
+  git pull
+  python -m pip install -r requirements.txt
+  python test_checkers.py && python test_bot.py
+  sudo systemctl restart multi-sniper     # or redeploy
+  ```
+
+---
+
+## 12. Setup troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `DISCORD_TOKEN missing` on startup | `.env` is absent or the token line is blank; the bot exits before connecting on purpose |
+| `Improper token has been passed` | Token was truncated or wrapped — re-copy it onto a single line with no quotes |
+| Bot online but silent | **Message Content Intent** is disabled, or `TARGET_CHANNEL_ID` is the wrong channel |
+| `Missing 'Add Reactions' permission` | Fix the channel permission overwrite for the bot's role |
+| Every platform ⚠️ | Outbound HTTPS blocked, or all proxies down — check the banner and `benched` log lines |
+| `DNS Robot browser unavailable` | `python -m playwright install --with-deps chromium` |
+| Worker restarts on a hosting provider | It was deployed as a web service; switch it to a background worker |
+| ⏳ during normal use | Raise `USER_MAX_CHECKS` or lower `USER_WINDOW_SECONDS` |
+
+Still stuck? Run `python checkers.py <name>` on the host itself: it exercises the exact request path with no Discord involvement and prints the raw HTTP status behind each verdict.

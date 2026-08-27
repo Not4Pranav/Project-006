@@ -1,116 +1,292 @@
-# 🎯 Multi-Sniper v2.0 — Discord Username Availability Bot
+# 🎯 Multi-Sniper — Discord Username Availability Bot
 
-A Discord bot that checks **username availability** across 8 platforms when a member posts a bare username in a watched channel, then reacts with platform emojis for each free result.
+Post a bare username in a watched Discord channel. The bot checks it across **8 platforms in parallel** and reacts to that same message with one emoji per platform where the name is free.
 
-> **8 Platforms checked in parallel:** Minecraft | guns.lol | Discord | GitHub | Steam | Reddit | Instagram | Twitter/X
+> **Platforms:** Minecraft 🕹️ · guns.lol 🔫 · Discord 🐈‍⬛ · GitHub 💻 · Steam 🎮 · Reddit 👀 · Instagram 📸 · Twitter/X 🐦
 
-## ✨ v2.0 — What's New
+```
+you:  vortex
+bot:  🕹️ 💻 👀        ← free on Minecraft, GitHub, and Reddit
+```
 
-- 🚀 **5 new platforms**: GitHub 💻, Steam 🎮, Reddit 👀, Instagram 📸, Twitter/X 🐦
-- 🧊 **Proxy pool**: multiple proxies with round-robin rotation, health checking, and automatic failover
-- 💾 **Smart caching**: taken names cached 10 min, available names cached 2 min (snipe protection)
-- ⚡ **Faster connections**: TCP connection pooling, keep-alive, DNS caching, gzip compression
-- 🔄 **Auto-retry**: transient failures are retried with backoff
+---
 
-## Quick local onboarding (10 steps)
+## Contents
 
-| # | Action |
-|---|--------|
-| **1** | Clone the repo: `git clone https://github.com/Not4Pranav/Project-006.git && cd Project-006` |
-| **2** | Create & activate a venv: `python3 -m venv .venv` then `source .venv/bin/activate` |
-| **3** | Verify Python 3.10+: `python --version` |
-| **4** | Install deps: `python -m pip install --upgrade pip && python -m pip install -r requirements.txt` |
-| **5** | Create `.env` from template: `cp .env.example .env` |
-| **6** | Fill minimal `.env` (only token + channel):<br>`DISCORD_TOKEN=YOUR_BOT_TOKEN`<br>`TARGET_CHANNEL_ID=123456789012345678`<br>(Leave `DISCORD_CHECK_MODE=off` – the default) |
-| **7** | Run offline tests (no Discord token needed):<br>`python -m py_compile bot.py checkers.py proxies.py && echo compile OK`<br>`python test_checkers.py`<br>`python test_bot.py` – both should end with `OK` |
-| **8** | Start the bot: `python bot.py` – you should see the startup banner listing all 8 platforms |
-| **9** | In the watched Discord channel, type a single bare username (e.g. `Notch`). The bot reacts with all platform emojis where the name is free. |
-| **10** | Stop with `Ctrl+C`. |
+- [What the reactions mean](#what-the-reactions-mean)
+- [Quick start](#quick-start)
+- [How a lookup works](#how-a-lookup-works)
+- [Speed: why answers are instant](#speed-why-answers-are-instant)
+- [Platform status matrix](#platform-status-matrix)
+- [Proxy pool](#proxy-pool)
+- [Smart caching](#smart-caching)
+- [Discord check modes](#discord-check-modes)
+- [Configuration reference](#configuration-reference)
+- [Development and testing](#development-and-testing)
+- [Troubleshooting](#troubleshooting)
+- [Responsible use](#responsible-use)
 
-## How it works
+---
 
-1. Message filter ignores bots, webhooks, non-username text, and wrong channels.
-2. Cooldown guards protect upstream services.
-3. **All 8 platform checks run in parallel** (shared deadline ≤ 4.5 s).
-4. Results are normalized to `available` / `taken` / `invalid` / `blocked`.
-5. The bot adds the appropriate emoji reaction(s) to the **same** message.
+## What the reactions mean
+
+| Reaction | Meaning |
+|---|---|
+| 🕹️ 🔫 🐈‍⬛ 💻 🎮 👀 📸 🐦 | The name is **free** on that platform |
+| ❌ | Every platform answered, and none of them were free |
+| ⚠️ | At least one check could not be confirmed (block, rate limit, timeout) — treat the result as unknown |
+| ⏳ | You tripped the per-user flood guard; try again immediately |
+
+The bot never reacts to bots, webhooks, messages in other channels, or anything that is not a single bare username token.
+
+---
+
+## Quick start
+
+```bash
+# 1. Clone and enter the repo
+git clone https://github.com/Not4Pranav/Project-006.git
+cd Project-006
+
+# 2. Create a virtualenv (Python 3.10+)
+python3 -m venv .venv && source .venv/bin/activate
+python --version                  # must be >= 3.10
+
+# 3. Install dependencies
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# 4. Configure
+cp .env.example .env
+#    Then edit .env and set at minimum:
+#       DISCORD_TOKEN=your-bot-token
+#       TARGET_CHANNEL_ID=123456789012345678
+
+# 5. Verify offline (no token or network needed)
+python test_checkers.py           # 79 tests
+python test_bot.py                # 37 tests
+
+# 6. Run
+python bot.py
+```
+
+Discord-side setup (creating the application, the **Message Content Intent**, and the invite URL) is covered step by step in **[SETUP.md](SETUP.md)**.
+
+Try it without Discord at all:
+
+```bash
+python checkers.py Notch          # one-off report for all 8 platforms
+python checkers.py vortex --no-extra
+```
+
+---
+
+## How a lookup works
+
+1. **Filter** — bots, webhooks, wrong channels, and non-username text are dropped before any budget is spent.
+2. **Flood guard** — a sub-second token bucket per user (default: 5 checks per 0.5 s).
+3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
+4. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
+5. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
+6. **React** — emojis are added to the original message concurrently.
+7. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
+
+Everything after step 1 shares a single response budget (4.5 s by default, hard-clamped below Discord's 5 s interaction feel), so a slow platform can never delay the reaction.
+
+---
+
+## Speed: why answers are instant
+
+| Technique | Effect |
+|---|---|
+| Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency |
+| Sub-second flood guard (5 / 0.5 s) | Back-to-back checks are not throttled in practice |
+| Result cache | Repeat lookups answer in microseconds, zero requests |
+| TCP connection pooling + keep-alive (30 s) | No repeated TLS handshakes |
+| DNS cache (5 min) | No repeated resolution per check |
+| Per-request proxy rotation | The 8 checks spread across 8 IPs instead of queueing behind one |
+| One retry on transient errors | A single connection reset does not become a ⚠️ |
+| gzip/deflate compression | Smaller page bodies for the HTML-scraped platforms |
+
+Brotli is deliberately **not** requested: aiohttp cannot decode `br` without the optional `Brotli` package, and advertising it makes real sites return bodies the bot cannot read.
+
+---
 
 ## Platform status matrix
 
-| Platform | Emoji | FREE | TAKEN | Blocked/unknown |
-|----------|-------|------|-------|-----------------|
-| Minecraft | 🕹️ | 204 or 404 | 200 (profile JSON) | 403 / 405 / 429 |
-| guns.lol | 🔫 | 404/410 or unclaimed-page marker | 200 without unclaimed marker | 403 / 429 / 503 |
-| Discord | 🐈‍⬛ | mode-dependent | mode-dependent | mode-dependent |
-| GitHub | 💻 | 404 | 200 (user JSON with login) | 403 / 429 |
-| Steam | 🎮 | 404 or "profile not found" page | 200 with profile content | 403 / 503 |
-| Reddit | 👀 | 404 | 200 (user-about JSON) | 403 / 429 / 503 |
-| Instagram | 📸 | 404 or "page isn't available" | 200 (profile page) | 401 / 403 / login wall |
-| Twitter/X | 🐦 | 404 or "doesn't exist" page | 200 (profile page) | 403 / 429 / challenge |
+| Platform | Emoji | Reported FREE | Reported TAKEN | Unknown / blocked |
+|---|---|---|---|---|
+| Minecraft | 🕹️ | 204 or 404 | 200 with profile JSON | 403 / 405 / 429 |
+| guns.lol | 🔫 | 404/410, or an unclaimed-page marker | 200 without that marker | 403 / 429 / 503, Cloudflare challenge |
+| Discord | 🐈‍⬛ | mode-dependent | mode-dependent | mode-dependent (see below) |
+| GitHub | 💻 | 404 | 200 with a `login` field | 403 / 429 (rate limit) |
+| Steam | 🎮 | 404, or "profile could not be found" | 200 with profile content | 403 / 429 / 503 |
+| Reddit | 👀 | 404 | 200 with user-about JSON | 403 / 429 / 503 |
+| Instagram | 📸 | 404, or "this page isn't available" | 200 profile page | login wall, checkpoint, 401 / 403 / 429 |
+| Twitter/X | 🐦 | 404, or "this account doesn't exist" | 200 profile page | rate limit, Arkose challenge, 403 / 429 |
 
-## 🧊 Proxy Pool
+Instagram and X are **best-effort**: both aggressively gate unauthenticated traffic. When they gate the bot, the result is honestly reported as unknown (⚠️) rather than guessed. Page matching folds typographic apostrophes to ASCII, so the real `doesn’t` served by those sites is matched correctly.
 
-Route checks through multiple proxies for better reliability and rate-limit avoidance:
+Minecraft is checked against `api.mojang.com` first and falls back to `api.minecraftservices.com` if the first endpoint is blocked or errors.
+
+---
+
+## Proxy pool
+
+Proxies are optional. Configure them and every outbound check is routed through the rotation:
 
 ```env
 # Single proxy (backward compatible)
 PROXY_URL=http://user:pass@proxy.example:8080
 
-# Proxy pool (rotation + failover)
+# Pool — comma or newline separated
 PROXY_URLS=http://proxy1:8080,http://proxy2:8080,http://user:pass@proxy3:8080
 ```
 
-**Features:**
-- Round-robin rotation across healthy proxies
-- Automatic health checking every 30 seconds
-- Dead-proxy cooldown (3 consecutive failures = marked down)
-- Automatic recovery after 60s cooldown
-- Falls back to direct connection when all proxies are down
+What the pool does:
 
-## 💾 Smart Caching
+- **Per-request round-robin.** The proxy is resolved for each individual request, so the 8 checks in one lookup go out over 8 different proxies.
+- **Live health reporting.** A proxy that fails a *real* check is recorded immediately and benched after 3 consecutive failures — no waiting for the next health sweep.
+- **Automatic retry on a different proxy.** A transient failure is retried once, and the retry resolves a fresh proxy.
+- **Concurrent health sweeps** every 30 s: all proxies are probed at the same time, so N proxies cost one timeout instead of N.
+- **Recovery** after a 60 s cooldown, then the proxy rejoins the rotation.
 
-- **Taken names**: cached for 10 minutes (they rarely free up quickly)
-- **Available names**: cached for 2 minutes (snipe protection — names get grabbed fast!)
-- Configurable via `CACHE_TTL_TAKEN` and `CACHE_TTL_AVAILABLE`
+### When every proxy is down
 
-## ⚡ Performance Optimizations
+By default the pool **keeps using proxies** (it resets the failure counters and retries them) instead of going direct. That is deliberate: if you configured proxies to keep your real IP away from these platforms, a silent direct fallback would leak exactly what you were hiding.
 
-- **TCP connection pooling**: 25 connections, 10 per host, reused across requests
-- **DNS caching**: 5-minute TTL avoids repeated resolution
-- **Keep-alive**: connections stay open for 30s after use
-- **Gzip/deflate/br compression**: all requests ask for compressed responses
-- **Parallel fan-out**: all 8 platforms checked simultaneously, not sequentially
-- **Shared deadline**: all checks share one wall-clock budget
+If you treat proxies purely as a speed optimisation, opt in:
 
-## Optional Discord modes
+```env
+PROXY_ALLOW_DIRECT_FALLBACK=true
+```
 
-Set `DISCORD_CHECK_MODE=dnsrobot` / `account` / `account_api` / `probe` in `.env` and follow the full `SETUP.md` for browser/credential setup.
-
-## Configuration Reference
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `DISCORD_TOKEN` | *(required)* | Bot token from Discord Developer Portal |
-| `TARGET_CHANNEL_ID` | *(blank=all)* | Channel to watch |
-| `LOG_CHANNEL_ID` | *(blank=off)* | Channel to log available hits |
-| `CHECK_TIMEOUT` | `3` | Per-request timeout (seconds) |
-| `RESPONSE_BUDGET_SECONDS` | `4.5` | Total check + reaction budget |
-| `REACTION_TIMEOUT` | `0.75` | Per-reaction REST call cap |
-| `USER_MAX_CHECKS` | `5` | Checks per user per window |
-| `USER_WINDOW_SECONDS` | `0.5` | Cooldown window (sub-second by default so checks feel instant) |
-| `CACHE_TTL_TAKEN` | `600` | Cache TTL for taken names (seconds) |
-| `CACHE_TTL_AVAILABLE` | `120` | Cache TTL for available names (seconds) |
-| `ENABLE_EXTRA_PLATFORMS` | `true` | Enable GitHub/Steam/Reddit/Instagram/Twitter |
-| `PROXY_URL` | *(blank)* | Single proxy URL |
-| `PROXY_URLS` | *(blank)* | Comma-separated proxy pool |
-
-## Development / testing
-
-- `python test_checkers.py` – offline tests (skip live network tests).
-- `python test_bot.py` – end-to-end pipeline tests.
-- `python checkers.py Notch` – one-off CLI report for all platforms.
-- `python checkers.py Notch --no-extra` – CLI report for core platforms only.
+Proxy credentials are redacted from every log line and from the startup banner.
 
 ---
 
-*For the complete original guide (Discord modes, DNS-Robot, account API, cloud deployment, troubleshooting, etc.) see the full `SETUP.md` and `CLOUD_SETUP.md` files.*
+## Smart caching
+
+A cache hit is the fastest possible answer: no sockets, no proxies, microseconds.
+
+| Result | Default TTL | Why |
+|---|---|---|
+| Taken names | 600 s (`RESULT_CACHE_TTL` × 2) | Claimed names rarely free up quickly |
+| Available names | 120 s (`RESULT_CACHE_TTL` × 0.4) | A free name may get sniped by someone else |
+
+Only **complete, definitive** answers are cached. A lookup where any platform returned `blocked` or `error` is never cached, so a transient outage cannot pin a wrong answer for ten minutes.
+
+The cache is pruned on write — stale entries first, then oldest — and capped by `CACHE_MAX_ENTRIES` (default 5000), so a busy server cannot grow it without bound.
+
+---
+
+## Discord check modes
+
+Discord has no public username-availability API, so this check is **off by default**. Set `DISCORD_CHECK_MODE` to enable one:
+
+| Mode | How it works | Needs |
+|---|---|---|
+| `off` *(default)* | Skipped; reported as `skipped` | — |
+| `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `python -m playwright install chromium` |
+| `account` / `account_api` | POSTs `{"username": "..."}` to Discord's username-eligibility route | Optionally an authorised credential |
+| `probe` | GETs your own authorised checker URL template (`200` = taken, `404` = free) | `DISCORD_PROBE_URL` |
+
+The bot never claims a name, and never sends the Discord bot token to any of these endpoints. Any credential you configure is sent **only** to the endpoint it belongs to.
+
+---
+
+## Configuration reference
+
+Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed values are clamped rather than crashing the bot.
+
+### Core
+
+| Setting | Default | Description |
+|---|---|---|
+| `DISCORD_TOKEN` | *(required)* | Bot token from the Discord Developer Portal |
+| `TARGET_CHANNEL_ID` | *(blank = all)* | The single channel to watch |
+| `LOG_CHANNEL_ID` | *(blank = off)* | Private channel that receives free-name hits |
+| `ENABLE_EXTRA_PLATFORMS` | `true` | Include GitHub, Steam, Reddit, Instagram, Twitter/X |
+
+### Latency and throttling
+
+| Setting | Default | Range | Description |
+|---|---|---|---|
+| `RESPONSE_BUDGET_SECONDS` | `4.5` | 0.5 – 4.8 | Total budget for checks + reactions |
+| `CHECK_TIMEOUT` | `3` | 0.05 – budget | Per-request outbound timeout |
+| `REACTION_TIMEOUT` | `0.75` | 0.05 – budget−0.05 | Cap per Discord reaction call |
+| `USER_MAX_CHECKS` | `5` | 1 – 10000 | Checks allowed per user per window |
+| `USER_WINDOW_SECONDS` | `0.5` | ≥ 0.01 | Flood-guard window — sub-second so checks feel instant |
+
+### Caching
+
+| Setting | Default | Description |
+|---|---|---|
+| `RESULT_CACHE_TTL` | `300` | Base TTL; the two below default to multiples of it |
+| `CACHE_TTL_TAKEN` | `600` | TTL for taken names (0 disables) |
+| `CACHE_TTL_AVAILABLE` | `120` | TTL for available names (0 disables) |
+| `CACHE_MAX_ENTRIES` | `5000` | Hard ceiling on cached usernames |
+
+### Proxies
+
+| Setting | Default | Description |
+|---|---|---|
+| `PROXY_URL` | *(blank)* | Single proxy; also joins the pool if one is configured |
+| `PROXY_URLS` | *(blank)* | Comma/newline separated pool |
+| `PROXY_ALLOW_DIRECT_FALLBACK` | `false` | Go direct when every proxy is down (leaks the host IP) |
+
+### Discord check
+
+| Setting | Default | Description |
+|---|---|---|
+| `DISCORD_CHECK_MODE` | `off` | `off` / `dnsrobot` / `account` / `account_api` / `probe` |
+| `DISCORD_ACCOUNT_API_URL` | Discord eligibility route | Endpoint for `account` mode |
+| `DISCORD_ACCOUNT_API_TOKEN` | *(blank)* | Credential sent only to that endpoint |
+| `DISCORD_ACCOUNT_API_TOKEN_HEADER` | `Authorization` | Header carrying that credential |
+| `DISCORD_ACCOUNT_API_TOKEN_SCHEME` | `Bearer` | Prefix; blank sends the raw token |
+| `DISCORD_PROBE_URL` | *(blank)* | Template containing `{username}` |
+| `DISCORD_PROBE_TOKEN` | *(blank)* | Credential sent only to the probe |
+| `DISCORD_PROBE_TOKEN_HEADER` | `Authorization` | Header carrying the probe token |
+| `DISCORD_PROBE_TOKEN_SCHEME` | `Bearer` | Prefix; blank sends the raw token |
+
+---
+
+## Development and testing
+
+```bash
+python test_checkers.py       # 79 offline tests (interpreters, request layer, proxies)
+python test_bot.py            # 37 pipeline tests (filters, budget, cache, reactions)
+LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
+
+python -m pyflakes *.py       # lint
+python checkers.py Notch      # manual CLI report
+```
+
+| File | Responsibility |
+|---|---|
+| `bot.py` | Discord client, message pipeline, budget, cache, reactions |
+| `checkers.py` | Per-platform checkers, pure interpreters, request layer, CLI |
+| `proxies.py` | `ProxyPool` rotation and health, `ProxyProvider` handed to checkers |
+| `test_checkers.py` / `test_bot.py` | Offline test suites (no network required) |
+
+The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pure functions of `(status, body)`, which is why the suites can cover every platform without touching the network.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Bot ignores every message | **Message Content Intent** is off in the Developer Portal, or `TARGET_CHANNEL_ID` points at another channel |
+| Bot answers but adds no reaction | Missing the **Add Reactions** permission in that channel — check the log line |
+| Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` |
+| ⚠️ on every platform | Outbound HTTPS is blocked, or every proxy is down (check the startup banner and `Proxy … benched` logs) |
+| Discord shows `skipped` | Expected: `DISCORD_CHECK_MODE=off` is the default |
+| `DNS Robot browser unavailable` | Run `python -m playwright install chromium` |
+| ⏳ on ordinary use | Raise `USER_MAX_CHECKS` or lower `USER_WINDOW_SECONDS` |
+
+---
+
+## Responsible use
+
+This tool reports *availability*; it does not register, reserve, or claim anything. Keep the flood guard on, respect each platform's terms of service and rate limits, and keep tokens and proxy credentials in `.env` (git-ignored) or your host's secret manager — never in the repository.

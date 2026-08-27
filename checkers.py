@@ -117,8 +117,10 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    # Only advertise encodings aiohttp can always decode. Advertising "br"
+    # without the optional Brotli package makes real sites answer with a body
+    # aiohttp cannot read, turning good checks into ERROR results.
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # API-specific headers for JSON endpoints
@@ -126,8 +128,7 @@ API_HEADERS = {
     "User-Agent": BROWSER_HEADERS["User-Agent"],
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 
@@ -185,11 +186,55 @@ GUNSLOL_UNCLAIMED_MARKERS = (
 _MISSING_PAYLOAD = object()
 
 
+def _normalize_page(page: str) -> str:
+    """Casefold page text and fold typographic quotes to ASCII.
+
+    Instagram and X render "doesn\u2019t" with a typographic apostrophe, so a
+    literal "doesn't" marker would never match the page they actually serve.
+    """
+
+    return (page.replace("\u2019", "'").replace("\u2018", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .casefold())
+
+
 GUNSLOL_CHALLENGE_MARKERS = (
     "just a moment...",
     "attention required",
     "cf-chl-",
     "/cdn-cgi/challenge-platform",
+)
+
+
+# Instagram and X are matched against narrow, page-specific phrases. Broad
+# words such as "challenge" or "captcha" appear inside ordinary profile HTML
+# (bios, scripts, CSS class names) and used to mark live profiles as BLOCKED.
+INSTAGRAM_MISSING_MARKERS = (
+    "sorry, this page isn't available",
+    "the link you followed may be broken",
+    "page not found \u2022 instagram",
+)
+INSTAGRAM_BLOCKED_MARKERS = (
+    "login \u2022 instagram",
+    "log in to instagram",
+    "login to instagram",
+    "checkpoint_required",
+    "/challenge/",
+    "please wait a few minutes before you try again",
+)
+TWITTER_MISSING_MARKERS = (
+    "this account doesn't exist",
+    "this user doesn't exist",
+    "hmm...this page doesn't exist",
+    "this page doesn't exist",
+)
+TWITTER_BLOCKED_MARKERS = (
+    "rate limit exceeded",
+    "solve this captcha",
+    "confirm you're not a robot",
+    "arkose",
+    "/i/flow/login",
+    "something went wrong, but don't fret",
 )
 
 
@@ -226,7 +271,7 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
             return TAKEN
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
+        content = _normalize_page(page)
         if any(marker in content for marker in GUNSLOL_CHALLENGE_MARKERS):
             return BLOCKED
         if any(marker in content for marker in GUNSLOL_UNCLAIMED_MARKERS):
@@ -234,7 +279,8 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
         return TAKEN
     if status in (404, 410):
         if isinstance(page, str) and any(
-                marker in page.casefold() for marker in GUNSLOL_CHALLENGE_MARKERS):
+                marker in _normalize_page(page)
+                for marker in GUNSLOL_CHALLENGE_MARKERS):
             return BLOCKED
         return AVAILABLE
     if status == 400:
@@ -374,7 +420,7 @@ def interpret_steam(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
+        content = _normalize_page(page)
         # Steam serves a "profile not found" page with 200 for missing profiles
         if "the specified profile could not be found" in content:
             return AVAILABLE
@@ -421,13 +467,14 @@ def interpret_instagram(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
-        # Login wall / challenge
-        if "login to instagram" in content or "challenge" in content:
-            return BLOCKED
-        # "Sorry, this page isn't available" indicates a non-existing profile
-        if "sorry, this page isn't available" in content:
+        content = _normalize_page(page)
+        # A missing profile is the strongest signal, so test it first: a login
+        # wall page can also mention "log in", and the old ordering made every
+        # free name look BLOCKED.
+        if any(marker in content for marker in INSTAGRAM_MISSING_MARKERS):
             return AVAILABLE
+        if any(marker in content for marker in INSTAGRAM_BLOCKED_MARKERS):
+            return BLOCKED
         return TAKEN
     if status == 404:
         return AVAILABLE
@@ -449,15 +496,10 @@ def interpret_twitter(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
-        # Account doesn't exist markers
-        if ("this account doesn't exist" in content
-                or "this user doesn't exist" in content
-                or "hmm...this page doesn't exist" in content):
+        content = _normalize_page(page)
+        if any(marker in content for marker in TWITTER_MISSING_MARKERS):
             return AVAILABLE
-        # Challenge / rate limit
-        if any(marker in content for marker in (
-                "rate limit exceeded", "captcha", "challenge")):
+        if any(marker in content for marker in TWITTER_BLOCKED_MARKERS):
             return BLOCKED
         return TAKEN
     if status == 404:
@@ -496,123 +538,178 @@ def _decoded_url_component_has_control_chars(value: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Retry helper
+# Request layer: proxy resolution, health reporting, and transient retries
 # ---------------------------------------------------------------------------
 
-async def _retry_request(
-    coro_factory,
-    max_retries: int = 1,
-    base_delay: float = 0.15,
-) -> object:
-    """Retry an async request factory on transient failures.
+# Failures worth retrying once: connection resets, proxy hiccups, timeouts.
+# A definitive HTTP status is never retried, and neither is a ValueError from
+# a malformed URL, which would fail identically every time.
+_TRANSIENT_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    aiohttp.ServerTimeoutError,
+    asyncio.TimeoutError,
+)
+# Failures that say something about the proxy rather than the target site.
+_PROXY_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
-    ``coro_factory`` is called fresh on each retry (it must return a new
-    coroutine). Only network/timeout errors trigger a retry; definitive
-    HTTP status responses are not retried.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_factory()
-        except _REQUEST_ERRORS as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-    raise last_exc  # type: ignore[misc]
+DEFAULT_MAX_RETRIES = 1
+DEFAULT_RETRY_DELAY = 0.05
 
 
-# ---------------------------------------------------------------------------
-# Fetch functions (with optional proxy pool support)
-# ---------------------------------------------------------------------------
+def _resolve_proxy(proxy: object) -> str | None:
+    """Resolve a proxy: accept a string, a callable factory, or ``None``."""
 
-def _resolve_proxy(proxy: str | None) -> str | None:
-    """Resolve proxy: accept a string, a callable, or None."""
     if proxy is None:
         return None
     if callable(proxy):
         return proxy()
-    return proxy
+    return proxy if isinstance(proxy, str) else None
 
+
+def _report_proxy(proxy: object, url: str | None, *, ok: bool) -> None:
+    """Feed one request outcome back to a pool that wants to hear about it.
+
+    Pools expose ``report_success`` / ``report_failure``; plain strings and
+    ``None`` do not, so this is a no-op for them. Reporting must never be able
+    to break a check, hence the broad guard.
+    """
+
+    if not url:
+        return
+    reporter = getattr(proxy, "report_success" if ok else "report_failure", None)
+    if not callable(reporter):
+        return
+    try:
+        reporter(url)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Proxy health reporting failed: %s", exc)
+
+
+async def _with_proxy(
+    proxy: object,
+    operation,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_RETRY_DELAY,
+):
+    """Run ``operation(proxy_url)`` with rotation, reporting, and one retry.
+
+    The proxy is resolved *per attempt*, so a retry automatically lands on the
+    next proxy in the rotation instead of hammering the one that just failed.
+    """
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        resolved = _resolve_proxy(proxy)
+        try:
+            result = await operation(resolved)
+        except _PROXY_ERRORS as exc:
+            _report_proxy(proxy, resolved, ok=False)
+            last_exc = exc
+            if attempt < max_retries and isinstance(exc, _TRANSIENT_ERRORS):
+                delay = base_delay * (2 ** attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                continue
+            raise
+        else:
+            _report_proxy(proxy, resolved, ok=True)
+            return result
+    raise last_exc  # pragma: no cover - loop always returns or raises
+
+
+async def _read_json_body(response: aiohttp.ClientResponse) -> object | None:
+    """Decode a JSON body, keeping malformed successful bodies distinguishable."""
+
+    try:
+        try:
+            return await response.json(content_type=None)
+        except TypeError:
+            return await response.json()
+    except (TypeError, ValueError, aiohttp.ContentTypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fetch functions (with proxy pool support)
+# ---------------------------------------------------------------------------
 
 async def _fetch_status(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> int:
     """GET one endpoint and return its status without following redirects."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(
-        url,
-        proxy=resolved_proxy,
-        headers=headers,
-        allow_redirects=False,
-    ) as response:
-        return response.status
+    async def attempt(resolved_proxy: str | None) -> int:
+        async with session.get(
+            url,
+            proxy=resolved_proxy,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            return response.status
+
+    return await _with_proxy(proxy, attempt)
 
 
 async def _fetch_json_get(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
     """GET JSON and keep malformed successful bodies distinguishable."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(url, proxy=resolved_proxy, headers=headers) as response:
-        try:
-            try:
-                body = await response.json(content_type=None)
-            except TypeError:
-                body = await response.json()
-        except (TypeError, ValueError, aiohttp.ContentTypeError):
-            body = None
-        return response.status, body
+    async def attempt(resolved_proxy: str | None) -> tuple[int, object | None]:
+        async with session.get(
+            url, proxy=resolved_proxy, headers=headers,
+        ) as response:
+            return response.status, await _read_json_body(response)
+
+    return await _with_proxy(proxy, attempt)
 
 
 async def _fetch_json(
     session: aiohttp.ClientSession,
     url: str,
     payload: Mapping[str, object],
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
     """POST JSON and return the status plus a decoded response, if any."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.post(
-        url,
-        json=dict(payload),
-        proxy=resolved_proxy,
-        headers=headers,
-        allow_redirects=False,
-    ) as response:
-        try:
-            try:
-                body = await response.json(content_type=None)
-            except TypeError:
-                body = await response.json()
-        except (TypeError, ValueError, aiohttp.ContentTypeError):
-            body = None
-        return response.status, body
+    body = dict(payload)
+
+    async def attempt(resolved_proxy: str | None) -> tuple[int, object | None]:
+        async with session.post(
+            url,
+            json=body,
+            proxy=resolved_proxy,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            return response.status, await _read_json_body(response)
+
+    return await _with_proxy(proxy, attempt)
 
 
 async def _fetch_page(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
     """GET a URL and return its status and decoded HTML without redirects."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(
-        url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
-    ) as response:
-        return response.status, await response.text(errors="replace")
+    async def attempt(resolved_proxy: str | None) -> tuple[int, str]:
+        async with session.get(
+            url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
+        ) as response:
+            return response.status, await response.text(errors="replace")
+
+    return await _with_proxy(proxy, attempt)
 
 
 def _safe_url(template: str, username: str) -> str:
@@ -1304,9 +1401,19 @@ async def check_twitter(session, username: str, proxy=None) -> Result:
 # Parallel fan-out and deadline support
 # ---------------------------------------------------------------------------
 
-def timeout_results(detail: str = "check deadline reached") -> list[Result]:
-    """Return one honest unknown/error result per platform."""
-    return [Result(platform, emoji, ERROR, detail) for platform, emoji in PLATFORMS]
+def timeout_results(
+    detail: str = "check deadline reached",
+    include_extra: bool = True,
+) -> list[Result]:
+    """Return one honest unknown/error result per platform that would run.
+
+    ``include_extra`` mirrors ``run_all_checks(enable_extra_platforms=...)`` so
+    a timed-out lookup reports exactly the platforms that were configured,
+    instead of inventing errors for checks that are switched off.
+    """
+
+    platforms = PLATFORMS if include_extra else CORE_PLATFORMS
+    return [Result(platform, emoji, ERROR, detail) for platform, emoji in platforms]
 
 
 async def _run_bounded(

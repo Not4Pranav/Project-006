@@ -309,6 +309,36 @@ class TestCache(unittest.TestCase):
             bot_module.CACHE_TTL_TAKEN = old_taken
 
 
+class TestCacheBounds(unittest.TestCase):
+    """The result cache must stay bounded on a busy server."""
+
+    def test_store_prunes_over_the_ceiling(self):
+        b = make_bot(404)
+        old_max = bot_module.CACHE_MAX_ENTRIES
+        bot_module.CACHE_MAX_ENTRIES = 10
+        try:
+            results = [checkers.Result("Minecraft", "x", checkers.TAKEN, "")]
+            for i in range(50):
+                b._store(f"name{i:04d}", results)
+            self.assertLessEqual(len(b._cache), 10)
+            # The most recent write survives the prune.
+            self.assertIn("name0049", b._cache)
+        finally:
+            bot_module.CACHE_MAX_ENTRIES = old_max
+
+    def test_expired_entry_is_evicted_on_read(self):
+        b = make_bot(404)
+        old_ttl = bot_module.CACHE_TTL_TAKEN
+        bot_module.CACHE_TTL_TAKEN = 0.0
+        try:
+            b._store("vortex", [
+                checkers.Result("Minecraft", "x", checkers.TAKEN, "")])
+            self.assertIsNone(b._cached("vortex"))
+            self.assertNotIn("vortex", b._cache)
+        finally:
+            bot_module.CACHE_TTL_TAKEN = old_ttl
+
+
 class TestLatencyBudget(unittest.TestCase):
     def test_checker_crash_still_reacts_with_warning(self):
         async def crashes(*_args, **_kwargs):

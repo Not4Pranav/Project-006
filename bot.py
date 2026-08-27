@@ -35,12 +35,16 @@ Configuration lives in .env (see .env.example):
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
     ENABLE_EXTRA_PLATFORMS    true (default) | false — check GitHub/Steam/Reddit/...
+    PROXY_ALLOW_DIRECT_FALLBACK  false (default) | true — go direct if all proxies die
 
 Proxy pool features:
-    - Round-robin rotation across healthy proxies
-    - Automatic health checking every 30s
-    - Dead-proxy cooldown and automatic recovery
-    - Falls back to direct connection when all proxies are down
+    - Round-robin rotation resolved per request, so the platform checks in one
+      lookup spread across the pool instead of hammering a single IP
+    - Live health reporting from real traffic: a proxy that fails a check is
+      benched at once and the retry lands on the next proxy
+    - Concurrent health checks every 30s, with a 60s recovery cooldown
+    - When every proxy is down it keeps using proxies by default rather than
+      leaking the host IP; set PROXY_ALLOW_DIRECT_FALLBACK=true to go direct
 
 Run locally: python bot.py
 """
@@ -59,7 +63,7 @@ import discord
 from dotenv import load_dotenv
 
 import checkers
-from proxies import ProxyPool, parse_proxy_list
+from proxies import ProxyPool, ProxyProvider, parse_proxy_list
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -184,12 +188,24 @@ CHECK_TIMEOUT = _bounded_float(
 # only exists to absorb genuine flood/spam bursts.
 USER_MAX_CHECKS = _bounded_int("USER_MAX_CHECKS", 5, minimum=1, maximum=10_000)
 USER_WINDOW_SECONDS = max(_opt_float("USER_WINDOW_SECONDS", 0.5), 0.01)
+# Base cache lifetime. The two smart TTLs below default to multiples of it,
+# so setting RESULT_CACHE_TTL alone still tunes caching as a whole.
 RESULT_CACHE_TTL = max(_opt_float("RESULT_CACHE_TTL", 300), 0.0)
 
-# Smart cache: taken names stay available longer (they rarely free up),
-# while available names expire faster (they might get sniped).
-CACHE_TTL_TAKEN = max(_opt_float("CACHE_TTL_TAKEN", 600), 0.0)   # 10 min
-CACHE_TTL_AVAILABLE = max(_opt_float("CACHE_TTL_AVAILABLE", 120), 0.0)  # 2 min
+# Smart cache: taken names stay cached longer (they rarely free up), while
+# available names expire faster (they might get sniped by someone else).
+CACHE_TTL_TAKEN = max(_opt_float("CACHE_TTL_TAKEN", RESULT_CACHE_TTL * 2), 0.0)
+CACHE_TTL_AVAILABLE = max(
+    _opt_float("CACHE_TTL_AVAILABLE", RESULT_CACHE_TTL * 0.4), 0.0)
+# Hard ceiling on cache entries so a busy server cannot grow it without bound.
+CACHE_MAX_ENTRIES = _bounded_int("CACHE_MAX_ENTRIES", 5000, 64, 1_000_000)
+
+# Proxy behaviour when every proxy is benched. Direct fallback is OFF by
+# default: falling back would expose the host's real IP to the platforms,
+# which is usually the exact thing the proxies were configured to prevent.
+PROXY_ALLOW_DIRECT_FALLBACK = os.getenv(
+    "PROXY_ALLOW_DIRECT_FALLBACK", "false").strip().lower() in (
+        "true", "1", "yes", "on")
 
 # Feedback emojis
 EMOJI_NONE_AVAILABLE = "❌"
@@ -227,10 +243,16 @@ class SniperBot(discord.Client):
         self._buckets: dict[int, deque[float]] = defaultdict(deque)
         # Recent results cache: {username_lower: (timestamp, [Result, ...])}
         self._cache: dict[str, tuple[float, list[checkers.Result]]] = {}
-        # Proxy pool for rotation and failover
-        self.proxy_pool: ProxyPool | None = None
-        # Background health check task
+        # Callable handed to the checkers; also collects live health reports.
+        self.proxy_provider: ProxyProvider = ProxyProvider(static_url=PROXY_URL)
+        # Proxy pool for rotation and failover (see the property below).
+        self.proxy_pool = None
+        # Background tasks (health checks) kept referenced so they are not
+        # garbage collected mid-flight.
         self._health_task: asyncio.Task | None = None
+        self._initial_health_task: asyncio.Task | None = None
+        # on_ready fires again after every gateway resume; print once.
+        self._banner_shown = False
 
     async def setup_hook(self) -> None:
         """Create one pooled outbound session before gateway events arrive."""
@@ -257,15 +279,16 @@ class SniperBot(discord.Client):
         if PROXY_URL and PROXY_URL not in proxy_list:
             proxy_list.insert(0, PROXY_URL)
         if proxy_list:
-            self.proxy_pool = ProxyPool(proxy_list)
-            # Start background health checking
+            self.proxy_pool = ProxyPool(
+                proxy_list, allow_direct_fallback=PROXY_ALLOW_DIRECT_FALLBACK)
+            # Background health checking, refreshed every 30s.
             self._health_task = asyncio.create_task(
                 self.proxy_pool.periodic_health_check(self.http_sniper))
-            # Do an initial health check
-            try:
-                await self.proxy_pool.health_check(self.http_sniper, timeout=2.0)
-            except Exception as exc:
-                log.warning("Initial proxy health check failed: %s", exc)
+            # The first sweep runs in the background: awaiting it here would
+            # delay the gateway login by a full probe timeout for no benefit,
+            # since live traffic reports health on its own.
+            self._initial_health_task = asyncio.create_task(
+                self._initial_health_check())
 
         if DISCORD_CHECK_MODE == "dnsrobot":
             try:
@@ -280,20 +303,48 @@ class SniperBot(discord.Client):
                     checkers._redact_sensitive_text(exc),
                 )
 
+    @property
+    def proxy_pool(self) -> ProxyPool | None:
+        return self.proxy_provider.pool
+
+    @proxy_pool.setter
+    def proxy_pool(self, pool: ProxyPool | None) -> None:
+        """Keep the pool and the provider handed to the checkers in sync."""
+
+        self.proxy_provider.pool = pool
+
+    async def _initial_health_check(self) -> None:
+        """Probe every proxy once at startup without blocking the login."""
+
+        if self.proxy_pool is None or self.http_sniper is None:
+            return
+        try:
+            await self.proxy_pool.health_check(self.http_sniper, timeout=3.0)
+            log.info("Initial proxy health: %d/%d alive",
+                     self.proxy_pool.alive_count, self.proxy_pool.size)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Initial proxy health check failed: %s",
+                        checkers._redact_sensitive_text(exc))
+
     def _next_proxy(self) -> str | None:
-        """Get the next proxy from the pool, or None for direct connection."""
-        if self.proxy_pool is not None:
-            return self.proxy_pool.next()
-        return PROXY_URL
+        """Get the next proxy from the pool, or None for a direct connection."""
+
+        return self.proxy_provider()
 
     async def close(self) -> None:
         try:
-            if self._health_task and not self._health_task.done():
-                self._health_task.cancel()
+            for task in (self._health_task, self._initial_health_task):
+                if task is None or task.done():
+                    continue
+                task.cancel()
                 try:
-                    await self._health_task
-                except (asyncio.CancelledError, Exception):
+                    await task
+                except asyncio.CancelledError:
                     pass
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Background task ended with an error: %s", exc)
         finally:
             try:
                 if self.http_sniper and not self.http_sniper.closed:
@@ -345,15 +396,29 @@ class SniperBot(discord.Client):
         if time.monotonic() - hit[0] < ttl:
             return hit[1]
 
-        # Expired: evict on read
+        # Expired: evict on read.
         del self._cache[key]
-        if len(self._cache) > 5000:
-            now = time.monotonic()
-            self._cache = {
-                cache_key: value for cache_key, value in self._cache.items()
-                if now - value[0] < CACHE_TTL_TAKEN
-            }
         return None
+
+    def _store(self, username: str, results: list[checkers.Result]) -> None:
+        """Cache one definitive answer, keeping the cache bounded."""
+
+        self._cache[username.lower()] = (time.monotonic(), results)
+        if len(self._cache) <= CACHE_MAX_ENTRIES:
+            return
+        # Drop everything already stale, then oldest-first until back in
+        # budget. Pruning on write (not only on an expired read) means a busy
+        # server can never grow the cache without bound.
+        now = time.monotonic()
+        self._cache = {
+            key: value for key, value in self._cache.items()
+            if now - value[0] < CACHE_TTL_TAKEN
+        }
+        if len(self._cache) > CACHE_MAX_ENTRIES:
+            for key, _ in sorted(
+                    self._cache.items(), key=lambda item: item[1][0],
+            )[:len(self._cache) - CACHE_MAX_ENTRIES]:
+                self._cache.pop(key, None)
 
     @staticmethod
     def _cacheable(results: list[checkers.Result]) -> bool:
@@ -456,7 +521,7 @@ class SniperBot(discord.Client):
 
         checker_task = asyncio.create_task(checkers.run_all_checks(
             self.http_sniper, username,
-            proxy=self._next_proxy,
+            proxy=self.proxy_provider,
             discord_mode=DISCORD_CHECK_MODE,
             discord_probe_url=DISCORD_PROBE_URL,
             discord_probe_headers=DISCORD_PROBE_HEADERS,
@@ -487,7 +552,8 @@ class SniperBot(discord.Client):
         except Exception as exc:  # noqa: BLE001
             log.warning("Checker task failed before its deadline: %s",
                         checkers._redact_sensitive_text(exc))
-            return checkers.timeout_results("checker task failed")
+            return checkers.timeout_results(
+                "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS)
 
     async def _write_hit_log(
         self,
@@ -550,6 +616,12 @@ class SniperBot(discord.Client):
     # -- events -------------------------------------------------------------
 
     async def on_ready(self) -> None:
+        # Discord fires on_ready again after every resume; the banner is
+        # startup information, so print it only the first time.
+        if self._banner_shown:
+            log.info("Reconnected to the Discord gateway as %s", self.user)
+            return
+        self._banner_shown = True
         print("=" * 62)
         print(f"🟢 MULTI-SNIPER v2.0 ONLINE as {self.user}")
         print("🔒 Watching channel : "
@@ -569,9 +641,9 @@ class SniperBot(discord.Client):
                   f"{self.proxy_pool.alive_count} alive")
             print(f"   └─ {self.proxy_pool.status_summary()}")
         elif PROXY_URL:
-            print(f"🧊 Proxy            : on (single)")
+            print("🧊 Proxy            : on (single)")
         else:
-            print(f"🧊 Proxy            : off (direct)")
+            print("🧊 Proxy            : off (direct)")
         print(f"⏳ User cooldown    : {USER_MAX_CHECKS} checks / "
               f"{USER_WINDOW_SECONDS:.2f}s")
         print(f"⚡ Response budget  : {RESPONSE_BUDGET_SECONDS:.2f}s "
@@ -615,12 +687,14 @@ class SniperBot(discord.Client):
             # wall-clock cap, not sequential caps.
             check_budget = deadline - time.monotonic() - REACTION_TIMEOUT
             if check_budget <= 0:
-                results = checkers.timeout_results("response deadline reached")
+                results = checkers.timeout_results(
+                    "response deadline reached",
+                    include_extra=ENABLE_EXTRA_PLATFORMS)
             else:
                 results = await self._run_checks_with_deadline(username, check_budget)
 
             if self._cacheable(results):
-                self._cache[username.lower()] = (time.monotonic(), results)
+                self._store(username, results)
             else:
                 log.info("not caching inconclusive results for %r", username)
 

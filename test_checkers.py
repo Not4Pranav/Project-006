@@ -210,7 +210,8 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_instagram(200, "Sorry, this page isn't available"), AVAILABLE)
         # 200 with login wall = blocked
         self.assertEqual(interpret_instagram(200, "Login to Instagram"), BLOCKED)
-        self.assertEqual(interpret_instagram(200, "challenge required"), BLOCKED)
+        self.assertEqual(
+            interpret_instagram(200, "redirecting to /challenge/ required"), BLOCKED)
         # 200 with empty body = blocked
         self.assertEqual(interpret_instagram(200, ""), BLOCKED)
         # 404 = available
@@ -224,6 +225,24 @@ class TestInterpreters(unittest.TestCase):
         # Other
         self.assertEqual(interpret_instagram(500), ERROR)
 
+    def test_instagram_typographic_apostrophe(self):
+        """Instagram serves a curly apostrophe; the ASCII marker must still hit."""
+        page = "Sorry, this page isn\u2019t available."
+        self.assertEqual(interpret_instagram(200, page), AVAILABLE)
+
+    def test_instagram_bio_word_does_not_block(self):
+        """A live profile that merely mentions 'challenge' is TAKEN, not BLOCKED."""
+        page = "<html>bio: I love a good challenge and captcha puzzles</html>"
+        self.assertEqual(interpret_instagram(200, page), TAKEN)
+
+    def test_twitter_typographic_apostrophe(self):
+        page = "This account doesn\u2019t exist"
+        self.assertEqual(interpret_twitter(200, page), AVAILABLE)
+
+    def test_twitter_bio_word_does_not_block(self):
+        page = "<html>class='challenge-card' bio: captcha enjoyer</html>"
+        self.assertEqual(interpret_twitter(200, page), TAKEN)
+
     def test_twitter(self):
         # 200 with normal page = taken
         self.assertEqual(interpret_twitter(200, "<html>profile content</html>"), TAKEN)
@@ -233,7 +252,7 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_twitter(200, "Hmm...this page doesn't exist"), AVAILABLE)
         # 200 with challenge = blocked
         self.assertEqual(interpret_twitter(200, "Rate limit exceeded"), BLOCKED)
-        self.assertEqual(interpret_twitter(200, "captcha"), BLOCKED)
+        self.assertEqual(interpret_twitter(200, "Solve this captcha"), BLOCKED)
         # 200 with empty body = blocked
         self.assertEqual(interpret_twitter(200, ""), BLOCKED)
         # 404 = available
@@ -623,11 +642,116 @@ class TestCheckers(unittest.TestCase):
         self.assertEqual(r.status, AVAILABLE)
 
 
+class TestProxyReportingAndRetries(unittest.TestCase):
+    """The request layer must feed real outcomes back into the proxy pool."""
+
+    @staticmethod
+    def run_async(coro):
+        return asyncio.run(coro)
+
+    def test_success_is_reported_to_the_pool(self):
+        from proxies import ProxyPool, ProxyProvider
+
+        pool = ProxyPool(["http://p1:8080"])
+        provider = ProxyProvider(pool=pool)
+        session = _session_with_status(404)
+
+        result = self.run_async(
+            checkers.check_minecraft(session, "zxqw99182", provider))
+
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertEqual(pool.alive_count, 1)
+        # The request was actually routed through the proxy.
+        self.assertEqual(session.get.call_args.kwargs["proxy"], "http://p1:8080")
+
+    def test_failure_benches_the_proxy_without_waiting_for_health_sweep(self):
+        from proxies import ProxyPool, ProxyProvider
+
+        pool = ProxyPool(["http://p1:8080"])
+        provider = ProxyProvider(pool=pool)
+        session = MagicMock()
+        session.get = MagicMock(
+            side_effect=aiohttp.ClientProxyConnectionError(MagicMock(), OSError()))
+
+        result = self.run_async(
+            checkers.check_minecraft(session, "zxqw99182", provider))
+
+        self.assertEqual(result.status, ERROR)
+        # Live traffic (not just the 30s health sweep) recorded the failures.
+        self.assertIn("100% fail", pool.status_summary())
+
+    def test_transient_error_is_retried_once(self):
+        calls = []
+        ok = _session_with_status(404)
+
+        def flaky_get(*args, **kwargs):
+            calls.append(kwargs.get("proxy"))
+            if len(calls) == 1:
+                raise aiohttp.ClientConnectionError("reset")
+            return ok.get(*args, **kwargs)
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=flaky_get)
+
+        result = self.run_async(
+            checkers.check_minecraft(session, "zxqw99182", None))
+
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertEqual(len(calls), 2)  # failed once, retried, succeeded
+
+    def test_retry_rotates_to_the_next_proxy(self):
+        from proxies import ProxyPool, ProxyProvider
+
+        pool = ProxyPool(["http://p1:8080", "http://p2:8080"])
+        provider = ProxyProvider(pool=pool)
+        seen = []
+        ok = _session_with_status(404)
+
+        def flaky_get(*args, **kwargs):
+            seen.append(kwargs.get("proxy"))
+            if len(seen) == 1:
+                raise aiohttp.ClientConnectionError("reset")
+            return ok.get(*args, **kwargs)
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=flaky_get)
+
+        self.run_async(checkers.check_minecraft(session, "zxqw99182", provider))
+
+        self.assertEqual(seen, ["http://p1:8080", "http://p2:8080"])
+
+    def test_plain_string_proxy_still_works(self):
+        session = _session_with_status(404)
+        result = self.run_async(
+            checkers.check_minecraft(session, "zxqw99182", "http://p1:8080"))
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertEqual(session.get.call_args.kwargs["proxy"], "http://p1:8080")
+
+
+class TestTimeoutResults(unittest.TestCase):
+
+    def test_includes_extra_platforms_by_default(self):
+        self.assertEqual(len(checkers.timeout_results()), len(checkers.PLATFORMS))
+
+    def test_core_only_when_extras_disabled(self):
+        results = checkers.timeout_results("x", include_extra=False)
+        self.assertEqual(len(results), len(checkers.CORE_PLATFORMS))
+        self.assertTrue(all(r.status == ERROR for r in results))
+
+
+class TestHeaders(unittest.TestCase):
+
+    def test_no_brotli_is_advertised(self):
+        """aiohttp cannot decode br without the optional Brotli package."""
+        for headers in (checkers.BROWSER_HEADERS, checkers.API_HEADERS):
+            self.assertNotIn("br", headers["Accept-Encoding"])
+
+
 class TestProxyPool(unittest.TestCase):
     """Tests for the proxy pool module."""
 
     def test_import(self):
-        from proxies import ProxyPool, parse_proxy_list
+        from proxies import ProxyPool
         pool = ProxyPool(["http://proxy1:8080", "http://proxy2:8080"])
         self.assertEqual(pool.size, 2)
         self.assertEqual(pool.alive_count, 2)
@@ -687,6 +811,41 @@ class TestProxyPool(unittest.TestCase):
         summary = pool.status_summary()
         self.assertIn("p1", summary)
         self.assertIn("alive", summary)
+
+    def test_direct_fallback_is_opt_in(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080"], allow_direct_fallback=True)
+        for _ in range(3):
+            pool.report_failure("http://p1:8080")
+        # Opted in: prefer a direct connection over a known-dead proxy.
+        self.assertIsNone(pool.next())
+
+    def test_provider_wraps_static_url(self):
+        from proxies import ProxyProvider
+        provider = ProxyProvider(static_url="http://only:8080")
+        self.assertEqual(provider(), "http://only:8080")
+        self.assertTrue(provider.enabled)
+        provider.report_failure("http://only:8080")  # must not raise
+
+    def test_provider_without_proxies(self):
+        from proxies import ProxyProvider
+        provider = ProxyProvider()
+        self.assertIsNone(provider())
+        self.assertFalse(provider.enabled)
+
+    def test_duplicate_proxies_are_collapsed(self):
+        from proxies import ProxyPool, parse_proxy_list
+        pool = ProxyPool(["http://p1:8080", "http://p1:8080"])
+        self.assertEqual(pool.size, 1)
+        self.assertEqual(
+            parse_proxy_list("http://p1:8080,http://p1:8080"), ["http://p1:8080"])
+
+    def test_unknown_url_report_is_ignored(self):
+        from proxies import ProxyPool
+        pool = ProxyPool(["http://p1:8080"])
+        pool.report_failure("http://not-in-pool:8080")
+        pool.report_success(None)
+        self.assertEqual(pool.alive_count, 1)
 
     def test_all_dead_falls_back(self):
         from proxies import ProxyPool
