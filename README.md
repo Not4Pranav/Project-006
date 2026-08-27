@@ -147,13 +147,20 @@ Everything after step 1 shares a single response budget (4.5 s by default, hard-
 | **Streaming answers** | The reply is painted instantly and updated per platform — a fast result is never held hostage by a slow site |
 | Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency, not the sum |
 | Result cache | Repeat lookups answer in microseconds, zero requests |
-| **Connection pre-warming** | TLS to all 8 hosts is established at startup, so the first lookup skips DNS + TCP + TLS |
+| **Connection pre-warming** | TLS to all hosts — including the fallback provider — is established at startup, so the first lookup skips DNS + TCP + TLS |
+| **Hedged fallback second opinion** | If a platform stalls past 1 s, instantusername.com is raced in parallel — a hanging endpoint no longer adds its full timeout on top of the rescue. The platform's own verdict still overrules within a 250 ms grace window, so ground truth wins whenever it arrives |
+| **GitHub status-only check** | `github.com/<name>`'s 404/200 contract replaces the JSON API — same answer, no 60-requests-per-hour rate limit to exhaust |
 | **Bounded page reads (96 KB)** | Steam/Instagram/X markers sit at the top of the document; the rest of a multi-MB page is never downloaded |
 | **Hedged Minecraft request** | The backup Mojang endpoint starts only if the primary stalls 150 ms — one request when healthy, no doubled latency when not |
-| TCP pooling + keep-alive (30 s) | No repeated handshakes between lookups |
+| **Connect deadline (2 s)** | A socket that cannot even connect (dead proxy, black-holed host) fails over to the next proxy instead of eating the whole check budget |
+| **Instant startup** | Gateway login never waits on the remote proxy list: download + verification run in the background and the pool is upgraded in place |
+| TCP pooling + keep-alive (30 s), Happy Eyeballs | No repeated handshakes between lookups; IPv4/IPv6 race to whichever connects first |
 | DNS cache (5 min) | No repeated resolution per check |
+| O(1) proxy rotation | Handing out the next healthy proxy no longer walks the pool, even with thousands of entries and hundreds benched |
+| Event-driven reply edits | The live reply wakes only when a result lands or an edit becomes due — no busy polling |
 | Sub-second flood guard (5 / 0.5 s) | Back-to-back checks are not throttled in practice |
 | Per-request proxy rotation | The 8 checks spread across 8 IPs instead of queueing behind one |
+| Pipelined proxy verification | Startup probing keeps every probe slot busy — one slow timeout never stalls the batch behind it |
 | One retry on transient errors | A single connection reset does not become a ⚠️ |
 | gzip/deflate compression | Smaller bodies for the HTML-scraped platforms |
 
@@ -215,7 +222,7 @@ Set `INSTANTUSERNAME_FALLBACK=false` to disable the second source entirely — f
 | Minecraft | 🕹️ | 204 or 404 | 200 with profile JSON | 403 / 405 / 429 |
 | guns.lol | 🔫 | 404/410, or an unclaimed-page marker | 200 without that marker | 403 / 429 / 503, Cloudflare challenge |
 | Discord | 🐈‍⬛ | mode-dependent | mode-dependent | mode-dependent (see below) |
-| GitHub | 💻 | 404 | 200 with a `login` field | 403 / 429 (rate limit) |
+| GitHub | 💻 | 404 | 200 profile page | 403 / 429 (rate limit) |
 | Steam | 🎮 | 404, or "profile could not be found" | 200 with profile content | 403 / 429 / 503 |
 | Reddit | 👀 | 404 | 200 with user-about JSON | 403 / 429 / 503 |
 | Instagram | 📸 | 404, or "this page isn't available" | 200 profile page | login wall, checkpoint, 401 / 403 / 429 |
@@ -289,7 +296,7 @@ PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
 
 Google Drive `…/view` links, GitHub `blob` links and plain raw URLs all work — share links are rewritten to their direct-download form automatically, and an HTML sign-in page is detected and rejected rather than parsed as proxies.
 
-What happens on boot, in order:
+What happens on boot — **entirely in the background, after the bot is already online** (a slow list download can never delay the gateway login; the pool is upgraded in place while lookups are being answered):
 
 | Step | Why |
 |---|---|
@@ -410,7 +417,7 @@ Discord has no public username-availability API, so this check is **off by defau
 | Mode | How it works | Needs |
 |---|---|---|
 | `off` *(default)* | Skipped; reported as `skipped` | — |
-| `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `python -m playwright install chromium` |
+| `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `pip install 'playwright>=1.48,<2'` + `python -m playwright install chromium` |
 | `account` / `account_api` | POSTs `{"username": "..."}` to Discord's username-eligibility route | Optionally an authorised credential |
 | `probe` | GETs your own authorised checker URL template (`200` = taken, `404` = free) | `DISCORD_PROBE_URL` |
 
@@ -446,6 +453,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 |---|---|---|---|
 | `RESPONSE_BUDGET_SECONDS` | `4.5` | 0.5 – 4.8 | Total budget for checks + reactions |
 | `CHECK_TIMEOUT` | `3` | 0.05 – budget | Per-request outbound timeout |
+| `CONNECT_DEADLINE` | `2` | 0.1 – CHECK_TIMEOUT | Per-socket connect cap; dead proxies fail over faster |
 | `REACTION_TIMEOUT` | `0.75` | 0.05 – budget−0.05 | Cap per Discord reaction call |
 | `USER_MAX_CHECKS` | `5` | 1 – 10000 | Checks allowed per user per window |
 | `USER_WINDOW_SECONDS` | `0.5` | ≥ 0.01 | Flood-guard window — sub-second so checks feel instant |
@@ -542,7 +550,7 @@ The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pur
 | Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` |
 | ⚠️ on every platform | Outbound HTTPS is blocked, or every proxy is down (check the startup banner and `Proxy … benched` logs) |
 | Discord shows `skipped` | Expected: `DISCORD_CHECK_MODE=off` is the default |
-| `DNS Robot browser unavailable` | Run `python -m playwright install chromium` |
+| `DNS Robot browser unavailable` | Run `pip install 'playwright>=1.48,<2'` then `python -m playwright install chromium` |
 | ⏳ on ordinary use | Raise `USER_MAX_CHECKS` or lower `USER_WINDOW_SECONDS` |
 
 ---

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import re
 import sys
 import time
@@ -513,6 +514,46 @@ def interpret_twitter(status: int, page: str | None = None) -> str:
 # Low-level fetch helpers
 # ---------------------------------------------------------------------------
 
+try:
+    _AIOHTTP_VERSION = tuple(
+        int(part) for part in aiohttp.__version__.split(".")[:2])
+except (ValueError, AttributeError):  # pragma: no cover - odd dev builds
+    _AIOHTTP_VERSION = (3, 9)
+
+
+def make_fast_connector(
+    limit: int,
+    limit_per_host: int,
+    *,
+    force_close: bool = False,
+    keepalive_timeout: float = 30.0,
+) -> aiohttp.TCPConnector:
+    """Build the fastest pooled connector the installed aiohttp supports.
+
+    - DNS results are cached (5 min) so repeat checks skip re-resolution.
+    - Happy Eyeballs (aiohttp >= 3.10) races IPv4/IPv6 and connects to
+      whichever answers first, shaving setup latency on dual-stack hosts.
+    - Keep-alive connections stay pooled between lookups.
+    - ``enable_cleanup_closed`` is only passed on aiohttp versions that want
+      it; newer ones deprecate it.
+    """
+
+    kwargs: dict[str, object] = {
+        "limit": limit,
+        "limit_per_host": limit_per_host,
+        "ttl_dns_cache": 300,
+        "use_dns_cache": True,
+        "force_close": force_close,
+        "keepalive_timeout": keepalive_timeout,
+    }
+    params = inspect.signature(aiohttp.TCPConnector.__init__).parameters
+    if "happy_eyeballs_delay" in params:
+        kwargs["happy_eyeballs_delay"] = 0.25
+    if "enable_cleanup_closed" in params and _AIOHTTP_VERSION < (3, 12):
+        kwargs["enable_cleanup_closed"] = True
+    return aiohttp.TCPConnector(**kwargs)
+
+
 _REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ValueError)
 _HTTP_SCHEMES = {"http", "https"}
 _HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -720,7 +761,20 @@ async def _fetch_page(
             url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
         ) as response:
             if max_bytes and max_bytes > 0:
-                raw = await response.content.read(max_bytes)
+                # StreamReader.read(n) returns only what is buffered *right
+                # now* - a single call can stop mid-way through the first
+                # network chunk, which on a slow proxy could truncate the
+                # prefix before the markers. Accumulate up to the cap (or
+                # EOF) so the marker search always sees the full prefix.
+                chunks: list[bytes] = []
+                remaining = max_bytes
+                while remaining > 0:
+                    chunk = await response.content.read(remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
                 encoding = response.charset or "utf-8"
                 try:
                     text = raw.decode(encoding, errors="replace")
@@ -886,7 +940,7 @@ PREWARM_URLS: tuple[str, ...] = (
     "https://api.mojang.com/",
     "https://api.minecraftservices.com/",
     "https://guns.lol/",
-    "https://api.github.com/",
+    "https://github.com/",
     "https://steamcommunity.com/",
     "https://www.reddit.com/",
     "https://www.instagram.com/",
@@ -977,7 +1031,9 @@ async def start_dnsrobot_browser(proxy: str | None = None):
 
     if async_playwright is None:
         raise RuntimeError(
-            "Playwright is not installed; run 'python -m pip install -r requirements.txt'")
+            "Playwright is not installed; run "
+            "\"python -m pip install 'playwright>=1.48,<2'\" and then "
+            "'python -m playwright install chromium'")
 
     runtime = await async_playwright().start()
     try:
@@ -1323,8 +1379,10 @@ async def check_discord(
 async def check_github(session, username: str, proxy=None) -> Result:
     """Check GitHub username availability (💻).
 
-    Uses the public GitHub API: 200 = taken, 404 = free.
-    Rate limit is generous (60 req/hr unauthenticated).
+    Uses the profile page's status code (200 = taken, 404 = free) rather
+    than the JSON API: the same contract, without the unauthenticated API's
+    60-requests-per-hour-per-IP limit that a busy channel exhausts in
+    minutes. Status-only, so no response body is parsed.
     """
 
     if not GITHUB_PATTERN.fullmatch(username):
@@ -1334,18 +1392,13 @@ async def check_github(session, username: str, proxy=None) -> Result:
         )
 
     try:
-        status, payload = await _fetch_json_get(
+        status = await _fetch_status(
             session,
-            f"https://api.github.com/users/{username}",
+            f"https://github.com/{quote(username, safe='')}",
             proxy,
-            headers=API_HEADERS,
         )
-        outcome = interpret_github(status, payload)
-        detail = f"HTTP {status}"
-        if status == 200 and isinstance(payload, Mapping):
-            login = payload.get("login", "")
-            detail += f" (login={login})"
-        return Result("GitHub", GITHUB_EMOJI, outcome, detail)
+        outcome = interpret_github(status)
+        return Result("GitHub", GITHUB_EMOJI, outcome, f"HTTP {status}")
     except _REQUEST_ERRORS as exc:
         return _request_error("GitHub", GITHUB_EMOJI, exc)
 
@@ -1610,6 +1663,45 @@ async def check_instantusername(
                   f"instantusername HTTP {status}")
 
 
+# How long a platform's own endpoint gets to answer before a second-opinion
+# request to instantusername.com starts *in parallel*. A healthy endpoint
+# answers well inside this window and costs exactly one request; a hanging or
+# walled one no longer makes the lookup wait its full timeout before the
+# fallback is even asked. The first definitive answer wins.
+FALLBACK_HEDGE_DELAY = 1.0
+# When the hedged fallback answers definitively FIRST, the platform's own
+# endpoint gets this brief grace window to overrule it - the first-party
+# verdict is ground truth, the aggregator is a second opinion. A hanging
+# primary still costs only this grace, not its full timeout.
+FALLBACK_PRIMARY_GRACE = 0.25
+
+
+async def _task_result(task: asyncio.Task, platform: str, emoji: str) -> Result:
+    """Await a finished checker task, normalizing exceptions into a Result."""
+
+    try:
+        result = await task
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return _request_error(platform, emoji, exc)
+    if not isinstance(result, Result):
+        return Result(platform, emoji, ERROR, "checker returned an invalid result")
+    return result
+
+
+def _consume_late_task(task: asyncio.Task) -> None:
+    """Consume a cancelled loser of a race so it never logs a warning."""
+
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Late checker task exited after the race: %s",
+                  _redact_sensitive_text(exc))
+
+
 async def _with_fallback(
     primary,
     session: aiohttp.ClientSession,
@@ -1618,26 +1710,94 @@ async def _with_fallback(
     username: str,
     proxy: object = None,
 ) -> Result:
-    """Run a platform's own check, then a second opinion if it was useless.
+    """Run a platform's own check, with instantusername.com as second opinion.
 
-    The fallback only runs when the primary could not answer (BLOCKED/ERROR),
-    so the fast path costs nothing extra, and it only replaces the result when
-    the fallback is itself definitive.
+    Fast path: the primary answers inside FALLBACK_HEDGE_DELAY and is
+    definitive - the fallback is never contacted. If the primary is
+    inconclusive (BLOCKED/ERROR) the fallback runs, and only replaces the
+    result when it is itself definitive. If the primary is simply slow, the
+    fallback is hedged in parallel and the first definitive answer wins, so a
+    hanging endpoint can no longer add its whole timeout on top of the
+    fallback's latency.
     """
 
-    result = await primary
-    if result.status not in (BLOCKED, ERROR):
-        return result
     if platform not in INSTANTUSERNAME_SERVICES:
-        return result
+        return await primary
 
-    fallback = await check_instantusername(
-        session, platform, emoji, username, proxy)
-    if fallback.status in (AVAILABLE, TAKEN):
-        log.info("%s: primary was %s, instantusername says %s",
-                 platform, result.status, fallback.status)
-        return fallback
-    return result
+    primary_task = asyncio.ensure_future(primary)
+    fallback_task: asyncio.Task | None = None
+    try:
+        # Give the platform's own endpoint its head start.
+        await asyncio.wait({primary_task}, timeout=FALLBACK_HEDGE_DELAY)
+
+        if primary_task.done():
+            primary_result = await _task_result(primary_task, platform, emoji)
+            if primary_result.status not in (BLOCKED, ERROR):
+                return primary_result
+            fallback_result = await check_instantusername(
+                session, platform, emoji, username, proxy)
+            if fallback_result.status in (AVAILABLE, TAKEN):
+                log.info("%s: primary was %s, instantusername says %s",
+                         platform, primary_result.status, fallback_result.status)
+                return fallback_result
+            return primary_result
+
+        # Primary is still running after the hedge window: it is likely on
+        # its way to a timeout. Race a second opinion instead of waiting.
+        fallback_task = asyncio.ensure_future(check_instantusername(
+            session, platform, emoji, username, proxy))
+        primary_result: Result | None = None
+        fallback_result: Result | None = None
+        pending = {primary_task, fallback_task}
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task is fallback_task:
+                    fallback_result = await _task_result(task, platform, emoji)
+                    if fallback_result.status in (AVAILABLE, TAKEN):
+                        if primary_task.done():
+                            # The primary already finished: its verdict rules.
+                            primary_result = await _task_result(
+                                primary_task, platform, emoji)
+                            if primary_result.status not in (BLOCKED, ERROR):
+                                return primary_result
+                            return fallback_result
+                        # Fallback answered first: give the platform's own
+                        # endpoint a brief grace window to overrule it.
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(primary_task),
+                                timeout=FALLBACK_PRIMARY_GRACE)
+                        except asyncio.TimeoutError:
+                            log.info("%s: hedged fallback answered first (%s)",
+                                     platform, fallback_result.status)
+                            return fallback_result
+                        primary_result = await _task_result(
+                            primary_task, platform, emoji)
+                        if primary_result.status not in (BLOCKED, ERROR):
+                            return primary_result
+                        return fallback_result
+                else:
+                    primary_result = await _task_result(task, platform, emoji)
+                    if primary_result.status not in (BLOCKED, ERROR):
+                        return primary_result
+
+        # Both finished and neither was definitive: keep the platform's own
+        # verdict when there is one, then the fallback's, then a safe ERROR.
+        if fallback_result is not None and fallback_result.status in (
+                AVAILABLE, TAKEN):
+            return fallback_result
+        if primary_result is not None:
+            return primary_result
+        if fallback_result is not None:
+            return fallback_result
+        return Result(platform, emoji, ERROR, "no answer received")
+    finally:
+        for task in (primary_task, fallback_task):
+            if task is not None and not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_late_task)
 
 
 # ---------------------------------------------------------------------------
@@ -1848,6 +2008,7 @@ async def prewarm_connections(
     session: aiohttp.ClientSession,
     proxy: object = None,
     timeout: float = 4.0,
+    urls: Sequence[str] | None = None,
 ) -> int:
     """Open a pooled TLS connection to every platform host up front.
 
@@ -1856,9 +2017,11 @@ async def prewarm_connections(
     a warm keep-alive connection instead. Failures are ignored on purpose: this
     is an optimisation, never a startup requirement.
 
-    Returns the number of hosts successfully warmed.
+    ``urls`` overrides the default host list (e.g. to add the fallback
+    provider's host when it is enabled). Returns how many hosts were warmed.
     """
 
+    targets = PREWARM_URLS if urls is None else tuple(urls)
     request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
 
     async def warm(url: str) -> bool:
@@ -1876,7 +2039,7 @@ async def prewarm_connections(
         except Exception:  # noqa: BLE001
             return False
 
-    warmed = await asyncio.gather(*(warm(url) for url in PREWARM_URLS))
+    warmed = await asyncio.gather(*(warm(url) for url in targets))
     return sum(1 for ok in warmed if ok)
 
 
@@ -1907,16 +2070,13 @@ async def _cli(argv: list[str] | None = None) -> int:
     ns = parser.parse_args(argv)
 
     deadline = max(0.1, ns.timeout)
-    request_timeout = aiohttp.ClientTimeout(total=deadline)
+    # A socket that cannot even connect inside the connect cap should rotate
+    # to the hedged/fallback path rather than eat the whole check budget.
+    request_timeout = aiohttp.ClientTimeout(
+        total=deadline, sock_connect=min(2.0, deadline))
 
     # Optimized TCP connector for connection pooling
-    connector = aiohttp.TCPConnector(
-        limit=20,
-        limit_per_host=10,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-        force_close=False,
-    )
+    connector = make_fast_connector(limit=20, limit_per_host=10)
 
     browser_runtime = None
     dnsrobot_browser = None

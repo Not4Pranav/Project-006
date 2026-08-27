@@ -302,6 +302,12 @@ REACTION_TIMEOUT = _bounded_float(
     maximum=max(0.05, RESPONSE_BUDGET_SECONDS - 0.05))
 CHECK_TIMEOUT = _bounded_float(
     "CHECK_TIMEOUT", 3.0, minimum=0.05, maximum=RESPONSE_BUDGET_SECONDS)
+# Per-socket connect cap inside CHECK_TIMEOUT. Dead proxies and black-holed
+# hosts should fail over quickly instead of consuming the whole check budget;
+# healthy TLS connects land in tens of milliseconds, so this never trims a
+# working connection.
+CONNECT_DEADLINE = _bounded_float(
+    "CONNECT_DEADLINE", 2.0, minimum=0.1, maximum=CHECK_TIMEOUT)
 # Anti-abuse throttle. Defaults are deliberately sub-second so a member can
 # fire checks back-to-back and get availability answers instantly; the window
 # only exists to absorb genuine flood/spam bursts.
@@ -503,28 +509,37 @@ class SniperBot(discord.Client):
     async def setup_hook(self) -> None:
         """Create one pooled outbound session before gateway events arrive."""
 
-        # Optimized TCP connector for connection pooling and reuse
-        connector = aiohttp.TCPConnector(
-            limit=HTTP_POOL_LIMIT,           # Total connection pool size
-            limit_per_host=HTTP_POOL_LIMIT_PER_HOST,  # Per target host
-            ttl_dns_cache=300,        # DNS cache for 5 minutes
-            enable_cleanup_closed=True,  # Clean up closed connections
-            force_close=False,        # Keep connections alive for reuse
-            keepalive_timeout=30,     # Keep idle connections for 30s
-        )
+        # Optimized TCP connector: pooled keep-alive connections, cached DNS,
+        # and Happy Eyeballs where the installed aiohttp supports it.
+        connector = checkers.make_fast_connector(
+            HTTP_POOL_LIMIT, HTTP_POOL_LIMIT_PER_HOST)
 
-        timeout = aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
+        # Connect fast, fail fast: a socket that cannot even connect inside
+        # CONNECT_DEADLINE (dead proxy, black-holed host) rotates to the next
+        # proxy instead of eating the entire per-check budget.
+        timeout = aiohttp.ClientTimeout(
+            total=CHECK_TIMEOUT,
+            sock_connect=min(CONNECT_DEADLINE, CHECK_TIMEOUT),
+        )
         self.http_sniper = aiohttp.ClientSession(
             headers=checkers.BROWSER_HEADERS,
             timeout=timeout,
             connector=connector,
         )
 
-        # Initialize proxy pool
-        proxy_list = await self._resolve_proxy_list()
-        if proxy_list:
+        # Initialize the proxy pool instantly from the locally configured
+        # sources (PROXY_URL / PROXY_URLS / proxies.txt). The optional remote
+        # list is fetched, sampled and verified in the background so a slow
+        # download can never delay the gateway login; the pool is upgraded
+        # in place while the bot is already answering. Until a remote list
+        # arrives, a pool built only from a remote source hands out direct
+        # connections - the same window the old blocking download had, minus
+        # the offline time.
+        local = configured_proxies()
+        self._curated_proxies = set(local)
+        if local or PROXY_LIST_URL:
             self.proxy_pool = ProxyPool(
-                proxy_list, allow_direct_fallback=PROXY_ALLOW_DIRECT_FALLBACK)
+                local, allow_direct_fallback=PROXY_ALLOW_DIRECT_FALLBACK)
             # Background health checking, refreshed every 30s.
             self._health_task = asyncio.create_task(
                 self.proxy_pool.periodic_health_check(
@@ -533,9 +548,13 @@ class SniperBot(discord.Client):
             # The first sweep runs in the background: awaiting it here would
             # delay the gateway login by a full probe timeout for no benefit,
             # since live traffic reports health on its own.
-            self._initial_health_task = asyncio.create_task(
-                self._verify_proxies() if PROXY_VERIFY_ON_START
-                else self._initial_health_check())
+            if PROXY_LIST_URL:
+                self._initial_health_task = asyncio.create_task(
+                    self._build_remote_pool())
+            else:
+                self._initial_health_task = asyncio.create_task(
+                    self._verify_proxies() if PROXY_VERIFY_ON_START
+                    else self._initial_health_check())
 
         if KEEPALIVE_PORT:
             await self._start_keepalive_server()
@@ -575,59 +594,68 @@ class SniperBot(discord.Client):
 
         self.proxy_provider.pool = pool
 
-    async def _resolve_proxy_list(self) -> list[str]:
-        """Assemble the rotation: local sources first, then the remote list.
+    async def _build_remote_pool(self) -> None:
+        """Fetch the remote proxy list and merge it in, off the login path.
 
         Anything configured locally (PROXY_URL / PROXY_URLS / proxies.txt) is
-        used as-is and never sampled - it is a deliberate, curated list. The
-        remote list is the bulk source: cached, filtered, sampled down to
-        PROXY_MAX_POOL and verified before anything else touches it.
+        already in the pool and is curated on purpose: never sampled away,
+        never filtered, never dropped by verification. The remote list is the
+        bulk source: cached, filtered, sampled down to PROXY_MAX_POOL, merged
+        into the pool and then verified. All of it runs in the background so
+        the gateway login - and every lookup served meanwhile - is never
+        blocked on a download.
         """
 
-        local = configured_proxies()
-        # Locally configured proxies are curated on purpose: they are never
-        # sampled away, never filtered, and never dropped by verification.
-        self._curated_proxies = set(local)
-        if not PROXY_LIST_URL:
-            return local
+        pool = self.proxy_pool
+        try:
+            remote, age = read_proxy_cache(PROXY_CACHE_FILE)
+            if remote and age <= PROXY_LIST_TTL:
+                log.info("Using %d cached proxies (%.0f min old)",
+                         len(remote), age / 60)
+            else:
+                downloaded = await fetch_proxy_list(
+                    self.http_sniper, PROXY_LIST_URL,
+                    timeout=PROXY_LIST_TIMEOUT)
+                if downloaded:
+                    remote = downloaded
+                    write_proxy_cache(remote, PROXY_CACHE_FILE)
+                elif remote:
+                    log.warning("Download failed; falling back to the cached "
+                                "list (%.0f min old)", age / 60)
 
-        remote, age = read_proxy_cache(PROXY_CACHE_FILE)
-        if remote and age <= PROXY_LIST_TTL:
-            log.info("Using %d cached proxies (%.0f min old)",
-                     len(remote), age / 60)
-        else:
-            downloaded = await fetch_proxy_list(
-                self.http_sniper, PROXY_LIST_URL, timeout=PROXY_LIST_TIMEOUT)
-            if downloaded:
-                remote = downloaded
-                write_proxy_cache(remote, PROXY_CACHE_FILE)
-            elif remote:
-                log.warning("Download failed; falling back to the cached list "
-                            "(%.0f min old)", age / 60)
+            if remote and PROXY_SKIP_SOCKS_PORTS:
+                remote, dropped = drop_socks_ports(remote)
+                if dropped:
+                    log.info("Skipped %d entries on SOCKS-only ports", dropped)
 
-        if remote and PROXY_SKIP_SOCKS_PORTS:
-            remote, dropped = drop_socks_ports(remote)
-            if dropped:
-                log.info("Skipped %d entries on SOCKS-only ports", dropped)
+            if remote and pool is not None:
+                budget = max(0, PROXY_MAX_POOL - pool.size)
+                sampled = sample_proxies(remote, budget)
+                if len(sampled) < len(remote):
+                    log.info("Sampled %d of %d remote proxies "
+                             "(PROXY_MAX_POOL=%d)",
+                             len(sampled), len(remote), PROXY_MAX_POOL)
+                existing = set(pool.urls)
+                fresh = [url for url in sampled if url not in existing]
+                if fresh:
+                    pool.add(fresh)
+                # Everything not in the pool stays available as a reserve, so
+                # verification can keep hunting until it has PROXY_MIN_POOL
+                # survivors.
+                in_pool = set(pool.urls)
+                self._proxy_reserve = [url for url in remote
+                                       if url not in in_pool]
+                random.shuffle(self._proxy_reserve)
 
-        budget = max(0, PROXY_MAX_POOL - len(local))
-        sampled = sample_proxies(remote, budget)
-        if remote and len(sampled) < len(remote):
-            log.info("Sampled %d of %d remote proxies (PROXY_MAX_POOL=%d)",
-                     len(sampled), len(remote), PROXY_MAX_POOL)
-
-        merged = list(local)
-        seen = set(local)
-        for url in sampled:
-            if url not in seen:
-                seen.add(url)
-                merged.append(url)
-
-        # Everything not in the first sample stays available as a reserve, so
-        # verification can keep hunting until it has PROXY_MIN_POOL survivors.
-        self._proxy_reserve = [url for url in remote if url not in seen]
-        random.shuffle(self._proxy_reserve)
-        return merged
+            if PROXY_VERIFY_ON_START:
+                await self._verify_proxies()
+            else:
+                await self._initial_health_check()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Remote proxy pool build failed: %s",
+                        checkers._redact_sensitive_text(exc))
 
     async def _verify_proxies(self) -> None:
         """Probe the pool once and drop whatever did not answer.
@@ -784,13 +812,17 @@ class SniperBot(discord.Client):
 
         if self.http_sniper is None:
             return
+        urls = list(checkers.PREWARM_URLS)
+        if INSTANTUSERNAME_FALLBACK:
+            # Warm the second-opinion host too, so a rescued check does not
+            # pay DNS+TLS on its first use either.
+            urls.append(f"{checkers.INSTANTUSERNAME_BASE_URL}/")
         started = time.monotonic()
         try:
             warmed = await checkers.prewarm_connections(
-                self.http_sniper, self.proxy_provider)
+                self.http_sniper, self.proxy_provider, urls=urls)
             log.info("Pre-warmed %d/%d platform connections in %.2fs",
-                     warmed, len(checkers.PREWARM_URLS),
-                     time.monotonic() - started)
+                     warmed, len(urls), time.monotonic() - started)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1163,6 +1195,7 @@ class SniperBot(discord.Client):
         results: list[checkers.Result],
         done: asyncio.Event,
         deadline: float,
+        changed: asyncio.Event | None = None,
     ) -> None:
         """Paint the reply immediately, then refresh it as results arrive.
 
@@ -1171,6 +1204,10 @@ class SniperBot(discord.Client):
         REPLY_EDIT_INTERVAL so a lookup cannot exhaust Discord's edit rate
         limit. The final paint always runs, so the message never ends up
         showing a stale, half-finished list.
+
+        Wakes are event-driven: the stream loop signals ``changed`` whenever a
+        platform reports, so the loop sleeps until something actually happens
+        (or until a throttled edit becomes due) instead of polling on a timer.
         """
 
         sent: discord.Message | None = None
@@ -1211,10 +1248,26 @@ class SniperBot(discord.Client):
                 # finish so the caller still gets a complete result list.
                 await done.wait()
                 continue
+
+            # Sleep until the next interesting moment: a new result, the checks
+            # finishing, or (when a paint is owed) the edit interval elapsing.
+            if changed is not None:
+                waiter = changed.wait()
+            else:
+                waiter = done.wait()
+            if changed is not None and text != last_text and last_paint > 0.0:
+                wake_in = max(0.0, REPLY_EDIT_INTERVAL
+                              - (time.monotonic() - last_paint))
+            else:
+                wake_in = 1.0
             try:
-                await asyncio.wait_for(done.wait(), timeout=0.05)
+                await asyncio.wait_for(waiter, timeout=wake_in)
             except asyncio.TimeoutError:
                 continue
+            if changed is not None:
+                # Single-threaded loop: nothing can append between the wake
+                # and this clear, so no result is ever missed.
+                changed.clear()
 
     async def _stream_checks_and_respond(
         self,
@@ -1234,10 +1287,11 @@ class SniperBot(discord.Client):
         results: list[checkers.Result] = []
         reaction_tasks: list[asyncio.Task] = []
         done = asyncio.Event()
+        changed = asyncio.Event()
         reply_task: asyncio.Task | None = None
         if REPLY_ENABLED:
             reply_task = asyncio.create_task(
-                self._live_reply(message, results, done, deadline))
+                self._live_reply(message, results, done, deadline, changed))
 
         stream = checkers.stream_all_checks(
             self.http_sniper, username,
@@ -1275,6 +1329,7 @@ class SniperBot(discord.Client):
                     break
 
                 results.append(result)
+                changed.set()
                 if not (REACT_ENABLED and result.available):
                     continue
                 remaining = deadline - time.monotonic()
@@ -1298,8 +1353,10 @@ class SniperBot(discord.Client):
             await stream.aclose()
 
         # Replace the shared list's contents in place so the reply task, which
-        # holds a reference to it, renders the completed set.
+        # holds a reference to it, renders the completed set. Signal the change
+        # before ``done`` so the reply loop always wakes for the final paint.
         results[:] = self._fill_missing(results)
+        changed.set()
         done.set()
 
         if reply_task is not None:
@@ -1383,7 +1440,10 @@ class SniperBot(discord.Client):
 
     async def on_ready(self) -> None:
         # Discord fires on_ready again after every resume; the banner is
-        # startup information, so print it only the first time.
+        # startup information, so print it only the first time. The
+        # keepalive server, connection pre-warm and fallback service refresh
+        # all start once in setup_hook - restarting them here would double
+        # the work (and fail to re-bind the keepalive port).
         if self._banner_shown:
             log.info("Reconnected to the Discord gateway as %s", self.user)
             return
@@ -1398,21 +1458,6 @@ class SniperBot(discord.Client):
         else:
             print("🕹️ Platforms        : Minecraft | guns.lol | "
                   f"Discord (mode: {DISCORD_CHECK_MODE})")
-        if KEEPALIVE_PORT:
-            await self._start_keepalive_server()
-
-        if PREWARM_CONNECTIONS:
-            # Background: never delay the gateway login for an optimisation.
-            self._prewarm_task = asyncio.create_task(self._prewarm())
-
-        if INSTANTUSERNAME_FALLBACK:
-            # Learn the fallback provider's live service list so platforms it
-            # adds later are picked up without a code change. Background, and
-            # harmless if it fails: a built-in map is already loaded.
-            self._services_task = asyncio.create_task(
-                checkers.refresh_instantusername_services(
-                    self.http_sniper, self._next_proxy))
-
         if DISCORD_CHECK_MODE == "dnsrobot":
             print("🌐 DNS Robot browser : "
                   f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
