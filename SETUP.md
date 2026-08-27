@@ -343,7 +343,7 @@ For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` ins
   ```bash
   git pull
   python -m pip install -r requirements.txt
-  python test_checkers.py && python test_bot.py
+  for f in test_checkers test_bot test_stress test_integration; do python $f.py || break; done
   sudo systemctl restart multi-sniper     # or redeploy
   ```
 

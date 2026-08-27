@@ -95,8 +95,10 @@ cp .env.example .env
 #       TARGET_CHANNEL_ID=123456789012345678
 
 # 5. Verify offline (no token or network needed)
-python test_checkers.py           # 79 tests
-python test_bot.py                # 37 tests
+python test_checkers.py           # 138 tests
+python test_bot.py                # 63 tests
+python test_stress.py             # 17 tests
+python test_integration.py        # 13 tests
 
 # 6. Run
 python bot.py
