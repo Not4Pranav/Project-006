@@ -97,9 +97,10 @@ python test_checkers.py     # 138 offline tests
 python test_bot.py          # 63 pipeline tests
 python test_stress.py       # 17 stress tests
 python test_integration.py  # 13 integration tests (real local sockets)
+python test_audit.py        # 21 deep-audit tests (loopback servers, fuzz)
 ```
 
-All four suites must end in `OK` (231 tests). None of them needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
+All five suites must end in `OK` (252 tests). None of them needs a Discord token or internet access (three live tests are skipped unless you set `LIVE=1`).
 
 Smoke-test the real checkers without touching Discord:
 
@@ -337,14 +338,14 @@ For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` ins
 - **Reconnects** are normal; the startup banner prints only once, and resumes are logged at INFO.
 - **Tuning latency:** `USER_WINDOW_SECONDS` controls throttling, `CHECK_TIMEOUT` controls how long a slow platform may stall a lookup, and the cache TTLs control how often names are re-fetched.
 - **Reaction ordering:** with the default `STREAM_REACTIONS=true`, emojis appear as each platform answers (fastest first). Set it to `false` if you want them batched in fixed platform order instead.
-- **Startup pre-warm:** `Pre-warmed 8/8 platform connections in 0.4s` in the log means the connection pool is hot; a lower count just means some hosts were unreachable at boot and will connect on demand.
+- **Startup pre-warm:** `Pre-warmed 9/9 platform connections in 0.4s` in the log means the connection pool is hot (the 8 platform hosts plus the fallback provider when enabled); a lower count just means some hosts were unreachable at boot and will connect on demand.
 - **Reducing load:** set `ENABLE_EXTRA_PLATFORMS=false` to check only Minecraft, guns.lol, and Discord.
 - **Updating:**
 
   ```bash
   git pull
   python -m pip install -r requirements.txt
-  for f in test_checkers test_bot test_stress test_integration; do python $f.py || break; done
+  for f in test_checkers test_bot test_stress test_integration test_audit; do python $f.py || break; done
   sudo systemctl restart multi-sniper     # or redeploy
   ```
 

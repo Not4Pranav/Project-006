@@ -99,6 +99,7 @@ python test_checkers.py           # 138 tests
 python test_bot.py                # 63 tests
 python test_stress.py             # 17 tests
 python test_integration.py        # 13 tests
+python test_audit.py              # 21 deep-audit tests (loopback servers)
 
 # 6. Run
 python bot.py
@@ -122,7 +123,7 @@ python checkers.py vortex --no-extra
 3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
 4. **Share duplicate work** — if the same username is already being checked for someone else, this message waits on that one lookup instead of starting a second (see *Busy channels* below).
 5. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
-6. **Fallback** — any platform that could not answer (blocked, rate-limited, network error) gets a second opinion from instantusername.com before it is reported as unknown.
+6. **Fallback** — any platform that could not answer (blocked, rate-limited, network error) gets a second opinion from instantusername.com before it is reported as unknown; a platform that merely *stalls* gets the second opinion hedged in parallel after 1 s, with the platform's own verdict able to overrule within a 250 ms grace window.
 7. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
 8. **Answer as results land** — the reply is posted instantly and edited as each platform reports (or, in react mode, each emoji is added the moment that platform answers). Only the ❌ / ⚠️ summary has to wait for everyone.
 9. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
@@ -204,7 +205,8 @@ GET https://api.instantusername.com/check/<service>/<username>
     -> {"available": true, "url": "..."}
 ```
 
-- It runs **only** when the platform's own check came back blocked or errored, so a healthy lookup never pays for it.
+- It runs **only** when the platform's own check came back blocked or errored — or when it stalls past 1 s, in which case the second opinion is *hedged* in parallel instead of waiting out the timeout. Either way, a healthy lookup never pays for it.
+- When the hedged second opinion answers before a slow endpoint, the platform's own verdict still overrules it within a short 250 ms grace window — first-party ground truth wins whenever it arrives in time.
 - It runs **inside the same shared deadline** — the fallback can never push an answer past the response budget.
 - It only overrides the result when it is itself definitive (`available` / `taken`). A failed fallback leaves the original honest *Unknown* in place.
 - The service catalogue is fetched from `/services.json` at startup, so platforms instantusername adds later are picked up without a code change. If that fetch fails, a built-in map is used.
@@ -287,7 +289,7 @@ Blank lines and `#` comments are ignored, duplicates are dropped, credentials co
 
 ### Big public lists: `PROXY_LIST_URL`
 
-Scraped public lists are far too large to keep in a repo (the one this bot ships with is ~169,000 entries) and go stale within hours, so they are **fetched at startup instead of stored**:
+Scraped public lists are far too large to keep in a repo (the one this bot ships with is ~169,000 entries) and go stale within hours, so they are **fetched in the background at startup instead of stored**:
 
 ```env
 # Default: the shared list. Set blank to switch remote loading off.
@@ -334,8 +336,7 @@ Three things make that possible, and they are worth knowing about before you tun
 - **File descriptors.** 1,000 concurrent sockets need 1,000 file descriptors, and the usual Linux default is 1,024.
   The bot raises its own soft limit at startup, and if the host refuses it **narrows the probe width to fit and
   says so** rather than dying with "too many open files".
-- **Chunking.** Probes are built in chunks instead of one coroutine per entry, so testing 100,000 proxies does not
-  allocate 100,000 coroutines up front. Peak memory stays flat whether the list has 1,000 entries or 169,000.
+- **Pipelining.** Probing runs through a fixed worker pool pulling from a shared cursor: only as many coroutines as the probe width ever exist (peak memory stays flat whether the list has 1,000 entries or 169,000), and one hanging proxy never stalls the batch behind it — every probe slot stays busy until the list runs out.
 
 Sizing the pool is a real trade-off, not a "bigger is better":
 
@@ -443,7 +444,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `REPLY_MENTION_AUTHOR` | `false` | Ping the requester in the reply |
 | `STREAM_REACTIONS` | `true` | Answer per platform as it reports (fastest); `false` batches |
 | `PORT` / `KEEPALIVE_PORT` | *(blank)* | Serve a health endpoint so free hosts keep the bot alive |
-| `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts at startup |
+| `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts (plus the fallback provider) at startup |
 | `INSTANTUSERNAME_FALLBACK` | `true` | Ask instantusername.com when a platform's own check fails |
 | `COALESCE_DUPLICATES` | `true` | Members asking the same name at once share one lookup |
 
@@ -476,7 +477,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `PROXY_URL` | *(blank)* | Single proxy; also joins the pool if one is configured |
 | `PROXY_URLS` | *(blank)* | Comma/newline separated pool |
 | `PROXY_FILE` | `proxies.txt` | Proxy list file loaded automatically; blank disables it |
-| `PROXY_LIST_URL` | *(shared list)* | Remote list downloaded at startup; blank disables it |
+| `PROXY_LIST_URL` | *(shared list)* | Remote list fetched in the background at startup; blank disables it |
 | `PROXY_CACHE_FILE` | `.proxy-cache.txt` | Where the downloaded list is cached |
 | `PROXY_LIST_TTL` | `21600` | Seconds before the remote list is downloaded again |
 | `PROXY_LIST_TIMEOUT` | `20` | Download timeout in seconds |
@@ -514,10 +515,11 @@ python test_checkers.py       # 138 offline tests (interpreters, request layer, 
 python test_bot.py            # 63 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 python test_integration.py    # 13 integration tests (real sockets: proxies, boot, CLI)
+python test_audit.py          # 21 deep-audit tests (bounded reads, rotation fuzz, hedge grid)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
 
-# all four suites, 231 tests, no network and no Discord token required
-for f in test_checkers test_bot test_stress test_integration; do python $f.py || break; done
+# all five suites, 252 tests, no internet and no Discord token required
+for f in test_checkers test_bot test_stress test_integration test_audit; do python $f.py || break; done
 
 python -m pyflakes *.py       # lint
 python checkers.py Notch      # manual CLI report
@@ -530,11 +532,13 @@ python checkers.py Notch      # manual CLI report
 | `proxies.py` | `ProxyPool` rotation and health, `ProxyProvider` handed to checkers |
 | `test_checkers.py` / `test_bot.py` / `test_stress.py` | Offline test suites (no network required) |
 | `test_integration.py` | End-to-end tests against real local sockets (proxy servers, list host, boot) |
+| `test_audit.py` | Adversarial audits: chunked-read correctness, ~90k-op rotation fuzz vs a reference model, a 200-case hedge timing grid, real-socket fan-out proofs |
 
-`test_integration.py` is the only suite that opens sockets. It starts real HTTP forward proxies,
-a real proxy-list host and a stand-in for `api.instantusername.com` on loopback ports, then boots an
-actual `SniperBot` through `setup_hook()` and feeds it a message — so the wiring between the modules
-is covered, not just each module in isolation. It still needs no internet and no Discord token.
+`test_integration.py` and `test_audit.py` are the suites that open sockets - always on loopback,
+never the internet. The integration suite starts real HTTP forward proxies, a real proxy-list host
+and a stand-in for `api.instantusername.com`, then boots an actual `SniperBot` through
+`setup_hook()` and feeds it a message. The audit suite adds slow/chunked loopback servers and fake
+clocks to attack the latency paths directly. Neither needs a Discord token.
 
 The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pure functions of `(status, body)`, which is why the suites can cover every platform without touching the network.
 
