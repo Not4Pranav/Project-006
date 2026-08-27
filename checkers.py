@@ -44,6 +44,8 @@ from dataclasses import dataclass
 from urllib.parse import unquote, urlencode, urlsplit
 
 import aiohttp
+import logging
+log = logging.getLogger(__name__)
 
 try:  # Playwright is optional until the DNS Robot mode is enabled.
     from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -1118,6 +1120,7 @@ async def _run_bounded(
         # Checkers already handle normal network failures. This final guard
         # isolates malformed optional configuration or unforeseen errors so one
         # platform can never cancel every result/reaction.
+        log.error("Unexpected checker exception: %s", exc)
         return _request_error(fallback.platform, fallback.emoji, exc)
 
 
