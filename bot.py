@@ -179,8 +179,11 @@ REACTION_TIMEOUT = _bounded_float(
     maximum=max(0.05, RESPONSE_BUDGET_SECONDS - 0.05))
 CHECK_TIMEOUT = _bounded_float(
     "CHECK_TIMEOUT", 3.0, minimum=0.05, maximum=RESPONSE_BUDGET_SECONDS)
-USER_MAX_CHECKS = _bounded_int("USER_MAX_CHECKS", 3, minimum=1, maximum=10_000)
-USER_WINDOW_SECONDS = max(_opt_float("USER_WINDOW_SECONDS", 60), 0.1)
+# Anti-abuse throttle. Defaults are deliberately sub-second so a member can
+# fire checks back-to-back and get availability answers instantly; the window
+# only exists to absorb genuine flood/spam bursts.
+USER_MAX_CHECKS = _bounded_int("USER_MAX_CHECKS", 5, minimum=1, maximum=10_000)
+USER_WINDOW_SECONDS = max(_opt_float("USER_WINDOW_SECONDS", 0.5), 0.01)
 RESULT_CACHE_TTL = max(_opt_float("RESULT_CACHE_TTL", 300), 0.0)
 
 # Smart cache: taken names stay available longer (they rarely free up),
@@ -570,7 +573,7 @@ class SniperBot(discord.Client):
         else:
             print(f"🧊 Proxy            : off (direct)")
         print(f"⏳ User cooldown    : {USER_MAX_CHECKS} checks / "
-              f"{USER_WINDOW_SECONDS:.0f}s")
+              f"{USER_WINDOW_SECONDS:.2f}s")
         print(f"⚡ Response budget  : {RESPONSE_BUDGET_SECONDS:.2f}s "
               f"(reaction cap {REACTION_TIMEOUT:.2f}s)")
         print(f"💾 Cache TTL        : {CACHE_TTL_AVAILABLE:.0f}s (free) / "

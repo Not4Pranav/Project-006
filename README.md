@@ -96,8 +96,8 @@ Set `DISCORD_CHECK_MODE=dnsrobot` / `account` / `account_api` / `probe` in `.env
 | `CHECK_TIMEOUT` | `3` | Per-request timeout (seconds) |
 | `RESPONSE_BUDGET_SECONDS` | `4.5` | Total check + reaction budget |
 | `REACTION_TIMEOUT` | `0.75` | Per-reaction REST call cap |
-| `USER_MAX_CHECKS` | `3` | Checks per user per window |
-| `USER_WINDOW_SECONDS` | `60` | Cooldown window |
+| `USER_MAX_CHECKS` | `5` | Checks per user per window |
+| `USER_WINDOW_SECONDS` | `0.5` | Cooldown window (sub-second by default so checks feel instant) |
 | `CACHE_TTL_TAKEN` | `600` | Cache TTL for taken names (seconds) |
 | `CACHE_TTL_AVAILABLE` | `120` | Cache TTL for available names (seconds) |
 | `ENABLE_EXTRA_PLATFORMS` | `true` | Enable GitHub/Steam/Reddit/Instagram/Twitter |
