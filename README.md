@@ -240,6 +240,23 @@ gate.example-vendor.com:7001:myuser:mypassword
 203.0.113.9:8080
 ```
 
+Check the list before you rely on it — this loads the file, validates every entry, and probes them all concurrently:
+
+```bash
+python proxies.py                     # checks proxies.txt
+python proxies.py /path/to/list.txt --timeout 8
+```
+
+```
+3 proxies loaded from proxies.txt
+
+  ✓ http://gate.example-vendor.com:7000     HTTP 200 in 412 ms
+  ✓ http://gate.example-vendor.com:7001     HTTP 200 in 388 ms
+  ✗ http://203.0.113.9:8080                 could not connect to the proxy
+
+2/3 alive.
+```
+
 `proxies.txt` is **gitignored**, so credentials never end up in a commit. Copy `proxies.txt.example` to get started, and set `PROXY_FILE=/path/to/list.txt` to read it from somewhere else (or `PROXY_FILE=` to switch the file off).
 
 Every common vendor format is accepted and normalised for you:

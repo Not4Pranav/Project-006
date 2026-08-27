@@ -161,6 +161,12 @@ cp proxies.txt.example proxies.txt
 #   203.0.113.9:8080
 ```
 
+Then verify them before going live — this validates every line and probes each proxy concurrently:
+
+```bash
+python proxies.py            # loads proxies.txt and reports which are alive
+```
+
 That file is read automatically at startup and is gitignored, so credentials never reach a commit. Point somewhere else with `PROXY_FILE=/etc/multi-sniper/proxies.txt`, or set `PROXY_FILE=` to switch it off.
 
 Formats are normalised for you — `host:port`, `host:port:user:pass`, `user:pass@host:port`, `user:pass:host:port` and full `http://` URLs all work, mixed freely in one file. Blank lines and `#` comments are ignored, duplicates dropped, bad lines skipped with a warning.

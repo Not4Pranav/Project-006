@@ -16,6 +16,8 @@
 # Blank lines and lines starting with # are ignored. Duplicates are dropped.
 # SOCKS proxies are NOT supported and will stop the bot at startup with a
 # clear message rather than silently exposing your real IP.
+#
+# Check your list any time with:   python proxies.py
 
 # gate.example-vendor.com:7000:myuser:mypassword
 # gate.example-vendor.com:7001:myuser:mypassword

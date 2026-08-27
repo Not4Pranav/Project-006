@@ -461,3 +461,109 @@ def _short_url(url: str) -> str:
 # Public alias: other modules render proxies for logs and errors with this,
 # which never reveals the credentials embedded in a proxy URL.
 short_proxy_url = _short_url
+
+
+# ---------------------------------------------------------------------------
+# CLI: verify a proxy list without starting the bot
+# ---------------------------------------------------------------------------
+
+
+async def _probe_one(session, url: str, target: str, timeout: float):
+    """Time one proxy against a real target. Returns (ok, detail)."""
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
+    started = time.monotonic()
+    try:
+        async with session.get(
+            target, proxy=url, timeout=request_timeout, allow_redirects=False,
+        ) as response:
+            elapsed = (time.monotonic() - started) * 1000
+            if response.status < 500:
+                return True, f"HTTP {response.status} in {elapsed:.0f} ms"
+            return False, f"HTTP {response.status} (proxy or target failing)"
+    except asyncio.TimeoutError:
+        return False, f"timed out after {timeout:.1f}s"
+    except aiohttp.ClientHttpProxyError as exc:
+        return False, f"proxy rejected the request: HTTP {exc.status}"
+    except aiohttp.ClientProxyConnectionError:
+        return False, "could not connect to the proxy"
+    except aiohttp.ClientError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+async def _check_list(path: str, target: str, timeout: float) -> int:
+    """Load a proxy file, validate it, and probe every entry concurrently."""
+
+    import checkers  # local import: the CLI is not on the bot's hot path
+
+    proxies = load_proxy_file(path)
+    if not proxies:
+        print(f"No usable proxies found in {path}.")
+        print("Expected one proxy per line, for example:")
+        print("    1.2.3.4:8080")
+        print("    1.2.3.4:8080:user:pass")
+        return 1
+
+    print(f"{len(proxies)} prox{'y' if len(proxies) == 1 else 'ies'} "
+          f"loaded from {path}\n")
+
+    invalid = []
+    for url in proxies:
+        error = checkers.validate_proxy_url(url)
+        if error:
+            invalid.append((url, error))
+    if invalid:
+        print("Rejected before probing:")
+        for url, error in invalid:
+            print(f"  ✗ {_short_url(url)}  {error}")
+        print()
+    usable = [u for u in proxies if not checkers.validate_proxy_url(u)]
+    if not usable:
+        return 1
+
+    print(f"Probing {target} through each proxy "
+          f"(timeout {timeout:.0f}s, all at once)...\n")
+    async with aiohttp.ClientSession() as session:
+        outcomes = await asyncio.gather(*(
+            _probe_one(session, url, target, timeout) for url in usable))
+
+    alive = 0
+    for url, (ok, detail) in zip(usable, outcomes):
+        alive += ok
+        print(f"  {'✓' if ok else '✗'} {_short_url(url):<40} {detail}")
+
+    print(f"\n{alive}/{len(usable)} alive.")
+    if alive == 0:
+        print("None of them answered. Check the credentials, the ports, and "
+              "whether your vendor allows this machine's IP.")
+        return 1
+    if alive < len(usable):
+        print("The dead ones are benched automatically at runtime after 3 "
+              "consecutive failures, so the bot will still work.")
+    return 0
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Check the proxy list the bot would use.")
+    parser.add_argument(
+        "path", nargs="?", default=DEFAULT_PROXY_FILE,
+        help=f"proxy list file (default: {DEFAULT_PROXY_FILE})")
+    parser.add_argument(
+        "--target", default="https://api.mojang.com",
+        help="URL to fetch through each proxy")
+    parser.add_argument(
+        "--timeout", type=float, default=8.0, help="seconds per probe")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
+    try:
+        return asyncio.run(_check_list(args.path, args.target, args.timeout))
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
