@@ -8,12 +8,15 @@ Run with plain Python:     python test_bot.py
 """
 
 import asyncio
+import os
+import sys
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import contextlib
 
+import aiohttp
 import discord
 
 import bot as bot_module
@@ -868,6 +871,162 @@ class TestProxyIntegration(unittest.TestCase):
         b.proxy_pool.next.return_value = "http://proxy1:8080"
         self.assertEqual(b._next_proxy(), "http://proxy1:8080")
         b.proxy_pool.next.assert_called_once()
+
+
+
+class TestProxyVerificationSearch(unittest.TestCase):
+    """The pool must reach PROXY_MIN_POOL even from a mostly-dead list."""
+
+    def setUp(self):
+        import proxies as proxies_module
+        self.proxies_module = proxies_module
+        saved = {name: getattr(bot_module, name) for name in (
+            "PROXY_MIN_POOL", "PROXY_MAX_POOL", "PROXY_VERIFY_MAX_SECONDS",
+            "PROXY_VERIFY_CONCURRENCY", "PROXY_VERIFY_TIMEOUT")}
+
+        def restore():
+            for name, value in saved.items():
+                setattr(bot_module, name, value)
+
+        self.addCleanup(restore)
+        bot_module.PROXY_MIN_POOL = 10
+        bot_module.PROXY_MAX_POOL = 25
+        bot_module.PROXY_VERIFY_MAX_SECONDS = 30.0
+        bot_module.PROXY_VERIFY_CONCURRENCY = 8
+        bot_module.PROXY_VERIFY_TIMEOUT = 1.0
+
+    def build(self, pool_urls, reserve, alive):
+        """A bot whose probes answer only for URLs in ``alive``."""
+
+        from proxies import ProxyPool, ProxyProvider
+
+        bot = bot_module.SniperBot.__new__(bot_module.SniperBot)
+        bot.http_sniper = MagicMock()
+        bot.proxy_provider = ProxyProvider(static_url=None)
+        bot.proxy_provider.pool = ProxyPool(pool_urls)
+        bot._proxy_reserve = list(reserve)
+        self.tested = []
+
+        async def fake_probe(_session, urls, *_args, **_kwargs):
+            self.tested.extend(urls)
+            return [url for url in urls if url in alive]
+
+        self.patch = patch.object(bot_module, "probe_proxies", fake_probe)
+        return bot
+
+    @staticmethod
+    def fake_session_factory():
+        """aiohttp.ClientSession stand-in whose close() is awaitable."""
+
+        session = MagicMock()
+        session.close = AsyncMock()
+        return MagicMock(return_value=session)
+
+    def run_verify(self, bot):
+        async def run():
+            with patch.object(aiohttp, "ClientSession",
+                              self.fake_session_factory()):
+                await bot._verify_proxies()
+        asyncio.run(run())
+
+    def urls(self, start, count):
+        return [f"http://10.0.{(start + i) // 256}.{(start + i) % 256}:8080"
+                for i in range(count)]
+
+    def test_search_continues_until_the_floor_is_reached(self):
+        pool_urls = self.urls(0, 25)
+        reserve = self.urls(100, 500)
+        alive = set(reserve[::40])            # ~13 working, none in the first pool
+        bot = self.build(pool_urls, reserve, alive)
+        with self.patch:
+            self.run_verify(bot)
+
+        pool = bot.proxy_provider.pool
+        self.assertGreaterEqual(pool.size, bot_module.PROXY_MIN_POOL)
+        self.assertTrue(set(pool.urls) <= alive, "a dead proxy survived")
+        self.assertGreater(len(self.tested), len(pool_urls),
+                           "the reserve was never touched")
+
+    def test_stops_at_the_maximum(self):
+        pool_urls = self.urls(0, 25)
+        reserve = self.urls(100, 500)
+        alive = set(pool_urls + reserve)      # everything works
+        bot = self.build(pool_urls, reserve, alive)
+        with self.patch:
+            self.run_verify(bot)
+        self.assertLessEqual(bot.proxy_provider.pool.size,
+                             bot_module.PROXY_MAX_POOL)
+
+    def test_exhausted_reserve_keeps_what_was_found(self):
+        pool_urls = self.urls(0, 25)
+        reserve = self.urls(100, 60)
+        alive = {reserve[0], reserve[1], pool_urls[0]}
+        bot = self.build(pool_urls, reserve, alive)
+        with self.patch:
+            self.run_verify(bot)
+
+        pool = bot.proxy_provider.pool
+        self.assertEqual(sorted(pool.urls), sorted(alive))
+        self.assertEqual(bot._proxy_reserve, [])   # searched to the end
+
+    def test_nothing_alive_keeps_the_pool_rather_than_going_direct(self):
+        pool_urls = self.urls(0, 25)
+        bot = self.build(pool_urls, self.urls(100, 100), set())
+        with self.patch:
+            self.run_verify(bot)
+
+        pool = bot.proxy_provider.pool
+        self.assertEqual(pool.size, 25)
+        self.assertEqual(pool.alive_count, 25)
+        self.assertIsNotNone(pool.next())
+
+    def test_time_budget_stops_the_search(self):
+        bot_module.PROXY_VERIFY_MAX_SECONDS = 0.25
+        pool_urls = self.urls(0, 25)
+        reserve = self.urls(100, 5000)
+        bot = self.build(pool_urls, reserve, set())
+
+        async def slow_probe(_session, urls, *_args, **_kwargs):
+            await asyncio.sleep(0.1)
+            return []
+
+        async def run():
+            with patch.object(bot_module, "probe_proxies", slow_probe), \
+                    patch.object(aiohttp, "ClientSession",
+                                 self.fake_session_factory()):
+                started = asyncio.get_running_loop().time()
+                await bot._verify_proxies()
+                return asyncio.get_running_loop().time() - started
+
+        elapsed = asyncio.run(run())
+        self.assertLess(elapsed, 5.0)
+        self.assertTrue(bot._proxy_reserve, "the whole reserve was consumed")
+
+    def test_verified_proxies_are_marked_healthy(self):
+        pool_urls = self.urls(0, 25)
+        alive = set(pool_urls[:12])
+        bot = self.build(pool_urls, [], alive)
+        with self.patch:
+            self.run_verify(bot)
+
+        pool = bot.proxy_provider.pool
+        self.assertEqual(pool.size, 12)
+        self.assertEqual(pool.alive_count, 12)
+        # Rotation hands out only survivors, and spreads across them.
+        handed_out = {pool.next() for _ in range(12)}
+        self.assertEqual(handed_out, alive)
+
+    def test_minimum_above_maximum_is_corrected_at_import(self):
+        """PROXY_MAX_POOL below PROXY_MIN_POOL is a typo, not a smaller pool."""
+
+        import subprocess
+        env = dict(os.environ, PROXY_MIN_POOL="150", PROXY_MAX_POOL="20")
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import bot; print(bot.PROXY_MIN_POOL, bot.PROXY_MAX_POOL)"],
+            capture_output=True, text=True, env=env, cwd=os.getcwd())
+        self.assertEqual(out.stdout.split(), ["150", "150"], out.stderr)
+
 
 
 if __name__ == "__main__":

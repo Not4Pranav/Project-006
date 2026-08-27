@@ -94,7 +94,7 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
 python test_checkers.py     # 134 offline tests
-python test_bot.py          # 54 pipeline tests
+python test_bot.py          # 61 pipeline tests
 python test_stress.py       # 17 stress tests
 ```
 
@@ -177,7 +177,13 @@ Formats are normalised for you — `host:port`, `host:port:user:pass`, `user:pas
 PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
 ```
 
-It is downloaded at startup, cached in `.proxy-cache.txt` for 6 hours, filtered of SOCKS-only ports, sampled down to `PROXY_MAX_POOL` (300), and probed — only proxies that actually answer end up serving traffic. Expect most of a free list to be dead; that is normal and handled.
+It is downloaded at startup, cached in `.proxy-cache.txt` for 6 hours, filtered of SOCKS-only ports, and probed — only proxies that actually answer end up serving traffic, and the bot keeps testing further batches until **`PROXY_MIN_POOL` (100) are working**, up to `PROXY_VERIFY_MAX_SECONDS` (300 s). The search runs in the background, so the bot answers messages while it works. Expect most of a free list to be dead; on a 0.74 %-alive list it found 102 working proxies in 66 seconds.
+
+To build a verified list up front instead:
+
+```bash
+python proxies.py "<list url>" --want 100 --skip-socks --keep proxies.txt
+```
 
 Environment variables work too, and are merged with the file:
 

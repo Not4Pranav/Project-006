@@ -55,6 +55,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 import time
 from collections import defaultdict, deque
 
@@ -66,7 +67,8 @@ import checkers
 from proxies import (
     DEFAULT_PROXY_CACHE, DEFAULT_PROXY_FILE, ProxyPool, ProxyProvider,
     drop_socks_ports, fetch_proxy_list, load_proxy_file, parse_proxy_list,
-    read_proxy_cache, sample_proxies, short_proxy_url, write_proxy_cache,
+    probe_proxies, read_proxy_cache, sample_proxies, short_proxy_url,
+    write_proxy_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -196,15 +198,38 @@ PROXY_LIST_TIMEOUT = _bounded_float(
 # costs memory, file descriptors and health-check time for no benefit: the
 # rotation only needs enough IPs to spread one lookup's eight requests.
 PROXY_MAX_POOL = _bounded_int("PROXY_MAX_POOL", 300, minimum=1, maximum=20_000)
+# How many *working* proxies the bot tries to end up with. Verification keeps
+# pulling fresh candidates from the list until it has this many, because a
+# public list is mostly dead and one sample of it will not be enough.
+PROXY_MIN_POOL = _bounded_int("PROXY_MIN_POOL", 100, minimum=0, maximum=20_000)
+# Wall-clock ceiling for that search. It runs in the background, so the bot is
+# already answering while it works; this only stops it hunting forever.
+PROXY_VERIFY_MAX_SECONDS = _bounded_float(
+    "PROXY_VERIFY_MAX_SECONDS", 300.0, minimum=1.0, maximum=3600.0)
+if PROXY_MAX_POOL < PROXY_MIN_POOL:
+    # A maximum below the minimum is a typo, not an instruction to keep fewer.
+    PROXY_MAX_POOL = PROXY_MIN_POOL
 # Probe every proxy once at startup and keep only the ones that answer.
 # Essential for public lists, where the large majority are already dead.
 PROXY_VERIFY_ON_START = os.getenv(
     "PROXY_VERIFY_ON_START", "true").strip().lower() in (
         "true", "1", "yes", "on", "")
+# Verification runs on its own connector, so these do not compete with live
+# lookups. Free proxies that work answer in a couple of seconds; the rest are
+# timeouts, so a wide-and-short probe finds working ones far faster than a
+# narrow-and-patient one.
 PROXY_VERIFY_CONCURRENCY = _bounded_int(
-    "PROXY_VERIFY_CONCURRENCY", 100, minimum=1, maximum=2_000)
+    "PROXY_VERIFY_CONCURRENCY", 400, minimum=1, maximum=5_000)
 PROXY_VERIFY_TIMEOUT = _bounded_float(
-    "PROXY_VERIFY_TIMEOUT", 6.0, minimum=0.5, maximum=60.0)
+    "PROXY_VERIFY_TIMEOUT", 5.0, minimum=0.5, maximum=60.0)
+# What a proxy must be able to fetch to count as working. It is deliberately
+# an HTTPS URL: every real check the bot makes is HTTPS, so a proxy that
+# cannot CONNECT is no use even if it serves plain HTTP happily.
+PROXY_PROBE_URL = os.getenv(
+    "PROXY_PROBE_URL", "https://api.mojang.com").strip() or "https://api.mojang.com"
+# The periodic sweep of the (small, already-verified) live pool stays gentle.
+PROXY_HEALTH_CONCURRENCY = _bounded_int(
+    "PROXY_HEALTH_CONCURRENCY", 50, minimum=1, maximum=1_000)
 # Skip entries on well-known SOCKS ports: aiohttp cannot speak SOCKS, so on a
 # scraped list they are just wasted probes.
 PROXY_SKIP_SOCKS_PORTS = os.getenv(
@@ -456,6 +481,9 @@ class SniperBot(discord.Client):
         self._prewarm_task: asyncio.Task | None = None
         self._services_task: asyncio.Task | None = None
         self._keepalive_runner = None
+        # Remote proxies not yet in the pool, drawn on when the verified count
+        # falls short of PROXY_MIN_POOL.
+        self._proxy_reserve: list[str] = []
         self._started_at = time.monotonic()
         self._checks_served = 0
         # on_ready fires again after every gateway resume; print once.
@@ -489,8 +517,8 @@ class SniperBot(discord.Client):
             # Background health checking, refreshed every 30s.
             self._health_task = asyncio.create_task(
                 self.proxy_pool.periodic_health_check(
-                    self.http_sniper,
-                    concurrency=PROXY_VERIFY_CONCURRENCY))
+                    self.http_sniper, PROXY_PROBE_URL,
+                    concurrency=PROXY_HEALTH_CONCURRENCY))
             # The first sweep runs in the background: awaiting it here would
             # delay the gateway login by a full probe timeout for no benefit,
             # since live traffic reports health on its own.
@@ -580,6 +608,11 @@ class SniperBot(discord.Client):
             if url not in seen:
                 seen.add(url)
                 merged.append(url)
+
+        # Everything not in the first sample stays available as a reserve, so
+        # verification can keep hunting until it has PROXY_MIN_POOL survivors.
+        self._proxy_reserve = [url for url in remote if url not in seen]
+        random.shuffle(self._proxy_reserve)
         return merged
 
     async def _verify_proxies(self) -> None:
@@ -594,25 +627,79 @@ class SniperBot(discord.Client):
         if pool is None or not pool.size:
             return
         started = time.monotonic()
-        log.info("Verifying %d proxies (%d at a time)...",
-                 pool.size, PROXY_VERIFY_CONCURRENCY)
-        alive, removed = await pool.verify(
-            self.http_sniper,
-            timeout=PROXY_VERIFY_TIMEOUT,
-            concurrency=PROXY_VERIFY_CONCURRENCY,
-        )
+        deadline = started + PROXY_VERIFY_MAX_SECONDS
+        log.info("Verifying %d proxies (%d at a time) against %s, "
+                 "aiming for %d working...",
+                 pool.size, PROXY_VERIFY_CONCURRENCY, PROXY_PROBE_URL,
+                 PROXY_MIN_POOL)
+
+        # Its own connector: hundreds of doomed proxy connections must not
+        # queue behind - or evict - the connections live lookups are using.
+        connector = aiohttp.TCPConnector(
+            limit=PROXY_VERIFY_CONCURRENCY, force_close=True,
+            enable_cleanup_closed=True)
+        session = aiohttp.ClientSession(connector=connector)
+        try:
+            working = await probe_proxies(
+                session, pool.urls, PROXY_PROBE_URL,
+                timeout=PROXY_VERIFY_TIMEOUT,
+                concurrency=PROXY_VERIFY_CONCURRENCY)
+            tested = pool.size
+
+            # A public list is mostly dead, so one sample rarely yields
+            # enough. Keep pulling fresh candidates until the target is met,
+            # the reserve runs out, or the time budget expires.
+            while (len(working) < PROXY_MIN_POOL
+                   and self._proxy_reserve
+                   and time.monotonic() < deadline):
+                hit_rate = max(len(working) / tested, 0.01) if tested else 0.05
+                wanted = PROXY_MIN_POOL - len(working)
+                batch_size = min(
+                    len(self._proxy_reserve),
+                    max(PROXY_VERIFY_CONCURRENCY, int(wanted / hit_rate) + 1),
+                    5000,
+                )
+                batch = self._proxy_reserve[:batch_size]
+                del self._proxy_reserve[:batch_size]
+                found = await probe_proxies(
+                    session, batch, PROXY_PROBE_URL,
+                    timeout=PROXY_VERIFY_TIMEOUT,
+                    concurrency=PROXY_VERIFY_CONCURRENCY)
+                tested += len(batch)
+                working.extend(found)
+                log.info("Proxy search: %d/%d working after testing %d "
+                         "(%.1f%% alive, %.0fs elapsed)",
+                         len(working), PROXY_MIN_POOL, tested,
+                         100 * len(working) / tested,
+                         time.monotonic() - started)
+        finally:
+            await session.close()
+
         elapsed = time.monotonic() - started
-        if alive:
-            log.info("Proxy check: %d alive, %d dropped, in %.1fs",
-                     alive, removed, elapsed)
-        else:
-            # Keep them: an empty pool means direct, unproxied traffic, which
-            # is exactly what proxies were configured to avoid.
+        if not working:
+            # Keep the pool: an empty pool means direct, unproxied traffic,
+            # which is exactly what proxies were configured to avoid.
             log.warning(
-                "No proxy answered in %.1fs. Keeping the pool and retrying "
-                "them live - checks may be slow until one recovers. Consider "
-                "a paid proxy provider, or set PROXY_LIST_URL to a fresher "
-                "list.", elapsed)
+                "No proxy answered out of %d tested in %.1fs. Keeping the "
+                "pool and retrying live - checks may be slow until one "
+                "recovers. Consider a paid provider, or point "
+                "PROXY_LIST_URL at a fresher list.", tested, elapsed)
+            return
+
+        keep = working[:PROXY_MAX_POOL]
+        pool.add(keep)
+        removed = pool.keep_only(keep)
+        for url in keep:
+            pool.report_success(url)
+        log.info("Proxy pool ready: %d working (tested %d, dropped %d) "
+                 "in %.1fs", pool.size, tested, removed, elapsed)
+        if len(keep) < PROXY_MIN_POOL:
+            log.warning(
+                "Only %d of the requested %d proxies are working. The list "
+                "is %s. Add known-good proxies to proxies.txt, or raise "
+                "PROXY_VERIFY_MAX_SECONDS to search longer.",
+                len(keep), PROXY_MIN_POOL,
+                "exhausted" if not self._proxy_reserve else "still being searched")
 
     async def _start_keepalive_server(self) -> None:
         """Serve a small health endpoint so free hosts keep the bot running.

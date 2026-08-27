@@ -238,6 +238,31 @@ class ProxyPool:
         await asyncio.gather(*(probe(p) for p in self._proxies))
         self._last_health_check = time.monotonic()
 
+    def add(self, urls: list[str]) -> int:
+        """Add proxies to the rotation, skipping ones already present."""
+
+        added = 0
+        for url in urls:
+            url = url.strip()
+            if url and url not in self._by_url:
+                health = ProxyHealth(url=url)
+                self._proxies.append(health)
+                self._by_url[url] = health
+                added += 1
+        return added
+
+    def keep_only(self, urls: list[str]) -> int:
+        """Restrict the pool to ``urls`` (order preserved). Returns removals."""
+
+        wanted = [u for u in urls if u in self._by_url]
+        if not wanted:
+            return 0
+        removed = len(self._proxies) - len(wanted)
+        self._proxies = [self._by_url[u] for u in wanted]
+        self._by_url = {p.url: p for p in self._proxies}
+        self._index = 0
+        return max(0, removed)
+
     async def verify(
         self,
         session: aiohttp.ClientSession,
@@ -260,26 +285,9 @@ class ProxyPool:
         if not self._proxies:
             return 0, 0
 
-        request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
-        gate = asyncio.Semaphore(max(1, concurrency))
-
-        async def probe(proxy: ProxyHealth) -> bool:
-            async with gate:
-                try:
-                    async with session.get(
-                        target_url,
-                        proxy=proxy.url,
-                        timeout=request_timeout,
-                        allow_redirects=False,
-                    ) as response:
-                        return response.status < 500
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    return False
-
-        outcomes = await asyncio.gather(*(probe(p) for p in self._proxies))
-        alive = [proxy for proxy, ok in zip(self._proxies, outcomes) if ok]
+        working = set(await probe_proxies(
+            session, self.urls, target_url, timeout, concurrency))
+        alive = [proxy for proxy in self._proxies if proxy.url in working]
         self._last_health_check = time.monotonic()
 
         if len(alive) < max(1, keep_minimum):
@@ -552,6 +560,50 @@ short_proxy_url = _short_url
 
 
 # ---------------------------------------------------------------------------
+# Probing
+# ---------------------------------------------------------------------------
+
+
+async def probe_proxies(
+    session: aiohttp.ClientSession,
+    urls: list[str],
+    target_url: str = "https://api.mojang.com",
+    timeout: float = 6.0,
+    concurrency: int = 100,
+) -> list[str]:
+    """Probe a batch of proxies and return the ones that answered.
+
+    Bounded by ``concurrency``: a public list can hold tens of thousands of
+    entries, and firing them all at once exhausts sockets rather than
+    finishing sooner. Never raises - a proxy that errors simply did not pass.
+    """
+
+    if not urls:
+        return []
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
+    gate = asyncio.Semaphore(max(1, concurrency))
+
+    async def probe(url: str) -> bool:
+        async with gate:
+            try:
+                async with session.get(
+                    target_url,
+                    proxy=url,
+                    timeout=request_timeout,
+                    allow_redirects=False,
+                ) as response:
+                    return response.status < 500
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - any failure means "unusable"
+                return False
+
+    outcomes = await asyncio.gather(*(probe(url) for url in urls))
+    return [url for url, ok in zip(urls, outcomes) if ok]
+
+
+# ---------------------------------------------------------------------------
 # Remote proxy lists
 # ---------------------------------------------------------------------------
 #
@@ -738,7 +790,8 @@ async def _load_source(source: str, timeout: float) -> list[str]:
 
 async def _check_list(path: str, target: str, timeout: float,
                       limit: int = 0, concurrency: int = 100,
-                      keep: str = "", skip_socks: bool = False) -> int:
+                      keep: str = "", skip_socks: bool = False,
+                      want: int = 0) -> int:
     """Load a proxy list, validate it, and probe every entry concurrently."""
 
     import checkers  # local import: the CLI is not on the bot's hot path
@@ -748,7 +801,14 @@ async def _check_list(path: str, target: str, timeout: float,
         proxies, dropped = drop_socks_ports(proxies)
         if dropped:
             print(f"Skipped {dropped} entries on SOCKS-only ports.")
-    if limit and len(proxies) > limit:
+    reserve: list[str] = []
+    if want and len(proxies) > want:
+        # Keep the rest in reserve: a public list is mostly dead, so reaching
+        # the target usually means testing far more than the target.
+        proxies = sample_proxies(proxies, len(proxies))
+        reserve = proxies[max(want * 20, concurrency):]
+        proxies = proxies[:max(want * 20, concurrency)]
+    elif limit and len(proxies) > limit:
         print(f"Sampling {limit} of {len(proxies)} proxies.")
         proxies = sample_proxies(proxies, limit)
     if not proxies:
@@ -784,10 +844,29 @@ async def _check_list(path: str, target: str, timeout: float,
             return await _probe_one(session, url, target, timeout)
 
     started = time.monotonic()
-    connector = aiohttp.TCPConnector(limit=max(1, concurrency) * 2)
+    connector = aiohttp.TCPConnector(
+        limit=max(1, concurrency) * 2, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
         outcomes = await asyncio.gather(*(
             probe(session, url) for url in usable))
+
+    alive_urls = [url for url, (ok, _d) in zip(usable, outcomes) if ok]
+    tested = len(usable)
+    while want and len(alive_urls) < want and reserve:
+        hit = max(len(alive_urls) / tested, 0.005)
+        batch_size = min(len(reserve),
+                         max(concurrency, int((want - len(alive_urls)) / hit)))
+        batch, reserve = reserve[:batch_size], reserve[batch_size:]
+        print(f"  ... {len(alive_urls)}/{want} found, testing "
+              f"{len(batch)} more")
+        async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(
+                    limit=max(1, concurrency) * 2, force_close=True)) as extra:
+            more = await asyncio.gather(*(probe(extra, url) for url in batch))
+        tested += len(batch)
+        alive_urls += [url for url, (ok, _d) in zip(batch, more) if ok]
+        usable = usable + batch
+        outcomes = list(outcomes) + list(more)
     elapsed = time.monotonic() - started
 
     alive_urls = []
@@ -843,6 +922,9 @@ def _main() -> int:
         "--keep", default="",
         help="write the proxies that answered to this file")
     parser.add_argument(
+        "--want", type=int, default=0,
+        help="keep testing until this many proxies work (for a big list)")
+    parser.add_argument(
         "--skip-socks", action="store_true",
         help="ignore entries on well-known SOCKS ports")
     args = parser.parse_args()
@@ -852,7 +934,7 @@ def _main() -> int:
         return asyncio.run(_check_list(
             args.path, args.target, args.timeout, limit=args.limit,
             concurrency=args.concurrency, keep=args.keep,
-            skip_socks=args.skip_socks))
+            skip_socks=args.skip_socks, want=args.want))
     except KeyboardInterrupt:
         return 130
 

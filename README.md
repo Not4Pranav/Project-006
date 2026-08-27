@@ -246,10 +246,10 @@ Check the list before you rely on it — this loads the file, validates every en
 python proxies.py                     # checks proxies.txt
 python proxies.py /path/to/list.txt --timeout 8
 python proxies.py "https://drive.google.com/file/d/<id>/view" \
-    --limit 500 --skip-socks --keep proxies.txt
+    --want 100 --skip-socks --keep proxies.txt
 ```
 
-The last form is how you distil a huge public list into a small working one: sample 500, skip SOCKS ports, probe them all, and write only the survivors to `proxies.txt`.
+The last form distils a huge public list into a working one: it keeps testing batches until **100 proxies answer**, then writes just those to `proxies.txt`. Use `--limit N` instead to test a fixed sample, and `--concurrency` to go wider.
 
 ```
 3 proxies loaded from proxies.txt
@@ -294,10 +294,24 @@ What happens on boot, in order:
 | Reuse `.proxy-cache.txt` if younger than `PROXY_LIST_TTL` (6 h) | Restarts are instant and work offline |
 | Otherwise download, then rewrite the cache | Survives the next restart even if the host goes away |
 | Drop entries on SOCKS-only ports (1080, 4145, 9050, …) | aiohttp cannot speak SOCKS — on a scraped list that is ~44% of the file, and every one would be a wasted probe |
-| Sample down to `PROXY_MAX_POOL` (300) | The rotation only needs enough IPs to spread one lookup's 8 requests; thousands cost memory, sockets and probe time for nothing. Sampling is spread across the whole file, not the first N, so it is not all one scraper's block |
-| Probe every remaining proxy once, keep only the ones that answer | Public proxies are mostly dead on arrival; without this the rotation hands out corpses and every lookup pays a timeout first |
+| Sample a first batch up to `PROXY_MAX_POOL` (300); the rest stays in reserve | The rotation only needs enough IPs to spread one lookup's 8 requests; thousands cost memory, sockets and probe time for nothing. Sampling is spread across the whole file, not the first N, so it is not all one scraper's block |
+| Probe each one, keep only what answers, **and keep pulling from the reserve until `PROXY_MIN_POOL` (100) are working** | Public proxies are mostly dead on arrival. One sample of a 1%-alive list yields about three usable proxies, so the search continues until the floor is met, the list runs out, or `PROXY_VERIFY_MAX_SECONDS` (300 s) expires |
 
-Startup verification is **pass/fail on one probe**, unlike the running rule where a proxy is only benched after 3 consecutive failures. If *nothing* answers, the pool is kept anyway and you get a loud warning — an empty pool would silently mean direct, unproxied traffic.
+Startup verification is **pass/fail on one probe**, unlike the running rule where a proxy is only benched after 3 consecutive failures. The probe is an **HTTPS** fetch (`PROXY_PROBE_URL`) because every real check is HTTPS — a proxy that cannot `CONNECT` is no use even if it serves plain HTTP happily. If *nothing* answers, the pool is kept anyway and you get a loud warning — an empty pool would silently mean direct, unproxied traffic.
+
+The search runs **in the background**: the bot answers messages while it works, using whatever is already verified. It also runs on **its own connector**, so several hundred doomed proxy connections never queue behind — or evict — the connections live lookups are using.
+
+Measured on a 20,150-entry list where only **0.74 %** were actually alive:
+
+```
+Verifying 300 proxies (400 at a time), aiming for 100 working...
+Proxy search:  40/100 working after testing  5,300 (0.8% alive,  28s)
+Proxy search:  78/100 working after testing 10,300 (0.8% alive,  54s)
+Proxy search: 102/100 working after testing 12,501 (0.8% alive,  66s)
+Proxy pool ready: 102 working (tested 12,501, dropped 298) in 66.4s
+```
+
+Every one of the 298 dead entries was dropped, and the 8 requests of a lookup then spread across 8 distinct working IPs.
 
 Measured on a 169,000-entry list (3.2 MB) with three working proxies hidden inside it:
 
@@ -430,9 +444,13 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `PROXY_LIST_TTL` | `21600` | Seconds before the remote list is downloaded again |
 | `PROXY_LIST_TIMEOUT` | `20` | Download timeout in seconds |
 | `PROXY_MAX_POOL` | `300` | Most proxies allowed in the rotation |
+| `PROXY_MIN_POOL` | `100` | Keep searching the list until this many work |
 | `PROXY_VERIFY_ON_START` | `true` | Probe once at boot and keep only what answers |
-| `PROXY_VERIFY_CONCURRENCY` | `100` | Proxies probed at the same time |
-| `PROXY_VERIFY_TIMEOUT` | `6` | Seconds allowed per verification probe |
+| `PROXY_VERIFY_CONCURRENCY` | `400` | Proxies probed at the same time (own connector) |
+| `PROXY_VERIFY_TIMEOUT` | `5` | Seconds allowed per verification probe |
+| `PROXY_VERIFY_MAX_SECONDS` | `300` | Wall-clock ceiling on the background search |
+| `PROXY_PROBE_URL` | `https://api.mojang.com` | What a proxy must be able to fetch to count |
+| `PROXY_HEALTH_CONCURRENCY` | `50` | Parallelism of the periodic 30 s sweep |
 | `PROXY_SKIP_SOCKS_PORTS` | `true` | Ignore entries on well-known SOCKS ports |
 | `PROXY_ALLOW_DIRECT_FALLBACK` | `false` | Go direct when every proxy is down (leaks the host IP) |
 
@@ -456,7 +474,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 
 ```bash
 python test_checkers.py       # 134 offline tests (interpreters, request layer, proxies, fallback)
-python test_bot.py            # 54 pipeline tests (filters, budget, cache, reply, reactions)
+python test_bot.py            # 61 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
 
