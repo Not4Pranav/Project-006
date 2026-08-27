@@ -895,7 +895,7 @@ class TestProxyVerificationSearch(unittest.TestCase):
         bot_module.PROXY_VERIFY_CONCURRENCY = 8
         bot_module.PROXY_VERIFY_TIMEOUT = 1.0
 
-    def build(self, pool_urls, reserve, alive):
+    def build(self, pool_urls, reserve, alive, curated=()):
         """A bot whose probes answer only for URLs in ``alive``."""
 
         from proxies import ProxyPool, ProxyProvider
@@ -905,6 +905,7 @@ class TestProxyVerificationSearch(unittest.TestCase):
         bot.proxy_provider = ProxyProvider(static_url=None)
         bot.proxy_provider.pool = ProxyPool(pool_urls)
         bot._proxy_reserve = list(reserve)
+        bot._curated_proxies = set(curated)
         self.tested = []
 
         async def fake_probe(_session, urls, *_args, **_kwargs):
@@ -979,6 +980,35 @@ class TestProxyVerificationSearch(unittest.TestCase):
         self.assertEqual(pool.size, 25)
         self.assertEqual(pool.alive_count, 25)
         self.assertIsNotNone(pool.next())
+
+    def test_curated_proxies_survive_a_failed_probe(self):
+        """A proxy the operator configured is never dropped by verification."""
+        curated = self.urls(0, 3)
+        remote_alive = self.urls(500, 4)
+        pool_urls = curated + self.urls(100, 20)
+        bot = self.build(pool_urls, remote_alive, set(remote_alive),
+                         curated=curated)
+        with self.patch:
+            self.run_verify(bot)
+
+        survivors = set(bot.proxy_provider.pool.urls)
+        # Not one of them answered the probe, yet all three are still here.
+        self.assertTrue(set(curated) <= survivors)
+        # The dead remote entries were dropped, the live ones promoted.
+        self.assertTrue(set(remote_alive) <= survivors)
+        self.assertEqual(survivors, set(curated) | set(remote_alive))
+
+    def test_curated_proxies_do_not_count_towards_the_floor(self):
+        """Unverified curated entries must not end the search early."""
+        curated = self.urls(0, 20)
+        bot = self.build(curated, self.urls(100, 200), set(), curated=curated)
+        with self.patch:
+            self.run_verify(bot)
+
+        # PROXY_MIN_POOL is 10 and nothing answered, so the reserve must have
+        # been searched rather than the 20 curated entries counting as "done".
+        self.assertTrue(self.tested, "the reserve was never searched")
+        self.assertGreater(len(self.tested), len(curated))
 
     def test_time_budget_stops_the_search(self):
         bot_module.PROXY_VERIFY_MAX_SECONDS = 0.25

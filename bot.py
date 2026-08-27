@@ -484,6 +484,9 @@ class SniperBot(discord.Client):
         # Remote proxies not yet in the pool, drawn on when the verified count
         # falls short of PROXY_MIN_POOL.
         self._proxy_reserve: list[str] = []
+        # Proxies from PROXY_URL / PROXY_URLS / proxies.txt: kept whatever a
+        # single probe says, because the operator chose them deliberately.
+        self._curated_proxies: set[str] = set()
         self._started_at = time.monotonic()
         self._checks_served = 0
         # on_ready fires again after every gateway resume; print once.
@@ -574,6 +577,9 @@ class SniperBot(discord.Client):
         """
 
         local = configured_proxies()
+        # Locally configured proxies are curated on purpose: they are never
+        # sampled away, never filtered, and never dropped by verification.
+        self._curated_proxies = set(local)
         if not PROXY_LIST_URL:
             return local
 
@@ -676,7 +682,23 @@ class SniperBot(discord.Client):
             await session.close()
 
         elapsed = time.monotonic() - started
-        if not working:
+
+        # A curated proxy that missed one probe is not evidence it is dead -
+        # it may simply have been busy - and the operator paid for it. Keep
+        # it, but say so.
+        curated_in_pool = [url for url in pool.urls
+                           if url in self._curated_proxies]
+        curated_failed = [url for url in curated_in_pool
+                          if url not in set(working)]
+        if curated_failed:
+            log.warning(
+                "%d configured prox%s did not answer the probe but "
+                "%s kept anyway (they were set explicitly): %s",
+                len(curated_failed), "y" if len(curated_failed) == 1 else "ies",
+                "is" if len(curated_failed) == 1 else "are",
+                ", ".join(short_proxy_url(u) for u in curated_failed[:5]))
+
+        if not working and not curated_in_pool:
             # Keep the pool: an empty pool means direct, unproxied traffic,
             # which is exactly what proxies were configured to avoid.
             log.warning(
@@ -686,19 +708,25 @@ class SniperBot(discord.Client):
                 "PROXY_LIST_URL at a fresher list.", tested, elapsed)
             return
 
-        keep = working[:PROXY_MAX_POOL]
+        # Curated first, then verified remote proxies, up to the cap.
+        keep = list(curated_in_pool)
+        for url in working:
+            if len(keep) >= PROXY_MAX_POOL:
+                break
+            if url not in self._curated_proxies:
+                keep.append(url)
         pool.add(keep)
         removed = pool.keep_only(keep)
-        for url in keep:
+        for url in working:
             pool.report_success(url)
         log.info("Proxy pool ready: %d working (tested %d, dropped %d) "
                  "in %.1fs", pool.size, tested, removed, elapsed)
-        if len(keep) < PROXY_MIN_POOL:
+        if len(working) < PROXY_MIN_POOL:
             log.warning(
                 "Only %d of the requested %d proxies are working. The list "
                 "is %s. Add known-good proxies to proxies.txt, or raise "
                 "PROXY_VERIFY_MAX_SECONDS to search longer.",
-                len(keep), PROXY_MIN_POOL,
+                len(working), PROXY_MIN_POOL,
                 "exhausted" if not self._proxy_reserve else "still being searched")
 
     async def _start_keepalive_server(self) -> None:
@@ -1351,7 +1379,7 @@ class SniperBot(discord.Client):
             return
         self._banner_shown = True
         print("=" * 62)
-        print(f"🟢 MULTI-SNIPER v2.0 ONLINE as {self.user}")
+        print(f"🟢 MULTI-SNIPER v3.0 ONLINE as {self.user}")
         print("🔒 Watching channel : "
               f"{TARGET_CHANNEL_ID if TARGET_CHANNEL_ID else 'ALL CHANNELS'}")
         if ENABLE_EXTRA_PLATFORMS:

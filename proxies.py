@@ -711,6 +711,14 @@ def write_proxy_cache(proxies: list[str],
         log.debug("Could not write the proxy cache: %s", exc)
 
 
+def shuffle_proxies(proxies: list[str], seed: int | None = None) -> list[str]:
+    """Return a shuffled copy, so "the first N" is not "one scraper's block"."""
+
+    shuffled = list(proxies)
+    random.Random(seed).shuffle(shuffled)
+    return shuffled
+
+
 def sample_proxies(proxies: list[str], limit: int,
                    seed: int | None = None) -> list[str]:
     """Take at most ``limit`` proxies, sampled evenly across the whole list.
@@ -802,15 +810,15 @@ async def _check_list(path: str, target: str, timeout: float,
         if dropped:
             print(f"Skipped {dropped} entries on SOCKS-only ports.")
     reserve: list[str] = []
-    if want and len(proxies) > want:
-        # Keep the rest in reserve: a public list is mostly dead, so reaching
-        # the target usually means testing far more than the target.
-        proxies = sample_proxies(proxies, len(proxies))
-        reserve = proxies[max(want * 20, concurrency):]
-        proxies = proxies[:max(want * 20, concurrency)]
-    elif limit and len(proxies) > limit:
+    if limit and len(proxies) > limit:
         print(f"Sampling {limit} of {len(proxies)} proxies.")
         proxies = sample_proxies(proxies, limit)
+    if want and len(proxies) > want:
+        # Test a first batch and hold the rest in reserve: reaching the target
+        # on a public list means testing far more entries than the target.
+        proxies = shuffle_proxies(proxies)
+        first = min(len(proxies), max(want * 20, concurrency))
+        proxies, reserve = proxies[:first], proxies[first:]
     if not proxies:
         print(f"No usable proxies found in {path}.")
         print("Expected one proxy per line, for example:")
@@ -838,49 +846,43 @@ async def _check_list(path: str, target: str, timeout: float,
     print(f"Probing {target} through each proxy "
           f"(timeout {timeout:.0f}s, {concurrency} at a time)...\n")
     gate = asyncio.Semaphore(max(1, concurrency))
+    results: list[tuple[str, bool, str]] = []
 
     async def probe(session, url):
         async with gate:
-            return await _probe_one(session, url, target, timeout)
+            ok, detail = await _probe_one(session, url, target, timeout)
+            results.append((url, ok, detail))
+            return ok
 
     started = time.monotonic()
     connector = aiohttp.TCPConnector(
         limit=max(1, concurrency) * 2, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
-        outcomes = await asyncio.gather(*(
-            probe(session, url) for url in usable))
+        await asyncio.gather(*(probe(session, url) for url in usable))
 
-    alive_urls = [url for url, (ok, _d) in zip(usable, outcomes) if ok]
-    tested = len(usable)
-    while want and len(alive_urls) < want and reserve:
-        hit = max(len(alive_urls) / tested, 0.005)
-        batch_size = min(len(reserve),
-                         max(concurrency, int((want - len(alive_urls)) / hit)))
-        batch, reserve = reserve[:batch_size], reserve[batch_size:]
-        print(f"  ... {len(alive_urls)}/{want} found, testing "
-              f"{len(batch)} more")
-        async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(
-                    limit=max(1, concurrency) * 2, force_close=True)) as extra:
-            more = await asyncio.gather(*(probe(extra, url) for url in batch))
-        tested += len(batch)
-        alive_urls += [url for url, (ok, _d) in zip(batch, more) if ok]
-        usable = usable + batch
-        outcomes = list(outcomes) + list(more)
+        # --want: a public list is mostly dead, so keep drawing fresh batches
+        # until the target is met or the reserve runs out.
+        while want and sum(ok for _u, ok, _d in results) < want and reserve:
+            found = sum(ok for _u, ok, _d in results)
+            hit_rate = max(found / len(results), 0.005)
+            batch_size = min(
+                len(reserve),
+                max(concurrency, int((want - found) / hit_rate)))
+            batch, reserve = reserve[:batch_size], reserve[batch_size:]
+            print(f"  ... {found}/{want} working, testing {len(batch)} more")
+            await asyncio.gather(*(probe(session, url) for url in batch))
     elapsed = time.monotonic() - started
 
-    alive_urls = []
-    quiet = len(usable) > 60
-    for url, (ok, detail) in zip(usable, outcomes):
-        if ok:
-            alive_urls.append(url)
+    alive_urls = [url for url, ok, _detail in results if ok]
+    quiet = len(results) > 60
+    for url, ok, detail in results:
         if ok or not quiet:
             print(f"  {'✓' if ok else '✗'} {_short_url(url):<40} {detail}")
     if quiet:
-        print(f"  ({len(usable) - len(alive_urls)} dead entries not listed)")
+        print(f"  ({len(results) - len(alive_urls)} dead entries not listed)")
 
     alive = len(alive_urls)
-    print(f"\n{alive}/{len(usable)} alive, checked in {elapsed:.1f}s.")
+    print(f"\n{alive}/{len(results)} alive, checked in {elapsed:.1f}s.")
 
     if keep and alive_urls:
         with open(keep, "w", encoding="utf-8") as handle:
@@ -893,9 +895,9 @@ async def _check_list(path: str, target: str, timeout: float,
         print("None of them answered. Check the credentials, the ports, and "
               "whether your vendor allows this machine's IP.")
         return 1
-    if alive < len(usable):
-        print("The dead ones are benched automatically at runtime after 3 "
-              "consecutive failures, so the bot will still work.")
+    if alive < len(results):
+        print("Dead entries are dropped at startup, and any that die later "
+              "are benched after 3 consecutive failures.")
     return 0
 
 

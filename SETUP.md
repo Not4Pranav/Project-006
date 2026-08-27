@@ -94,11 +94,12 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
 python test_checkers.py     # 134 offline tests
-python test_bot.py          # 61 pipeline tests
+python test_bot.py          # 63 pipeline tests
 python test_stress.py       # 17 stress tests
+python test_integration.py  # 12 integration tests (real local sockets)
 ```
 
-Both suites must end in `OK`. Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
+All four suites must end in `OK` (226 tests). Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
 
 Smoke-test the real checkers without touching Discord:
 
@@ -121,7 +122,7 @@ Expected startup banner:
 
 ```
 ==============================================================
-🟢 MULTI-SNIPER v2.0 ONLINE as Multi-Sniper#1234
+🟢 MULTI-SNIPER v3.0 ONLINE as Multi-Sniper#1234
 🔒 Watching channel : 123456789012345678
 🕹️ Platforms        : Minecraft | guns.lol | Discord | GitHub | Steam | Reddit | Instagram | Twitter/X
 🧊 Proxy            : off (direct)

@@ -323,7 +323,11 @@ verified 300 proxies in 0.2 s -> 3 alive, 297 dropped
 8-request lookup through the verified pool: 3 ms
 ```
 
-Anything you configure locally (`PROXY_URL`, `PROXY_URLS`, `proxies.txt`) is treated as curated: it is never sampled away and never filtered.
+Anything you configure locally (`PROXY_URL`, `PROXY_URLS`, `proxies.txt`) is treated as **curated**: it is never
+sampled away and never filtered. If startup verification cannot reach one of your own proxies it stays in the pool
+anyway and you get a warning naming it — a paid proxy that fails one probe is far more likely to be a slow handshake
+than a dead endpoint, and silently discarding what you paid for would be worse than a noisy log line. Only proxies
+pulled from a remote list are dropped when they fail to answer.
 
 ### Or via environment variables
 
@@ -474,9 +478,13 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 
 ```bash
 python test_checkers.py       # 134 offline tests (interpreters, request layer, proxies, fallback)
-python test_bot.py            # 61 pipeline tests (filters, budget, cache, reply, reactions)
+python test_bot.py            # 63 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
+python test_integration.py    # 12 integration tests (real sockets: proxies, boot, CLI)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
+
+# all four suites, 226 tests, no network and no Discord token required
+for f in test_checkers test_bot test_stress test_integration; do python $f.py || break; done
 
 python -m pyflakes *.py       # lint
 python checkers.py Notch      # manual CLI report
@@ -488,6 +496,12 @@ python checkers.py Notch      # manual CLI report
 | `checkers.py` | Per-platform checkers, pure interpreters, request layer, CLI |
 | `proxies.py` | `ProxyPool` rotation and health, `ProxyProvider` handed to checkers |
 | `test_checkers.py` / `test_bot.py` / `test_stress.py` | Offline test suites (no network required) |
+| `test_integration.py` | End-to-end tests against real local sockets (proxy servers, list host, boot) |
+
+`test_integration.py` is the only suite that opens sockets. It starts real HTTP forward proxies,
+a real proxy-list host and a stand-in for `api.instantusername.com` on loopback ports, then boots an
+actual `SniperBot` through `setup_hook()` and feeds it a message — so the wiring between the modules
+is covered, not just each module in isolation. It still needs no internet and no Discord token.
 
 The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pure functions of `(status, body)`, which is why the suites can cover every platform without touching the network.
 
