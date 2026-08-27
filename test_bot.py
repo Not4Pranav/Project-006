@@ -12,6 +12,8 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import contextlib
+
 import bot as bot_module
 import checkers
 from test_checkers import _browser_with_status, _session_with_status
@@ -44,6 +46,28 @@ def make_bot(session_status=404):
 def reactions(message):
     """The emojis the bot reacted with, in order."""
     return [call.args[0] for call in message.add_reaction.await_args_list]
+
+
+@contextlib.contextmanager
+def patch_workers(results=None, factory=None):
+    """Replace the shared worker builder used by both check paths.
+
+    ``bot.py`` has two fan-out modes (streaming and batched) that share
+    ``checkers.build_check_workers``; patching that keeps these scenarios
+    honest for whichever mode is active.
+    """
+
+    def build(*_args, **_kwargs):
+        if factory is not None:
+            return factory()
+
+        async def done(result):
+            return result
+
+        return [done(result) for result in results]
+
+    with patch.object(checkers, "build_check_workers", build):
+        yield
 
 
 class TestFilters(unittest.TestCase):
@@ -202,31 +226,25 @@ class TestReactions(unittest.TestCase):
         self.assertEqual(reactions(msg), ["⚠️"])
 
     def test_partial_outage_gets_warning_not_misleading_cross(self):
-        async def partial_results(*_args, **_kwargs):
-            return [
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
                 checkers.Result("Minecraft", "🕹️", checkers.TAKEN),
                 checkers.Result("guns.lol", "🔫", checkers.BLOCKED),
                 checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
-            ]
-
-        b = make_bot()
-        msg = make_message("vortex")
-        with patch.object(checkers, "run_all_checks", partial_results):
+        ]):
             asyncio.run(b.on_message(msg))
         self.assertEqual(reactions(msg), ["⚠️"])
         self.assertNotIn("vortex", b._cache)
 
     def test_unrecognized_status_gets_warning_and_is_not_cached(self):
-        async def malformed_results(*_args, **_kwargs):
-            return [
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
                 checkers.Result("Minecraft", "🕹️", checkers.TAKEN),
                 checkers.Result("guns.lol", "🔫", "unexpected"),
                 checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
-            ]
-
-        b = make_bot()
-        msg = make_message("vortex")
-        with patch.object(checkers, "run_all_checks", malformed_results):
+        ]):
             asyncio.run(b.on_message(msg))
         self.assertEqual(reactions(msg), ["⚠️"])
         self.assertNotIn("vortex", b._cache)
@@ -275,7 +293,9 @@ class TestCache(unittest.TestCase):
             # Only ONE round of HTTP requests for two messages.
             self.assertEqual(b.http_sniper.get.call_count, 2)  # MC + guns.lol
             # But both messages still get their reactions.
-            self.assertEqual(reactions(first), reactions(second))
+            # Streaming reacts in completion order and a cache hit reacts in
+            # platform order, so compare the emoji *sets*, not the sequence.
+            self.assertEqual(set(reactions(first)), set(reactions(second)))
         finally:
             bot_module.ENABLE_EXTRA_PLATFORMS = old_extra
 
@@ -307,6 +327,65 @@ class TestCache(unittest.TestCase):
         finally:
             bot_module.CACHE_TTL_AVAILABLE = old_available
             bot_module.CACHE_TTL_TAKEN = old_taken
+
+
+class TestStreamingReactions(unittest.TestCase):
+    """A fast free platform must not wait for a slow one."""
+
+    def test_fast_platform_reacts_before_slow_one_finishes(self):
+        order = []
+
+        async def fast():
+            order.append("fast")
+            return checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE)
+
+        async def slow():
+            await asyncio.sleep(0.25)
+            order.append("slow")
+            return checkers.Result("guns.lol", "🔫", checkers.AVAILABLE)
+
+        b = make_bot()
+        message = make_message("vortex")
+        seen_at = {}
+        original = b._react
+
+        async def timed_react(msg, emoji, timeout=None):
+            seen_at[emoji] = time.monotonic()
+            return await original(msg, emoji, timeout)
+
+        b._react = timed_react
+        started = time.monotonic()
+        with patch_workers(factory=lambda: [fast(), slow()]):
+            asyncio.run(b.on_message(message))
+
+        self.assertIn("🕹️", seen_at)
+        # The fast platform's emoji lands almost immediately, well before the
+        # 0.25s slow check completes.
+        self.assertLess(seen_at["🕹️"] - started, 0.15)
+        self.assertEqual(order, ["fast", "slow"])
+
+    def test_missing_platforms_are_reported_as_errors(self):
+        async def only_one():
+            return checkers.Result("Minecraft", "🕹️", checkers.TAKEN)
+
+        b = make_bot()
+        message = make_message("vortex")
+        with patch_workers(factory=lambda: [only_one()]):
+            asyncio.run(b.on_message(message))
+        # Nothing free and platforms missing -> honest warning, no caching.
+        self.assertEqual(reactions(message), ["⚠️"])
+        self.assertNotIn("vortex", b._cache)
+
+    def test_batched_mode_still_works(self):
+        old = bot_module.STREAM_REACTIONS
+        bot_module.STREAM_REACTIONS = False
+        try:
+            b = make_bot(404)
+            message = make_message("zxqw99182")
+            asyncio.run(b.on_message(message))
+            self.assertIn("🕹️", reactions(message))
+        finally:
+            bot_module.STREAM_REACTIONS = old
 
 
 class TestCacheBounds(unittest.TestCase):
@@ -341,12 +420,12 @@ class TestCacheBounds(unittest.TestCase):
 
 class TestLatencyBudget(unittest.TestCase):
     def test_checker_crash_still_reacts_with_warning(self):
-        async def crashes(*_args, **_kwargs):
+        async def crashes():
             raise RuntimeError("unexpected checker crash")
 
         b = make_bot()
         message = make_message("vortex")
-        with patch.object(checkers, "run_all_checks", crashes):
+        with patch_workers(factory=lambda: [crashes()]):
             asyncio.run(b.on_message(message))
         self.assertEqual(reactions(message), ["⚠️"])
 
@@ -354,9 +433,9 @@ class TestLatencyBudget(unittest.TestCase):
         old_budget = bot_module.RESPONSE_BUDGET_SECONDS
         old_reaction_timeout = bot_module.REACTION_TIMEOUT
 
-        async def ignores_its_timeout(*_args, **_kwargs):
+        async def ignores_its_timeout():
             await asyncio.sleep(0.2)
-            return []
+            return checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE)
 
         bot_module.RESPONSE_BUDGET_SECONDS = 0.05
         bot_module.REACTION_TIMEOUT = 0.01
@@ -364,7 +443,7 @@ class TestLatencyBudget(unittest.TestCase):
             b = make_bot()
             message = make_message("vortex")
             started = time.monotonic()
-            with patch.object(checkers, "run_all_checks", ignores_its_timeout):
+            with patch_workers(factory=lambda: [ignores_its_timeout()]):
                 asyncio.run(b.on_message(message))
             elapsed = time.monotonic() - started
         finally:

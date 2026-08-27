@@ -88,7 +88,7 @@ python checkers.py vortex --no-extra
 3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
 4. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
 5. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
-6. **React** — emojis are added to the original message concurrently.
+6. **React as results land** — each free platform's emoji is added the moment that platform answers. The ❌ / ⚠️ summary is the only verdict that has to wait for everyone.
 7. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
 
 Everything after step 1 shares a single response budget (4.5 s by default, hard-clamped below Discord's 5 s interaction feel), so a slow platform can never delay the reaction.
@@ -97,16 +97,31 @@ Everything after step 1 shares a single response budget (4.5 s by default, hard-
 
 ## Speed: why answers are instant
 
+**Time-to-first-reaction is the number that matters** — how long before you see *any* answer. Streaming reactions cuts it by an order of magnitude:
+
+| | First reaction | All reactions |
+|---|---|---|
+| Batched (old) | 1602 ms | 1604 ms |
+| **Streaming (default)** | **121 ms** | 1603 ms |
+
+*Measured over 8 platforms with one 1.6 s straggler; total time is still bounded by the slowest platform, but you no longer wait for it to learn the fast ones.*
+
 | Technique | Effect |
 |---|---|
-| Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency |
-| Sub-second flood guard (5 / 0.5 s) | Back-to-back checks are not throttled in practice |
+| **Streaming reactions** | Each emoji lands the instant that platform answers — a fast free result is never held hostage by a slow site |
+| Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency, not the sum |
 | Result cache | Repeat lookups answer in microseconds, zero requests |
-| TCP connection pooling + keep-alive (30 s) | No repeated TLS handshakes |
+| **Connection pre-warming** | TLS to all 8 hosts is established at startup, so the first lookup skips DNS + TCP + TLS |
+| **Bounded page reads (96 KB)** | Steam/Instagram/X markers sit at the top of the document; the rest of a multi-MB page is never downloaded |
+| **Hedged Minecraft request** | The backup Mojang endpoint starts only if the primary stalls 150 ms — one request when healthy, no doubled latency when not |
+| TCP pooling + keep-alive (30 s) | No repeated handshakes between lookups |
 | DNS cache (5 min) | No repeated resolution per check |
+| Sub-second flood guard (5 / 0.5 s) | Back-to-back checks are not throttled in practice |
 | Per-request proxy rotation | The 8 checks spread across 8 IPs instead of queueing behind one |
 | One retry on transient errors | A single connection reset does not become a ⚠️ |
-| gzip/deflate compression | Smaller page bodies for the HTML-scraped platforms |
+| gzip/deflate compression | Smaller bodies for the HTML-scraped platforms |
+
+With streaming on, emojis appear in **completion order** rather than platform order. Set `STREAM_REACTIONS=false` if you prefer the old fixed ordering.
 
 Brotli is deliberately **not** requested: aiohttp cannot decode `br` without the optional `Brotli` package, and advertising it makes real sites return bodies the bot cannot read.
 
@@ -207,6 +222,8 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `TARGET_CHANNEL_ID` | *(blank = all)* | The single channel to watch |
 | `LOG_CHANNEL_ID` | *(blank = off)* | Private channel that receives free-name hits |
 | `ENABLE_EXTRA_PLATFORMS` | `true` | Include GitHub, Steam, Reddit, Instagram, Twitter/X |
+| `STREAM_REACTIONS` | `true` | React per platform as it answers (fastest); `false` batches them |
+| `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts at startup |
 
 ### Latency and throttling
 

@@ -207,6 +207,18 @@ PROXY_ALLOW_DIRECT_FALLBACK = os.getenv(
     "PROXY_ALLOW_DIRECT_FALLBACK", "false").strip().lower() in (
         "true", "1", "yes", "on")
 
+# Stream reactions: add each platform's emoji the moment that platform
+# answers, instead of waiting for the slowest one. This is the single biggest
+# win in time-to-first-reaction. Set to false for the old batched behaviour
+# (all emojis appear at once, in platform order).
+STREAM_REACTIONS = os.getenv("STREAM_REACTIONS", "true").strip().lower() in (
+    "true", "1", "yes", "on", "")
+
+# Pre-open a pooled TLS connection to every platform host at startup so the
+# first real lookup does not pay DNS + TCP + TLS setup.
+PREWARM_CONNECTIONS = os.getenv("PREWARM_CONNECTIONS", "true").strip().lower() in (
+    "true", "1", "yes", "on", "")
+
 # Feedback emojis
 EMOJI_NONE_AVAILABLE = "❌"
 EMOJI_ALL_FAILED = "⚠️"
@@ -251,6 +263,7 @@ class SniperBot(discord.Client):
         # garbage collected mid-flight.
         self._health_task: asyncio.Task | None = None
         self._initial_health_task: asyncio.Task | None = None
+        self._prewarm_task: asyncio.Task | None = None
         # on_ready fires again after every gateway resume; print once.
         self._banner_shown = False
 
@@ -290,6 +303,10 @@ class SniperBot(discord.Client):
             self._initial_health_task = asyncio.create_task(
                 self._initial_health_check())
 
+        if PREWARM_CONNECTIONS:
+            # Background: never delay the gateway login for an optimisation.
+            self._prewarm_task = asyncio.create_task(self._prewarm())
+
         if DISCORD_CHECK_MODE == "dnsrobot":
             try:
                 proxy_for_browser = self._next_proxy()
@@ -313,6 +330,24 @@ class SniperBot(discord.Client):
 
         self.proxy_provider.pool = pool
 
+    async def _prewarm(self) -> None:
+        """Open keep-alive connections to the platform hosts up front."""
+
+        if self.http_sniper is None:
+            return
+        started = time.monotonic()
+        try:
+            warmed = await checkers.prewarm_connections(
+                self.http_sniper, self.proxy_provider)
+            log.info("Pre-warmed %d/%d platform connections in %.2fs",
+                     warmed, len(checkers.PREWARM_URLS),
+                     time.monotonic() - started)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Connection pre-warm failed: %s",
+                      checkers._redact_sensitive_text(exc))
+
     async def _initial_health_check(self) -> None:
         """Probe every proxy once at startup without blocking the login."""
 
@@ -335,7 +370,8 @@ class SniperBot(discord.Client):
 
     async def close(self) -> None:
         try:
-            for task in (self._health_task, self._initial_health_task):
+            for task in (self._health_task, self._initial_health_task,
+                         self._prewarm_task):
                 if task is None or task.done():
                     continue
                 task.cancel()
@@ -555,6 +591,124 @@ class SniperBot(discord.Client):
             return checkers.timeout_results(
                 "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS)
 
+    @staticmethod
+    def _verdict_emojis(results: list[checkers.Result]) -> list[str]:
+        """Translate normalized checker results into reaction emojis."""
+
+        available = [result for result in results if result.available]
+        if available:
+            return [result.emoji for result in available]
+        statuses = {result.status for result in results}
+        known_non_unknown = {
+            checkers.AVAILABLE, checkers.TAKEN, checkers.INVALID, checkers.SKIPPED,
+        }
+        unknown = {checkers.ERROR, checkers.BLOCKED}
+        if (not statuses or statuses - known_non_unknown
+                or statuses & unknown or statuses <= {checkers.SKIPPED}):
+            return [EMOJI_ALL_FAILED]
+        return [EMOJI_NONE_AVAILABLE]
+
+    @staticmethod
+    def _fill_missing(results: list[checkers.Result]) -> list[checkers.Result]:
+        """Add an honest ERROR for any configured platform that never answered."""
+
+        expected = (checkers.PLATFORMS if ENABLE_EXTRA_PLATFORMS
+                    else checkers.CORE_PLATFORMS)
+        seen = {result.platform for result in results}
+        by_platform = {result.platform: result for result in results}
+        ordered: list[checkers.Result] = []
+        for platform, emoji in expected:
+            if platform in seen:
+                ordered.append(by_platform[platform])
+            else:
+                ordered.append(checkers.Result(
+                    platform, emoji, checkers.ERROR, "check deadline reached"))
+        return ordered
+
+    async def _stream_checks_and_react(
+        self,
+        message: discord.Message,
+        username: str,
+        check_budget: float,
+        deadline: float,
+    ) -> list[checkers.Result]:
+        """React to each free platform the instant that platform answers.
+
+        Every check still starts simultaneously under the same shared budget;
+        the difference is that a fast platform's emoji is no longer held
+        hostage by the slowest one. Time-to-first-reaction drops from "slowest
+        check" to "fastest free check".
+        """
+
+        results: list[checkers.Result] = []
+        reaction_tasks: list[asyncio.Task] = []
+        stream = checkers.stream_all_checks(
+            self.http_sniper, username,
+            proxy=self.proxy_provider,
+            discord_mode=DISCORD_CHECK_MODE,
+            discord_probe_url=DISCORD_PROBE_URL,
+            discord_probe_headers=DISCORD_PROBE_HEADERS,
+            timeout=check_budget,
+            discord_account_api_url=DISCORD_ACCOUNT_API_URL,
+            discord_account_api_headers=DISCORD_ACCOUNT_API_HEADERS,
+            dnsrobot_browser=self.dnsrobot_browser,
+            dnsrobot_semaphore=self.dnsrobot_semaphore,
+            enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
+        )
+
+        # Hard outer bound, mirroring the batched path: a checker that ignores
+        # its own timeout must never hold the reaction past the budget.
+        results_by: object = stream.__aiter__()
+        checks_end = time.monotonic() + check_budget
+        try:
+            while True:
+                remaining_checks = checks_end - time.monotonic()
+                if remaining_checks <= 0:
+                    log.warning("Check budget exhausted with %d/%d platforms in",
+                                len(results), len(checkers.PLATFORMS))
+                    break
+                try:
+                    result = await asyncio.wait_for(
+                        results_by.__anext__(), timeout=remaining_checks)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    log.warning("Check budget reached while streaming results")
+                    break
+
+                results.append(result)
+                if not result.available:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("Skipping %r reaction: deadline exhausted",
+                                result.platform)
+                    continue
+                reaction_tasks.append(asyncio.create_task(self._react(
+                    message, result.emoji,
+                    timeout=min(REACTION_TIMEOUT, remaining))))
+        except asyncio.CancelledError:
+            for task in reaction_tasks:
+                task.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Checker stream failed: %s",
+                        checkers._redact_sensitive_text(exc))
+        finally:
+            await stream.aclose()
+
+        results = self._fill_missing(results)
+
+        # Nothing was free: the single summary emoji can only be decided once
+        # every platform has reported.
+        if not any(result.available for result in results):
+            await self._react_all(
+                message, self._verdict_emojis(results), deadline)
+
+        if reaction_tasks:
+            await asyncio.gather(*reaction_tasks, return_exceptions=True)
+        return results
+
     async def _write_hit_log(
         self,
         message: discord.Message,
@@ -632,6 +786,10 @@ class SniperBot(discord.Client):
         else:
             print("🕹️ Platforms        : Minecraft | guns.lol | "
                   f"Discord (mode: {DISCORD_CHECK_MODE})")
+        if PREWARM_CONNECTIONS:
+            # Background: never delay the gateway login for an optimisation.
+            self._prewarm_task = asyncio.create_task(self._prewarm())
+
         if DISCORD_CHECK_MODE == "dnsrobot":
             print("🌐 DNS Robot browser : "
                   f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
@@ -677,11 +835,13 @@ class SniperBot(discord.Client):
             await self._react_all(message, [EMOJI_COOLDOWN], deadline)
             return
 
-        # 5. Serve repeat lookups from cache when possible.
+        # 5. Serve repeat lookups from cache when possible. A cache hit needs
+        # no sockets at all, so it is by far the fastest path.
         cached = self._cached(username)
         if cached is not None:
-            results = cached
             log.info("cache hit for %r", username)
+            results = cached
+            await self._react_all(message, self._verdict_emojis(results), deadline)
         else:
             # Reserve time for the reaction. All checkers get this same
             # wall-clock cap, not sequential caps.
@@ -690,8 +850,18 @@ class SniperBot(discord.Client):
                 results = checkers.timeout_results(
                     "response deadline reached",
                     include_extra=ENABLE_EXTRA_PLATFORMS)
+                await self._react_all(
+                    message, self._verdict_emojis(results), deadline)
+            elif STREAM_REACTIONS:
+                # 6a. Fastest path: react to each platform as it answers.
+                results = await self._stream_checks_and_react(
+                    message, username, check_budget, deadline)
             else:
-                results = await self._run_checks_with_deadline(username, check_budget)
+                # 6b. Batched path: wait for every platform, then react.
+                results = await self._run_checks_with_deadline(
+                    username, check_budget)
+                await self._react_all(
+                    message, self._verdict_emojis(results), deadline)
 
             if self._cacheable(results):
                 self._store(username, results)
@@ -702,28 +872,9 @@ class SniperBot(discord.Client):
                 log.info("%-12s %-9s %-28s (%s)",
                          result.platform, result.status, result.detail, username)
 
-        # 6. Translate normalized checker results into reactions.
-        available = [result for result in results if result.available]
-        if available:
-            reaction_emojis = [result.emoji for result in available]
-        else:
-            statuses = {result.status for result in results}
-            known_non_unknown = {
-                checkers.AVAILABLE, checkers.TAKEN, checkers.INVALID,
-                checkers.SKIPPED,
-            }
-            unknown = {checkers.ERROR, checkers.BLOCKED}
-            if (not statuses or statuses - known_non_unknown
-                    or statuses & unknown or statuses <= {checkers.SKIPPED}):
-                reaction_emojis = [EMOJI_ALL_FAILED]
-            else:
-                reaction_emojis = [EMOJI_NONE_AVAILABLE]
-
-        # 7. The member-visible answer is complete before optional logging.
-        await self._react_all(message, reaction_emojis, deadline)
-
-        # 8. Optional private log for genuine availability hits. It is bounded
+        # 7. Optional private log for genuine availability hits. It is bounded
         # by the same deadline and never delays the member-visible reaction.
+        available = [result for result in results if result.available]
         if available and LOG_CHANNEL_ID:
             await self._write_hit_log(message, available, deadline)
 

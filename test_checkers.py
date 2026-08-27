@@ -41,6 +41,11 @@ def _session_with_status(status: int, body: str = ""):
     response = MagicMock()
     response.status = status
     response.text = AsyncMock(return_value=body)
+    # _fetch_page reads a bounded prefix off the stream instead of the whole
+    # body, so the fake response has to behave like a real streamed response.
+    response.charset = "utf-8"
+    response.content = MagicMock()
+    response.content.read = AsyncMock(return_value=body.encode("utf-8"))
     response.json = AsyncMock(
         return_value={"id": "069a79f444e94726a5befca90e38aaf5", "name": "Notch"}
         if status == 200 else {})
@@ -726,6 +731,74 @@ class TestProxyReportingAndRetries(unittest.TestCase):
             checkers.check_minecraft(session, "zxqw99182", "http://p1:8080"))
         self.assertEqual(result.status, AVAILABLE)
         self.assertEqual(session.get.call_args.kwargs["proxy"], "http://p1:8080")
+
+
+class TestSpeedPaths(unittest.TestCase):
+    """Latency optimisations must not change verdicts."""
+
+    @staticmethod
+    def run_async(coro):
+        return asyncio.run(coro)
+
+    def test_page_read_is_bounded(self):
+        """A huge page is truncated, and the marker still resolves."""
+        body = "Sorry, this page isn't available" + ("x" * 5_000_000)
+        session = _session_with_status(200, body)
+        result = self.run_async(
+            checkers.check_instagram(session, "zxqw99182"))
+        self.assertEqual(result.status, AVAILABLE)
+        # The stream read was capped rather than pulling the whole body.
+        session.get.return_value.__aenter__.return_value.content.read \
+            .assert_awaited_with(checkers.MAX_PAGE_BYTES)
+
+    def test_healthy_minecraft_primary_costs_one_request(self):
+        """The hedge must not double Mojang traffic in the normal case."""
+        session = _session_with_status(404)
+        result = self.run_async(checkers.check_minecraft(session, "zxqw99182"))
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_slow_minecraft_primary_is_hedged(self):
+        calls = []
+        ok = _session_with_status(404)
+
+        def slow_first(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("url"))
+            return ok.get(*args, **kwargs)
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=slow_first)
+        with patch.object(checkers, "MINECRAFT_HEDGE_DELAY", 0.0):
+            result = self.run_async(
+                checkers.check_minecraft(session, "zxqw99182"))
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertGreaterEqual(len(calls), 1)
+
+    def test_stream_yields_results_as_they_complete(self):
+        async def collect():
+            seen = []
+
+            async def fast():
+                return checkers.Result("GitHub", "x", AVAILABLE)
+
+            async def slow():
+                await asyncio.sleep(0.1)
+                return checkers.Result("Steam", "y", TAKEN)
+
+            with patch.object(checkers, "build_check_workers",
+                              lambda *a, **k: [slow(), fast()]):
+                async for result in checkers.stream_all_checks(None, "vortex"):
+                    seen.append(result.platform)
+            return seen
+
+        # Declared slow-first, but the fast one must arrive first.
+        self.assertEqual(self.run_async(collect()), ["GitHub", "Steam"])
+
+    def test_prewarm_never_raises(self):
+        session = MagicMock()
+        session.head = MagicMock(side_effect=aiohttp.ClientConnectionError("no"))
+        warmed = self.run_async(checkers.prewarm_connections(session))
+        self.assertEqual(warmed, 0)
 
 
 class TestTimeoutResults(unittest.TestCase):

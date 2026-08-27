@@ -38,7 +38,7 @@ import asyncio
 import re
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import unquote, urlencode, urlsplit
 
@@ -695,19 +695,40 @@ async def _fetch_json(
     return await _with_proxy(proxy, attempt)
 
 
+# Profile pages can be megabytes of JS. Every marker this bot looks for lives
+# in the first screenful of markup (title, meta, error banner), so the body is
+# read only up to this cap and the rest of the transfer is abandoned.
+MAX_PAGE_BYTES = 96 * 1024
+
+
 async def _fetch_page(
     session: aiohttp.ClientSession,
     url: str,
     proxy: object = None,
     headers: Mapping[str, str] | None = None,
+    max_bytes: int = MAX_PAGE_BYTES,
 ) -> tuple[int, str]:
-    """GET a URL and return its status and decoded HTML without redirects."""
+    """GET a URL and return its status and a bounded prefix of its HTML.
+
+    Reading a capped prefix instead of the whole body is a large latency win
+    on the page-scraped platforms (Steam, Instagram, X) and cannot change a
+    verdict: the markers are always near the top of the document.
+    """
 
     async def attempt(resolved_proxy: str | None) -> tuple[int, str]:
         async with session.get(
             url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
         ) as response:
-            return response.status, await response.text(errors="replace")
+            if max_bytes and max_bytes > 0:
+                raw = await response.content.read(max_bytes)
+                encoding = response.charset or "utf-8"
+                try:
+                    text = raw.decode(encoding, errors="replace")
+                except LookupError:  # server advertised a charset Python lacks
+                    text = raw.decode("utf-8", errors="replace")
+            else:
+                text = await response.text(errors="replace")
+            return response.status, text
 
     return await _with_proxy(proxy, attempt)
 
@@ -852,9 +873,24 @@ def _request_error(platform: str, emoji: str, exc: Exception) -> Result:
 
 # Mojang occasionally returns random 403s at api.mojang.com, so retry the
 # equivalent minecraftservices lookup once.
+# How long the primary Mojang endpoint gets before the backup is hedged in.
+MINECRAFT_HEDGE_DELAY = 0.15
+
 MINECRAFT_ENDPOINTS: Sequence[str] = (
     "https://api.mojang.com/users/profiles/minecraft/{username}",
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{username}",
+)
+
+# Hosts contacted by the checkers, used to pre-open pooled TLS connections.
+PREWARM_URLS: tuple[str, ...] = (
+    "https://api.mojang.com/",
+    "https://api.minecraftservices.com/",
+    "https://guns.lol/",
+    "https://api.github.com/",
+    "https://steamcommunity.com/",
+    "https://www.reddit.com/",
+    "https://www.instagram.com/",
+    "https://x.com/",
 )
 
 DEFAULT_DISCORD_ACCOUNT_API_URL = (
@@ -1006,8 +1042,31 @@ def _remaining_page_seconds(deadline: float) -> float:
 # Platform checkers (async)
 # ---------------------------------------------------------------------------
 
+async def _minecraft_lookup(session, template: str, username: str, proxy) -> Result:
+    """One Mojang endpoint lookup, normalized into a Result."""
+
+    try:
+        status, payload = await _fetch_json_get(
+            session, _safe_url(template, username), proxy)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Minecraft", MINECRAFT_EMOJI, exc)
+    outcome_status = interpret_minecraft(status, payload)
+    detail = f"HTTP {status}"
+    if status == 200 and outcome_status == BLOCKED:
+        detail += " (unexpected profile response)"
+    return Result("Minecraft", MINECRAFT_EMOJI, outcome_status, detail)
+
+
 async def check_minecraft(session, username: str, proxy=None) -> Result:
-    """Check Minecraft/Mojang availability (emoji 🕹️)."""
+    """Check Minecraft/Mojang availability (emoji 🕹️).
+
+    Mojang hands out sporadic 403s at api.mojang.com, so a second endpoint
+    exists as a fallback. It is issued as a *hedged* request: the backup only
+    starts if the primary has not answered within MINECRAFT_HEDGE_DELAY, and
+    the first definitive answer wins with the other cancelled. A healthy
+    primary therefore still costs exactly one request, while a slow or blocked
+    one no longer doubles this check's latency.
+    """
 
     if not MINECRAFT_PATTERN.fullmatch(username):
         return Result(
@@ -1015,25 +1074,36 @@ async def check_minecraft(session, username: str, proxy=None) -> Result:
             "name must be 3-16 chars of A-Z a-z 0-9 _",
         )
 
-    outcome: Result | None = None
-    for template in MINECRAFT_ENDPOINTS:
-        try:
-            status, payload = await _fetch_json_get(
-                session, _safe_url(template, username), proxy)
-            outcome_status = interpret_minecraft(status, payload)
-            detail = f"HTTP {status}"
-            if status == 200 and outcome_status == BLOCKED:
-                detail += " (unexpected profile response)"
-            outcome = Result(
-                "Minecraft", MINECRAFT_EMOJI,
-                outcome_status, detail,
-            )
-            if outcome.status not in (BLOCKED, ERROR):
-                return outcome
-        except _REQUEST_ERRORS as exc:
-            outcome = _request_error("Minecraft", MINECRAFT_EMOJI, exc)
+    async def hedged(template: str, delay: float):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await _minecraft_lookup(session, template, username, proxy)
 
-    return outcome or Result("Minecraft", MINECRAFT_EMOJI, ERROR, "no endpoint attempted")
+    tasks = [
+        asyncio.ensure_future(hedged(template, index * MINECRAFT_HEDGE_DELAY))
+        for index, template in enumerate(MINECRAFT_ENDPOINTS)
+    ]
+    fallback: Result | None = None
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                outcome = await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                fallback = fallback or _request_error(
+                    "Minecraft", MINECRAFT_EMOJI, exc)
+                continue
+            if outcome.status not in (BLOCKED, ERROR):
+                return outcome        # definitive: stop waiting for the rest
+            fallback = fallback or outcome
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    return fallback or Result(
+        "Minecraft", MINECRAFT_EMOJI, ERROR, "no endpoint attempted")
 
 
 async def check_gunslol(session, username: str, proxy=None) -> Result:
@@ -1438,10 +1508,10 @@ async def _run_bounded(
         return _request_error(fallback.platform, fallback.emoji, exc)
 
 
-async def run_all_checks(
+def build_check_workers(
     session: aiohttp.ClientSession,
     username: str,
-    proxy: str | None = None,
+    proxy: object = None,
     discord_mode: str = "off",
     discord_probe_url: str | None = None,
     discord_probe_headers: Mapping[str, str] | None = None,
@@ -1451,19 +1521,15 @@ async def run_all_checks(
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
-) -> list[Result]:
-    """Fan out every platform check in parallel.
+) -> list[Awaitable[Result]]:
+    """Build one bounded coroutine per configured platform, in PLATFORMS order.
 
-    ``timeout`` is a *shared wall-clock budget* for the fan-out. Every worker
-    begins at the same time, so the total duration is at most the one timeout,
-    not the sum of platform timeouts. Timed-out workers return ERROR results.
-
-    When ``enable_extra_platforms`` is True, GitHub, Steam, Reddit, Instagram,
-    and Twitter/X are also checked in parallel.
+    Nothing runs until the caller awaits or schedules them, which lets a caller
+    either gather them (ordered results) or consume them as they complete.
     """
 
     fallbacks = timeout_results()
-    workers = [
+    workers: list[Awaitable[Result]] = [
         _run_bounded(check_minecraft(session, username, proxy), fallbacks[0], timeout),
         _run_bounded(check_gunslol(session, username, proxy), fallbacks[1], timeout),
         _run_bounded(
@@ -1501,7 +1567,130 @@ async def run_all_checks(
                 check_twitter(session, username, proxy), extra_fallbacks[4], timeout),
         ])
 
+    return workers
+
+
+async def run_all_checks(
+    session: aiohttp.ClientSession,
+    username: str,
+    proxy: object = None,
+    discord_mode: str = "off",
+    discord_probe_url: str | None = None,
+    discord_probe_headers: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    discord_account_api_url: str | None = None,
+    discord_account_api_headers: Mapping[str, str] | None = None,
+    dnsrobot_browser=None,
+    dnsrobot_semaphore: asyncio.Semaphore | None = None,
+    enable_extra_platforms: bool = True,
+) -> list[Result]:
+    """Fan out every platform check in parallel and return ordered results.
+
+    ``timeout`` is a *shared wall-clock budget* for the fan-out. Every worker
+    begins at the same time, so the total duration is at most the one timeout,
+    not the sum of platform timeouts. Timed-out workers return ERROR results.
+
+    Results come back in ``PLATFORMS`` order. Use ``stream_all_checks`` when
+    you would rather act on each platform the moment it answers.
+    """
+
+    workers = build_check_workers(
+        session, username, proxy,
+        discord_mode=discord_mode,
+        discord_probe_url=discord_probe_url,
+        discord_probe_headers=discord_probe_headers,
+        timeout=timeout,
+        discord_account_api_url=discord_account_api_url,
+        discord_account_api_headers=discord_account_api_headers,
+        dnsrobot_browser=dnsrobot_browser,
+        dnsrobot_semaphore=dnsrobot_semaphore,
+        enable_extra_platforms=enable_extra_platforms,
+    )
     return list(await asyncio.gather(*workers))
+
+
+async def stream_all_checks(
+    session: aiohttp.ClientSession,
+    username: str,
+    proxy: object = None,
+    discord_mode: str = "off",
+    discord_probe_url: str | None = None,
+    discord_probe_headers: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    discord_account_api_url: str | None = None,
+    discord_account_api_headers: Mapping[str, str] | None = None,
+    dnsrobot_browser=None,
+    dnsrobot_semaphore: asyncio.Semaphore | None = None,
+    enable_extra_platforms: bool = True,
+) -> AsyncIterator[Result]:
+    """Yield each platform result the moment that platform answers.
+
+    Same parallel fan-out and same shared deadline as ``run_all_checks``, but
+    the caller does not have to wait for the slowest platform before acting on
+    the fastest one. Results arrive in completion order, not PLATFORMS order.
+    """
+
+    workers = build_check_workers(
+        session, username, proxy,
+        discord_mode=discord_mode,
+        discord_probe_url=discord_probe_url,
+        discord_probe_headers=discord_probe_headers,
+        timeout=timeout,
+        discord_account_api_url=discord_account_api_url,
+        discord_account_api_headers=discord_account_api_headers,
+        dnsrobot_browser=dnsrobot_browser,
+        dnsrobot_semaphore=dnsrobot_semaphore,
+        enable_extra_platforms=enable_extra_platforms,
+    )
+    tasks = [asyncio.ensure_future(worker) for worker in workers]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                yield await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("Checker task failed: %s", _redact_sensitive_text(exc))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
+async def prewarm_connections(
+    session: aiohttp.ClientSession,
+    proxy: object = None,
+    timeout: float = 4.0,
+) -> int:
+    """Open a pooled TLS connection to every platform host up front.
+
+    The first request to a host pays DNS + TCP + TLS (often 100-300 ms). Doing
+    that once at startup, in the background, means the first real lookup reuses
+    a warm keep-alive connection instead. Failures are ignored on purpose: this
+    is an optimisation, never a startup requirement.
+
+    Returns the number of hosts successfully warmed.
+    """
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
+
+    async def warm(url: str) -> bool:
+        try:
+            async with session.head(
+                url,
+                proxy=_resolve_proxy(proxy),
+                timeout=request_timeout,
+                allow_redirects=False,
+            ) as response:
+                response.release()
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return False
+
+    warmed = await asyncio.gather(*(warm(url) for url in PREWARM_URLS))
+    return sum(1 for ok in warmed if ok)
 
 
 # ---------------------------------------------------------------------------

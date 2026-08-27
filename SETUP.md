@@ -277,6 +277,8 @@ For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` ins
 - **Logs** print one line per platform per lookup (`Minecraft  taken  HTTP 200  (vortex)`), with credentials redacted.
 - **Reconnects** are normal; the startup banner prints only once, and resumes are logged at INFO.
 - **Tuning latency:** `USER_WINDOW_SECONDS` controls throttling, `CHECK_TIMEOUT` controls how long a slow platform may stall a lookup, and the cache TTLs control how often names are re-fetched.
+- **Reaction ordering:** with the default `STREAM_REACTIONS=true`, emojis appear as each platform answers (fastest first). Set it to `false` if you want them batched in fixed platform order instead.
+- **Startup pre-warm:** `Pre-warmed 8/8 platform connections in 0.4s` in the log means the connection pool is hot; a lower count just means some hosts were unreachable at boot and will connect on demand.
 - **Reducing load:** set `ENABLE_EXTRA_PLATFORMS=false` to check only Minecraft, guns.lol, and Discord.
 - **Updating:**
 
