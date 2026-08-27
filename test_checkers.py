@@ -965,5 +965,275 @@ class TestLiveNetwork(unittest.TestCase):
         self.assertEqual(free.status, AVAILABLE, free.detail)
 
 
+# ---------------------------------------------------------------------------
+# instantusername.com fallback provider
+# ---------------------------------------------------------------------------
+
+
+def _instant_session(status=200, payload=None, error=None, record=None):
+    """Fake session for the instantusername JSON API."""
+
+    response = MagicMock()
+    response.status = status
+    response.json = AsyncMock(return_value=payload)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=response)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+
+    def get(url, **kwargs):
+        if record is not None:
+            record.append((url, kwargs))
+        if error is not None:
+            raise error
+        return ctx
+
+    session = MagicMock()
+    session.get = MagicMock(side_effect=get)
+    return session
+
+
+class TestInstantUsernameInterpreter(unittest.TestCase):
+    def test_available_and_taken(self):
+        self.assertEqual(
+            checkers.interpret_instantusername(200, {"available": True}),
+            AVAILABLE)
+        self.assertEqual(
+            checkers.interpret_instantusername(200, {"available": False}),
+            TAKEN)
+
+    def test_rate_limit_is_blocked_not_an_answer(self):
+        for status in (401, 403, 429):
+            self.assertEqual(
+                checkers.interpret_instantusername(status, None), BLOCKED)
+
+    def test_unusable_payloads_are_errors(self):
+        junk = [None, {}, {"available": "yes"}, {"available": 1}, [], "ok",
+                {"available": None}, 42]
+        for payload in junk:
+            self.assertEqual(
+                checkers.interpret_instantusername(200, payload), ERROR,
+                repr(payload))
+
+    def test_unknown_service_and_server_errors(self):
+        self.assertEqual(
+            checkers.interpret_instantusername(404, {"available": True}), ERROR)
+        self.assertEqual(
+            checkers.interpret_instantusername(500, None), ERROR)
+
+
+class TestInstantUsernameCheck(unittest.TestCase):
+    @staticmethod
+    def run_async(coro):
+        return asyncio.run(coro)
+
+    def test_available(self):
+        calls = []
+        session = _instant_session(
+            200, {"available": True, "url": "https://github.com/x"},
+            record=calls)
+        result = self.run_async(checkers.check_instantusername(
+            session, "GitHub", "\U0001F4BB", "zxqw99182"))
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertEqual(result.platform, "GitHub")
+        self.assertEqual(
+            calls[0][0],
+            "https://api.instantusername.com/check/github/zxqw99182")
+
+    def test_taken(self):
+        session = _instant_session(200, {"available": False})
+        result = self.run_async(checkers.check_instantusername(
+            session, "Instagram", "\U0001F4F8", "instagram"))
+        self.assertEqual(result.status, TAKEN)
+
+    def test_platform_without_a_service(self):
+        session = _instant_session(200, {"available": True})
+        result = self.run_async(checkers.check_instantusername(
+            session, "guns.lol", "\U0001F52B", "vortex"))
+        self.assertEqual(result.status, ERROR)
+        self.assertIn("no instantusername service", result.detail)
+        session.get.assert_not_called()
+
+    def test_network_failure_never_raises(self):
+        session = _instant_session(error=aiohttp.ClientConnectionError("down"))
+        result = self.run_async(checkers.check_instantusername(
+            session, "Reddit", "\U0001F440", "vortex"))
+        self.assertEqual(result.status, ERROR)
+
+    def test_username_is_url_encoded(self):
+        calls = []
+        session = _instant_session(200, {"available": True}, record=calls)
+        self.run_async(checkers.check_instantusername(
+            session, "Twitter/X", "\U0001F426", "a b/c?d", proxy=None))
+        self.assertEqual(
+            calls[0][0],
+            "https://api.instantusername.com/check/twitter/a%20b%2Fc%3Fd")
+
+
+class TestInstantUsernameCatalogue(unittest.TestCase):
+    def setUp(self):
+        saved = dict(checkers.INSTANTUSERNAME_SERVICES)
+
+        def restore():
+            checkers.INSTANTUSERNAME_SERVICES.clear()
+            checkers.INSTANTUSERNAME_SERVICES.update(saved)
+
+        self.addCleanup(restore)
+
+    def test_new_services_are_learned(self):
+        payload = {"services": [
+            {"service": "Discord", "endpoint": "/check/discord/{username}"},
+            {"service": "Minecraft", "endpoint": "/check/mc-java/{username}"},
+            {"service": "Pinterest", "endpoint": "/check/pinterest/{username}"},
+        ]}
+        asyncio.run(checkers.refresh_instantusername_services(
+            _instant_session(200, payload)))
+        self.assertEqual(
+            checkers.INSTANTUSERNAME_SERVICES["Discord"], "discord")
+        self.assertEqual(
+            checkers.INSTANTUSERNAME_SERVICES["Minecraft"], "mc-java")
+        # Services we do not check must not be added.
+        self.assertNotIn("Pinterest", checkers.INSTANTUSERNAME_SERVICES)
+
+    def test_renamed_service_is_matched_by_alias(self):
+        payload = {"services": [
+            {"service": "X (Twitter)", "endpoint": "/check/x/{username}"},
+        ]}
+        asyncio.run(checkers.refresh_instantusername_services(
+            _instant_session(200, payload)))
+        self.assertEqual(
+            checkers.INSTANTUSERNAME_SERVICES["Twitter/X"], "x")
+
+    def test_junk_entries_are_ignored(self):
+        payload = {"services": [
+            None, 42, {}, {"service": "GitHub"}, {"endpoint": "/check/x/y"},
+            {"service": "GitHub", "endpoint": "nonsense"},
+            {"service": 7, "endpoint": "/check/github/{username}"},
+        ]}
+        asyncio.run(checkers.refresh_instantusername_services(
+            _instant_session(200, payload)))
+        self.assertEqual(
+            checkers.INSTANTUSERNAME_SERVICES["GitHub"], "github")
+
+    def test_outage_keeps_the_builtin_map(self):
+        for session in (_instant_session(503, None),
+                        _instant_session(200, {"services": "nope"}),
+                        _instant_session(error=asyncio.TimeoutError())):
+            asyncio.run(checkers.refresh_instantusername_services(session))
+            self.assertEqual(
+                checkers.INSTANTUSERNAME_SERVICES["Instagram"], "instagram")
+
+
+class TestFallbackWiring(unittest.TestCase):
+    """The fallback must only fire when the platform itself gave up."""
+
+    def _run(self, primary_status, fallback_status=AVAILABLE, enabled=True):
+        calls = []
+
+        async def fake_instagram(*_args, **_kwargs):
+            return checkers.Result(
+                "Instagram", "\U0001F4F8", primary_status, "primary")
+
+        async def fake_fallback(_session, platform, emoji, username,
+                                proxy=None):
+            calls.append((platform, username))
+            return checkers.Result(
+                platform, emoji, fallback_status, "instantusername")
+
+        async def run():
+            workers = checkers.build_check_workers(
+                _session_with_status(500), "vortex", timeout=2.0,
+                instantusername_fallback=enabled)
+            return await asyncio.gather(*workers)
+
+        with patch.object(checkers, "check_instagram", fake_instagram), \
+                patch.object(checkers, "check_instantusername", fake_fallback):
+            results = asyncio.run(run())
+
+        instagram = next(r for r in results if r.platform == "Instagram")
+        instagram_calls = [c for c in calls if c[0] == "Instagram"]
+        return instagram, instagram_calls
+
+    def test_blocked_primary_uses_the_fallback(self):
+        result, calls = self._run(BLOCKED)
+        self.assertEqual(result.status, AVAILABLE)
+        self.assertIn("instantusername", result.detail)
+        self.assertEqual(calls, [("Instagram", "vortex")])
+
+    def test_errored_primary_uses_the_fallback(self):
+        result, _ = self._run(ERROR)
+        self.assertEqual(result.status, AVAILABLE)
+
+    def test_fallback_can_answer_taken_too(self):
+        result, _ = self._run(BLOCKED, fallback_status=TAKEN)
+        self.assertEqual(result.status, TAKEN)
+
+    def test_definitive_primary_never_calls_the_fallback(self):
+        for status in (AVAILABLE, TAKEN, INVALID, SKIPPED):
+            result, calls = self._run(status)
+            self.assertEqual(result.status, status)
+            self.assertEqual(calls, [], status)
+
+    def test_useless_fallback_keeps_the_primary_result(self):
+        result, calls = self._run(BLOCKED, fallback_status=ERROR)
+        self.assertEqual(result.status, BLOCKED)
+        self.assertEqual(result.detail, "primary")
+        self.assertEqual(len(calls), 1)
+
+    def test_fallback_can_be_switched_off(self):
+        result, calls = self._run(BLOCKED, enabled=False)
+        self.assertEqual(result.status, BLOCKED)
+        self.assertEqual(calls, [])
+
+    def test_platforms_without_a_service_are_untouched(self):
+        called = []
+
+        async def blocked(*_args, **_kwargs):
+            return checkers.Result(
+                "guns.lol", "\U0001F52B", BLOCKED, "cloudflare")
+
+        async def fake_fallback(_session, platform, *_args, **_kwargs):
+            called.append(platform)
+            return checkers.Result(platform, "?", AVAILABLE, "x")
+
+        async def run():
+            workers = checkers.build_check_workers(
+                _session_with_status(500), "vortex", timeout=2.0)
+            return await asyncio.gather(*workers)
+
+        with patch.object(checkers, "check_gunslol", blocked), \
+                patch.object(checkers, "check_instantusername", fake_fallback):
+            results = asyncio.run(run())
+
+        gunslol = next(r for r in results if r.platform == "guns.lol")
+        self.assertEqual(gunslol.status, BLOCKED)
+        self.assertNotIn("guns.lol", called)
+        self.assertNotIn("Minecraft", called)
+
+    def test_fallback_still_respects_the_shared_deadline(self):
+        async def slow_primary(*_args, **_kwargs):
+            await asyncio.sleep(5)
+            return checkers.Result("Instagram", "\U0001F4F8", BLOCKED)
+
+        async def slow_fallback(*_args, **_kwargs):
+            await asyncio.sleep(5)
+            return checkers.Result("Instagram", "\U0001F4F8", AVAILABLE)
+
+        async def run():
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with patch.object(checkers, "check_instagram", slow_primary), \
+                    patch.object(checkers, "check_instantusername",
+                                 slow_fallback):
+                workers = checkers.build_check_workers(
+                    _session_with_status(500), "vortex", timeout=0.2)
+                results = await asyncio.gather(*workers)
+            return results, loop.time() - started
+
+        results, elapsed = asyncio.run(run())
+        self.assertLess(elapsed, 1.0)
+        instagram = next(r for r in results if r.platform == "Instagram")
+        self.assertEqual(instagram.status, ERROR)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

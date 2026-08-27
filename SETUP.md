@@ -93,9 +93,9 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 84 offline tests
+python test_checkers.py     # 105 offline tests
 python test_bot.py          # 54 pipeline tests
-python test_stress.py       # 8 stress tests
+python test_stress.py       # 17 stress tests
 ```
 
 Both suites must end in `OK`. Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).

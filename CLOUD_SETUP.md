@@ -272,6 +272,15 @@ PORT=8080
 # Free tiers are small: keep the browser mode off
 DISCORD_CHECK_MODE=off
 
+# Second opinion when a platform blocks your host's IP. Shared cloud IPs get
+# rate-limited far more often than home ones, so leave this on.
+INSTANTUSERNAME_FALLBACK=true
+
+# Busy channel? These control how many outbound connections the bot may hold.
+# On a 1 GB free instance, 200 is comfortable; drop to 50 on the smallest tiers.
+HTTP_POOL_LIMIT=200
+HTTP_POOL_LIMIT_PER_HOST=40
+
 # Lower memory / fewer outbound requests on a tiny instance
 # ENABLE_EXTRA_PLATFORMS=false
 ```
@@ -296,7 +305,7 @@ Quick health probe from anywhere:
 curl -s https://your-app.onrender.com/health
 ```
 
-`"status":"ok"` means the Discord gateway is connected. `"starting"` means the process is alive but not yet logged in.
+`"status":"ok"` means the Discord gateway is connected. `"starting"` means the process is alive but not yet logged in. The payload also reports `checks_served`, `cached_names` and `checks_in_flight`, which is the quickest way to see whether a busy channel is backing up.
 
 ---
 

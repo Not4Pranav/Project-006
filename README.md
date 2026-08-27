@@ -27,6 +27,8 @@ The reply appears **immediately** and fills in live as each platform reports. Pr
 - [Quick start](#quick-start)
 - [How a lookup works](#how-a-lookup-works)
 - [Speed: why answers are instant](#speed-why-answers-are-instant)
+- [Busy channels: many members, many usernames](#busy-channels-many-members-many-usernames)
+- [Fallback source: instantusername.com](#fallback-source-instantusernamecom)
 - [Platform status matrix](#platform-status-matrix)
 - [Proxy pool](#proxy-pool)
 - [Smart caching](#smart-caching)
@@ -116,10 +118,12 @@ python checkers.py vortex --no-extra
 1. **Filter** — bots, webhooks, wrong channels, and non-username text are dropped before any budget is spent.
 2. **Flood guard** — a sub-second token bucket per user (default: 5 checks per 0.5 s).
 3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
-4. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
-5. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
-6. **Answer as results land** — the reply is posted instantly and edited as each platform reports (or, in react mode, each emoji is added the moment that platform answers). Only the ❌ / ⚠️ summary has to wait for everyone.
-7. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
+4. **Share duplicate work** — if the same username is already being checked for someone else, this message waits on that one lookup instead of starting a second (see *Busy channels* below).
+5. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
+6. **Fallback** — any platform that could not answer (blocked, rate-limited, network error) gets a second opinion from instantusername.com before it is reported as unknown.
+7. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
+8. **Answer as results land** — the reply is posted instantly and edited as each platform reports (or, in react mode, each emoji is added the moment that platform answers). Only the ❌ / ⚠️ summary has to wait for everyone.
+9. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
 
 Everything after step 1 shares a single response budget (4.5 s by default, hard-clamped below Discord's 5 s interaction feel), so a slow platform can never delay the reaction.
 
@@ -154,6 +158,51 @@ Everything after step 1 shares a single response budget (4.5 s by default, hard-
 With streaming on, emojis appear in **completion order** rather than platform order. Set `STREAM_REACTIONS=false` if you prefer the old fixed ordering.
 
 Brotli is deliberately **not** requested: aiohttp cannot decode `br` without the optional `Brotli` package, and advertising it makes real sites return bodies the bot cannot read.
+
+---
+
+## Busy channels: many members, many usernames
+
+Every message is handled independently and answered as a reply **to that member's own message**, so a channel where twenty people paste twenty different usernames at the same second behaves exactly like twenty separate lookups — no shared result list, no cross-talk, no queue.
+
+Three things make that hold up under load:
+
+| Mechanism | What it prevents |
+|---|---|
+| **Large connection pool** (`HTTP_POOL_LIMIT`, default 200 / 40 per host) | Requests silently queueing on an exhausted pool until they blow their deadline and report *Unknown* |
+| **Duplicate coalescing** (`COALESCE_DUPLICATES`, default on) | Twelve members pasting the same name causing twelve identical fan-outs (96 requests) instead of one (8) |
+| **Per-user flood guard** | One spammer eating everyone else's budget — the token bucket is per user, never global |
+
+Measured with a local server answering each "platform" in 80 ms, one lookup = 8 requests:
+
+| Members at once | Old pool (25/10) | New pool (200/40) |
+|---|---|---|
+| 10 | 0.67 s slowest | **0.18 s** |
+| 25 | 1.65 s slowest | **0.45 s** |
+| 50 | 3.40 s slowest (over budget) | **0.87 s** |
+| 100 | 6.04 s slowest, **10 timed out** | **1.75 s, none timed out** |
+
+Duplicate coalescing is transparent: each member still gets their own reply, the lookup just runs once. If the shared lookup fails or runs out of time, the waiting messages fall back to doing the work themselves rather than reporting nothing.
+
+---
+
+## Fallback source: instantusername.com
+
+A platform check can stop working for reasons that have nothing to do with the username — Cloudflare turns on a challenge, an endpoint rate-limits the host, a site changes its markup. Rather than reporting *Unknown*, the bot asks a second source:
+
+```
+GET https://api.instantusername.com/check/<service>/<username>
+    -> {"available": true, "url": "..."}
+```
+
+- It runs **only** when the platform's own check came back blocked or errored, so a healthy lookup never pays for it.
+- It runs **inside the same shared deadline** — the fallback can never push an answer past the response budget.
+- It only overrides the result when it is itself definitive (`available` / `taken`). A failed fallback leaves the original honest *Unknown* in place.
+- The service catalogue is fetched from `/services.json` at startup, so platforms instantusername adds later are picked up without a code change. If that fetch fails, a built-in map is used.
+
+Covered by default: **GitHub, Steam, Reddit, Instagram, Twitter/X** (plus Discord and Minecraft automatically, if instantusername lists them). guns.lol has no equivalent there and is never sent.
+
+Set `INSTANTUSERNAME_FALLBACK=false` to disable the second source entirely — for example if you do not want usernames leaving your host except to the platforms themselves.
 
 ---
 
@@ -259,6 +308,8 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `STREAM_REACTIONS` | `true` | Answer per platform as it reports (fastest); `false` batches |
 | `PORT` / `KEEPALIVE_PORT` | *(blank)* | Serve a health endpoint so free hosts keep the bot alive |
 | `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts at startup |
+| `INSTANTUSERNAME_FALLBACK` | `true` | Ask instantusername.com when a platform's own check fails |
+| `COALESCE_DUPLICATES` | `true` | Members asking the same name at once share one lookup |
 
 ### Latency and throttling
 
@@ -269,6 +320,8 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `REACTION_TIMEOUT` | `0.75` | 0.05 – budget−0.05 | Cap per Discord reaction call |
 | `USER_MAX_CHECKS` | `5` | 1 – 10000 | Checks allowed per user per window |
 | `USER_WINDOW_SECONDS` | `0.5` | ≥ 0.01 | Flood-guard window — sub-second so checks feel instant |
+| `HTTP_POOL_LIMIT` | `200` | 8 – 5000 | Total outbound connections — raise it for very busy channels |
+| `HTTP_POOL_LIMIT_PER_HOST` | `40` | 2 – 1000 | Outbound connections per platform host |
 
 ### Caching
 
@@ -306,9 +359,9 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 ## Development and testing
 
 ```bash
-python test_checkers.py       # 84 offline tests (interpreters, request layer, proxies)
+python test_checkers.py       # 105 offline tests (interpreters, request layer, proxies, fallback)
 python test_bot.py            # 54 pipeline tests (filters, budget, cache, reply, reactions)
-python test_stress.py         # 8 stress tests (fuzzing, 200x concurrency, leaks)
+python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
 
 python -m pyflakes *.py       # lint

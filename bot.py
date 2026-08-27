@@ -200,6 +200,29 @@ CACHE_TTL_AVAILABLE = max(
 # Hard ceiling on cache entries so a busy server cannot grow it without bound.
 CACHE_MAX_ENTRIES = _bounded_int("CACHE_MAX_ENTRIES", 5000, 64, 1_000_000)
 
+# Outbound connection pool. Every lookup opens up to one connection per
+# platform, so a channel where a dozen members paste usernames at the same
+# moment needs a pool far larger than a single lookup does. Too small a pool
+# does not fail loudly - requests silently queue until they blow their
+# deadline and report "Unknown" - so these default generously.
+HTTP_POOL_LIMIT = _bounded_int("HTTP_POOL_LIMIT", 200, 8, 5_000)
+HTTP_POOL_LIMIT_PER_HOST = _bounded_int(
+    "HTTP_POOL_LIMIT_PER_HOST", 40, 2, 1_000)
+
+# Coalesce duplicate lookups: when several members paste the SAME username
+# while a check for it is already running, they all wait on that one check
+# instead of starting their own. Every member still gets their own reply.
+COALESCE_DUPLICATES = os.getenv(
+    "COALESCE_DUPLICATES", "true").strip().lower() in (
+        "true", "1", "yes", "on", "")
+
+# Second-opinion provider. When a platform's own endpoint stops answering
+# (Cloudflare wall, rate limit, network error) the check falls back to
+# instantusername.com instead of reporting "Unknown".
+INSTANTUSERNAME_FALLBACK = os.getenv(
+    "INSTANTUSERNAME_FALLBACK", "true").strip().lower() in (
+        "true", "1", "yes", "on", "")
+
 # Proxy behaviour when every proxy is benched. Direct fallback is OFF by
 # default: falling back would expose the host's real IP to the platforms,
 # which is usually the exact thing the proxies were configured to prevent.
@@ -333,6 +356,9 @@ class SniperBot(discord.Client):
         self._buckets: dict[int, deque[float]] = defaultdict(deque)
         # Recent results cache: {username_lower: (timestamp, [Result, ...])}
         self._cache: dict[str, tuple[float, list[checkers.Result]]] = {}
+        # Lookups running right now: {username_lower: Future[[Result, ...]]}.
+        # Two members pasting the same name at the same time share one check.
+        self._inflight: dict[str, asyncio.Future] = {}
         # Callable handed to the checkers; also collects live health reports.
         self.proxy_provider: ProxyProvider = ProxyProvider(static_url=PROXY_URL)
         # Proxy pool for rotation and failover (see the property below).
@@ -342,6 +368,7 @@ class SniperBot(discord.Client):
         self._health_task: asyncio.Task | None = None
         self._initial_health_task: asyncio.Task | None = None
         self._prewarm_task: asyncio.Task | None = None
+        self._services_task: asyncio.Task | None = None
         self._keepalive_runner = None
         self._started_at = time.monotonic()
         self._checks_served = 0
@@ -353,8 +380,8 @@ class SniperBot(discord.Client):
 
         # Optimized TCP connector for connection pooling and reuse
         connector = aiohttp.TCPConnector(
-            limit=25,                 # Total connection pool size
-            limit_per_host=10,        # Max connections per target host
+            limit=HTTP_POOL_LIMIT,           # Total connection pool size
+            limit_per_host=HTTP_POOL_LIMIT_PER_HOST,  # Per target host
             ttl_dns_cache=300,        # DNS cache for 5 minutes
             enable_cleanup_closed=True,  # Clean up closed connections
             force_close=False,        # Keep connections alive for reuse
@@ -390,6 +417,14 @@ class SniperBot(discord.Client):
         if PREWARM_CONNECTIONS:
             # Background: never delay the gateway login for an optimisation.
             self._prewarm_task = asyncio.create_task(self._prewarm())
+
+        if INSTANTUSERNAME_FALLBACK:
+            # Learn the fallback provider's live service list so platforms it
+            # adds later are picked up without a code change. Background, and
+            # harmless if it fails: a built-in map is already loaded.
+            self._services_task = asyncio.create_task(
+                checkers.refresh_instantusername_services(
+                    self.http_sniper, self._next_proxy))
 
         if DISCORD_CHECK_MODE == "dnsrobot":
             try:
@@ -432,6 +467,7 @@ class SniperBot(discord.Client):
                 "uptime_seconds": round(uptime, 1),
                 "checks_served": self._checks_served,
                 "cached_names": len(self._cache),
+                "checks_in_flight": len(self._inflight),
                 "proxies_alive": (
                     self.proxy_pool.alive_count if self.proxy_pool else 0),
             })
@@ -494,7 +530,7 @@ class SniperBot(discord.Client):
     async def close(self) -> None:
         try:
             for task in (self._health_task, self._initial_health_task,
-                         self._prewarm_task):
+                         self._prewarm_task, self._services_task):
                 if task is None or task.done():
                     continue
                 task.cancel()
@@ -697,6 +733,7 @@ class SniperBot(discord.Client):
             dnsrobot_browser=self.dnsrobot_browser,
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
+            instantusername_fallback=INSTANTUSERNAME_FALLBACK,
         ))
 
         try:
@@ -924,6 +961,7 @@ class SniperBot(discord.Client):
             dnsrobot_browser=self.dnsrobot_browser,
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
+            instantusername_fallback=INSTANTUSERNAME_FALLBACK,
         )
 
         # Hard outer bound, mirroring the batched path: a checker that ignores
@@ -1077,6 +1115,14 @@ class SniperBot(discord.Client):
             # Background: never delay the gateway login for an optimisation.
             self._prewarm_task = asyncio.create_task(self._prewarm())
 
+        if INSTANTUSERNAME_FALLBACK:
+            # Learn the fallback provider's live service list so platforms it
+            # adds later are picked up without a code change. Background, and
+            # harmless if it fails: a built-in map is already loaded.
+            self._services_task = asyncio.create_task(
+                checkers.refresh_instantusername_services(
+                    self.http_sniper, self._next_proxy))
+
         if DISCORD_CHECK_MODE == "dnsrobot":
             print("🌐 DNS Robot browser : "
                   f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
@@ -1098,9 +1144,119 @@ class SniperBot(discord.Client):
               f"{USER_WINDOW_SECONDS:.2f}s")
         print(f"⚡ Response budget  : {RESPONSE_BUDGET_SECONDS:.2f}s "
               f"(reaction cap {REACTION_TIMEOUT:.2f}s)")
+        print(f"🔁 Fallback source  : "
+              f"{'instantusername.com' if INSTANTUSERNAME_FALLBACK else 'off'}"
+              f" ({len(checkers.INSTANTUSERNAME_SERVICES)} platforms covered)")
+        print(f"🧵 Concurrency      : pool {HTTP_POOL_LIMIT} conns "
+              f"({HTTP_POOL_LIMIT_PER_HOST}/host) | duplicate lookups "
+              f"{'shared' if COALESCE_DUPLICATES else 'independent'}")
         print(f"💾 Cache TTL        : {CACHE_TTL_AVAILABLE:.0f}s (free) / "
               f"{CACHE_TTL_TAKEN:.0f}s (taken)")
         print("=" * 62)
+
+    async def _lookup(
+        self,
+        message: discord.Message,
+        username: str,
+        deadline: float,
+    ) -> list[checkers.Result]:
+        """Answer one message, sharing work with identical lookups in flight.
+
+        Lookups are otherwise fully independent: every message gets its own
+        budget, its own result list and its own reply, so any number of
+        members can ask about different usernames at the same time.
+        """
+
+        key = username.lower()
+        if COALESCE_DUPLICATES:
+            running = self._inflight.get(key)
+            if running is not None:
+                log.info("joining in-flight lookup for %r", username)
+                results = await self._await_inflight(running, deadline)
+                if results is not None:
+                    await self._publish_results(message, results, deadline)
+                    return results
+                # The leader failed or ran out of time: fall through and do
+                # the work ourselves rather than reporting nothing.
+
+        leader: asyncio.Future | None = None
+        if COALESCE_DUPLICATES and key not in self._inflight:
+            leader = asyncio.get_running_loop().create_future()
+            self._inflight[key] = leader
+
+        results: list[checkers.Result] = []
+        try:
+            results = await self._perform_lookup(message, username, deadline)
+        finally:
+            if leader is not None:
+                # Only retract our own entry; a later lookup may own it now.
+                if self._inflight.get(key) is leader:
+                    del self._inflight[key]
+                if not leader.done():
+                    # Followers copy the list: nobody should be able to mutate
+                    # another message's results.
+                    leader.set_result(list(results))
+        return results
+
+    @staticmethod
+    async def _await_inflight(
+        running: asyncio.Future,
+        deadline: float,
+    ) -> list[checkers.Result] | None:
+        """Wait for another message's identical lookup, within our budget."""
+
+        remaining = deadline - time.monotonic() - REACTION_TIMEOUT
+        if remaining <= 0:
+            return None
+        try:
+            results = await asyncio.wait_for(
+                asyncio.shield(running), timeout=remaining)
+        except asyncio.TimeoutError:
+            log.info("shared lookup did not finish inside our budget")
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.debug("shared lookup failed: %s",
+                      checkers._redact_sensitive_text(exc))
+            return None
+        return list(results) if results else None
+
+    async def _perform_lookup(
+        self,
+        message: discord.Message,
+        username: str,
+        deadline: float,
+    ) -> list[checkers.Result]:
+        """Run the platform checks for one message and publish the answer."""
+
+        # Reserve time for the reaction. All checkers get this same
+        # wall-clock cap, not sequential caps.
+        check_budget = deadline - time.monotonic() - REACTION_TIMEOUT
+        if check_budget <= 0:
+            results = checkers.timeout_results(
+                "response deadline reached",
+                include_extra=ENABLE_EXTRA_PLATFORMS)
+            await self._publish_results(message, results, deadline)
+        elif STREAM_REACTIONS:
+            # Fastest path: answer each platform as it reports.
+            results = await self._stream_checks_and_respond(
+                message, username, check_budget, deadline)
+        else:
+            # Batched path: wait for every platform, then answer once.
+            results = await self._run_checks_with_deadline(
+                username, check_budget)
+            await self._publish_results(message, results, deadline)
+
+        if self._cacheable(results):
+            self._store(username, results)
+        else:
+            log.info("not caching inconclusive results for %r", username)
+
+        for result in results:
+            log.info("%-12s %-9s %-28s (%s)",
+                     result.platform, result.status, result.detail, username)
+        return results
 
     async def on_message(self, message: discord.Message) -> None:
         """Filter -> cooldown -> parallel checks -> same-message reactions."""
@@ -1137,32 +1293,7 @@ class SniperBot(discord.Client):
             results = cached
             await self._publish_results(message, results, deadline)
         else:
-            # Reserve time for the reaction. All checkers get this same
-            # wall-clock cap, not sequential caps.
-            check_budget = deadline - time.monotonic() - REACTION_TIMEOUT
-            if check_budget <= 0:
-                results = checkers.timeout_results(
-                    "response deadline reached",
-                    include_extra=ENABLE_EXTRA_PLATFORMS)
-                await self._publish_results(message, results, deadline)
-            elif STREAM_REACTIONS:
-                # 6a. Fastest path: answer each platform as it reports.
-                results = await self._stream_checks_and_respond(
-                    message, username, check_budget, deadline)
-            else:
-                # 6b. Batched path: wait for every platform, then answer once.
-                results = await self._run_checks_with_deadline(
-                    username, check_budget)
-                await self._publish_results(message, results, deadline)
-
-            if self._cacheable(results):
-                self._store(username, results)
-            else:
-                log.info("not caching inconclusive results for %r", username)
-
-            for result in results:
-                log.info("%-12s %-9s %-28s (%s)",
-                         result.platform, result.status, result.detail, username)
+            results = await self._lookup(message, username, deadline)
 
         # 7. Optional private log for genuine availability hits. It is bounded
         # by the same deadline and never delays the member-visible reaction.

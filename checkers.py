@@ -40,7 +40,7 @@ import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
-from urllib.parse import unquote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import aiohttp
 import logging
@@ -1468,6 +1468,179 @@ async def check_twitter(session, username: str, proxy=None) -> Result:
 
 
 # ---------------------------------------------------------------------------
+# instantusername.com fallback provider
+# ---------------------------------------------------------------------------
+#
+# When a platform's own endpoint stops answering usefully - Cloudflare wall,
+# rate limit, login gate, network error - the check would otherwise report
+# "Unknown". instantusername.com exposes a small credential-free JSON API that
+# answers the same question, so it is used as a second opinion *only* for the
+# platforms that came back inconclusive.
+#
+#   GET https://api.instantusername.com/services.json
+#       -> {"services": [{"service": "GitHub",
+#                         "endpoint": "/check/github/{username}"}, ...]}
+#   GET https://api.instantusername.com/check/<service>/<username>
+#       -> {"available": true|false, "url": "..."}
+
+INSTANTUSERNAME_BASE_URL = "https://api.instantusername.com"
+INSTANTUSERNAME_SERVICES_URL = f"{INSTANTUSERNAME_BASE_URL}/services.json"
+
+# Our platform name -> their service slug. Seeded with the slugs the service
+# has shipped for years; refresh_instantusername_services() can extend this at
+# runtime from their live catalogue.
+INSTANTUSERNAME_SERVICES: dict[str, str] = {
+    "GitHub": "github",
+    "Steam": "steam",
+    "Reddit": "reddit",
+    "Instagram": "instagram",
+    "Twitter/X": "twitter",
+}
+
+# Their service names, normalized, mapped onto our platform names. Used when
+# refreshing from the live catalogue so newly added services (for example
+# Discord or Minecraft) are picked up without a code change.
+_INSTANTUSERNAME_ALIASES: dict[str, str] = {
+    "github": "GitHub",
+    "steam": "Steam",
+    "reddit": "Reddit",
+    "instagram": "Instagram",
+    "twitter": "Twitter/X",
+    "x": "Twitter/X",
+    "xtwitter": "Twitter/X",
+    "discord": "Discord",
+    "minecraft": "Minecraft",
+}
+
+
+def _normalize_service_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).casefold())
+
+
+def interpret_instantusername(status: int, payload: object | None) -> str:
+    """Map one instantusername.com check response to a normalized status."""
+
+    if status == 404:
+        # Unknown service slug: not an availability answer.
+        return ERROR
+    if status in (401, 403, 429):
+        return BLOCKED
+    if status != 200 or not isinstance(payload, Mapping):
+        return ERROR
+    available = payload.get("available")
+    if type(available) is not bool:
+        return ERROR
+    return AVAILABLE if available else TAKEN
+
+
+async def refresh_instantusername_services(
+    session: aiohttp.ClientSession,
+    proxy: object = None,
+    timeout: float = 6.0,
+) -> int:
+    """Learn the live service catalogue so new platforms map automatically.
+
+    Failure is not an error: the seeded map keeps working. Returns how many
+    of our platforms are currently covered.
+    """
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
+    try:
+        async with session.get(
+            INSTANTUSERNAME_SERVICES_URL,
+            proxy=_resolve_proxy(proxy),
+            timeout=request_timeout,
+            headers=API_HEADERS,
+        ) as response:
+            if response.status != 200:
+                return len(INSTANTUSERNAME_SERVICES)
+            payload = await _read_json_body(response)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.debug("instantusername catalogue unavailable: %s",
+                  _redact_sensitive_text(exc))
+        return len(INSTANTUSERNAME_SERVICES)
+
+    services = payload.get("services") if isinstance(payload, Mapping) else None
+    if not isinstance(services, Sequence):
+        return len(INSTANTUSERNAME_SERVICES)
+
+    known = {name for name, _emoji in PLATFORMS}
+    for entry in services:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_name = entry.get("service")
+        endpoint = entry.get("endpoint")
+        if not isinstance(raw_name, str) or not isinstance(endpoint, str):
+            continue
+        platform = _INSTANTUSERNAME_ALIASES.get(_normalize_service_name(raw_name))
+        if platform not in known:
+            continue
+        # "/check/github/{username}" -> "github"
+        parts = [part for part in endpoint.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "check":
+            INSTANTUSERNAME_SERVICES[platform] = parts[1]
+
+    return len(INSTANTUSERNAME_SERVICES)
+
+
+async def check_instantusername(
+    session: aiohttp.ClientSession,
+    platform: str,
+    emoji: str,
+    username: str,
+    proxy: object = None,
+) -> Result:
+    """Ask instantusername.com about one platform. Never raises."""
+
+    service = INSTANTUSERNAME_SERVICES.get(platform)
+    if not service:
+        return Result(platform, emoji, ERROR, "no instantusername service")
+    try:
+        url = (f"{INSTANTUSERNAME_BASE_URL}/check/"
+               f"{quote(service, safe='')}/{quote(username, safe='')}")
+        status, payload = await _fetch_json_get(
+            session, url, proxy, headers=API_HEADERS)
+    except _REQUEST_ERRORS as exc:
+        return Result(platform, emoji, ERROR,
+                      f"instantusername: {_redact_sensitive_text(exc)}")
+    outcome = interpret_instantusername(status, payload)
+    return Result(platform, emoji, outcome,
+                  f"instantusername HTTP {status}")
+
+
+async def _with_fallback(
+    primary,
+    session: aiohttp.ClientSession,
+    platform: str,
+    emoji: str,
+    username: str,
+    proxy: object = None,
+) -> Result:
+    """Run a platform's own check, then a second opinion if it was useless.
+
+    The fallback only runs when the primary could not answer (BLOCKED/ERROR),
+    so the fast path costs nothing extra, and it only replaces the result when
+    the fallback is itself definitive.
+    """
+
+    result = await primary
+    if result.status not in (BLOCKED, ERROR):
+        return result
+    if platform not in INSTANTUSERNAME_SERVICES:
+        return result
+
+    fallback = await check_instantusername(
+        session, platform, emoji, username, proxy)
+    if fallback.status in (AVAILABLE, TAKEN):
+        log.info("%s: primary was %s, instantusername says %s",
+                 platform, result.status, fallback.status)
+        return fallback
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Parallel fan-out and deadline support
 # ---------------------------------------------------------------------------
 
@@ -1521,18 +1694,33 @@ def build_check_workers(
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
+    instantusername_fallback: bool = True,
 ) -> list[Awaitable[Result]]:
     """Build one bounded coroutine per configured platform, in PLATFORMS order.
 
     Nothing runs until the caller awaits or schedules them, which lets a caller
     either gather them (ordered results) or consume them as they complete.
+
+    Each worker is independent and holds no shared mutable state, so any number
+    of lookups (different users, different usernames) can run at the same time.
     """
 
     fallbacks = timeout_results()
+
+    def bounded(coro, deadline_result: Result) -> Awaitable[Result]:
+        """Attach the instantusername second opinion, then the deadline."""
+
+        if (instantusername_fallback
+                and deadline_result.platform in INSTANTUSERNAME_SERVICES):
+            coro = _with_fallback(
+                coro, session, deadline_result.platform,
+                deadline_result.emoji, username, proxy)
+        return _run_bounded(coro, deadline_result, timeout)
+
     workers: list[Awaitable[Result]] = [
-        _run_bounded(check_minecraft(session, username, proxy), fallbacks[0], timeout),
-        _run_bounded(check_gunslol(session, username, proxy), fallbacks[1], timeout),
-        _run_bounded(
+        bounded(check_minecraft(session, username, proxy), fallbacks[0]),
+        bounded(check_gunslol(session, username, proxy), fallbacks[1]),
+        bounded(
             check_discord(
                 session,
                 username,
@@ -1546,7 +1734,7 @@ def build_check_workers(
                 dnsrobot_semaphore=dnsrobot_semaphore,
                 dnsrobot_timeout=timeout,
             ),
-            fallbacks[2], timeout,
+            fallbacks[2],
         ),
     ]
 
@@ -1555,16 +1743,11 @@ def build_check_workers(
             Result(p, e, ERROR, "check deadline reached") for p, e in FAST_PLATFORMS
         ]
         workers.extend([
-            _run_bounded(
-                check_github(session, username, proxy), extra_fallbacks[0], timeout),
-            _run_bounded(
-                check_steam(session, username, proxy), extra_fallbacks[1], timeout),
-            _run_bounded(
-                check_reddit(session, username, proxy), extra_fallbacks[2], timeout),
-            _run_bounded(
-                check_instagram(session, username, proxy), extra_fallbacks[3], timeout),
-            _run_bounded(
-                check_twitter(session, username, proxy), extra_fallbacks[4], timeout),
+            bounded(check_github(session, username, proxy), extra_fallbacks[0]),
+            bounded(check_steam(session, username, proxy), extra_fallbacks[1]),
+            bounded(check_reddit(session, username, proxy), extra_fallbacks[2]),
+            bounded(check_instagram(session, username, proxy), extra_fallbacks[3]),
+            bounded(check_twitter(session, username, proxy), extra_fallbacks[4]),
         ])
 
     return workers
@@ -1583,6 +1766,7 @@ async def run_all_checks(
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
+    instantusername_fallback: bool = True,
 ) -> list[Result]:
     """Fan out every platform check in parallel and return ordered results.
 
@@ -1605,6 +1789,7 @@ async def run_all_checks(
         dnsrobot_browser=dnsrobot_browser,
         dnsrobot_semaphore=dnsrobot_semaphore,
         enable_extra_platforms=enable_extra_platforms,
+        instantusername_fallback=instantusername_fallback,
     )
     return list(await asyncio.gather(*workers))
 
@@ -1622,6 +1807,7 @@ async def stream_all_checks(
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
+    instantusername_fallback: bool = True,
 ) -> AsyncIterator[Result]:
     """Yield each platform result the moment that platform answers.
 
@@ -1641,6 +1827,7 @@ async def stream_all_checks(
         dnsrobot_browser=dnsrobot_browser,
         dnsrobot_semaphore=dnsrobot_semaphore,
         enable_extra_platforms=enable_extra_platforms,
+        instantusername_fallback=instantusername_fallback,
     )
     tasks = [asyncio.ensure_future(worker) for worker in workers]
     try:
