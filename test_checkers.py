@@ -22,6 +22,9 @@ from checkers import (
     INVALID,
     SKIPPED,
     TAKEN,
+    interpret_discord_account_api,
+    interpret_discord_dnsrobot,
+    interpret_discord_dnsrobot_page,
     interpret_discord_probe,
     interpret_gunslol,
     interpret_minecraft,
@@ -33,12 +36,43 @@ def _session_with_status(status: int, body: str = ""):
     response = MagicMock()
     response.status = status
     response.text = AsyncMock(return_value=body)
+    response.json = AsyncMock(
+        return_value={"id": "069a79f444e94726a5befca90e38aaf5", "name": "Notch"}
+        if status == 200 else {})
     ctx = MagicMock()
     ctx.__aenter__ = AsyncMock(return_value=response)
     ctx.__aexit__ = AsyncMock(return_value=False)
     session = MagicMock()
     session.get = MagicMock(return_value=ctx)
     return session
+
+
+def _session_with_json(status: int, payload):
+    """Fake aiohttp session whose POST yields a JSON account-api response."""
+    response = MagicMock()
+    response.status = status
+    response.json = AsyncMock(return_value=payload)
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(return_value=response)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.post = MagicMock(return_value=ctx)
+    return session
+
+
+def _browser_with_status(status):
+    """Fake Playwright browser whose rendered Discord card has ``status``."""
+    page = MagicMock()
+    page.url = "https://dnsrobot.net/username-checker?u=vortex"
+    page.goto = AsyncMock()
+    page.wait_for_function = AsyncMock()
+    page.evaluate = AsyncMock(return_value=status)
+    context = MagicMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.close = AsyncMock()
+    browser = MagicMock()
+    browser.new_context = AsyncMock(return_value=context)
+    return browser, page, context
 
 
 class TestInterpreters(unittest.TestCase):
@@ -49,9 +83,14 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_minecraft(400), INVALID)    # bad name
         self.assertEqual(interpret_minecraft(429), BLOCKED)    # rate limited
         self.assertEqual(interpret_minecraft(500), ERROR)
+        self.assertEqual(interpret_minecraft(200, {"id": "uuid", "name": "Notch"}), TAKEN)
+        self.assertEqual(interpret_minecraft(200, {"message": "challenge"}), BLOCKED)
+        self.assertEqual(interpret_minecraft(200, {"id": "", "name": "Notch"}), BLOCKED)
 
     def test_gunslol(self):
         self.assertEqual(interpret_gunslol(200), TAKEN)
+        self.assertEqual(interpret_gunslol(200, ""), BLOCKED)
+        self.assertEqual(interpret_gunslol(200, 123), BLOCKED)
         self.assertEqual(interpret_gunslol(404), AVAILABLE)
         self.assertEqual(interpret_gunslol(410), AVAILABLE)
         self.assertEqual(interpret_gunslol(403), BLOCKED)      # Cloudflare
@@ -77,6 +116,43 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_discord_probe(401), BLOCKED)
         self.assertEqual(interpret_discord_probe(403), BLOCKED)
         self.assertEqual(interpret_discord_probe(429), BLOCKED)
+
+    def test_discord_account_api(self):
+        self.assertEqual(interpret_discord_account_api(200, {"taken": True}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(200, {"taken": False}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(200, {"available": True}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(200, {"available": False}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"taken": False, "available": True}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"taken": False, "available": False}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"taken": "false"}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 2}}}), AVAILABLE)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 3}}}), TAKEN)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": False}}}), ERROR)
+        self.assertEqual(interpret_discord_account_api(
+            200, {"data": {"check": {"status": 2.0}}}), ERROR)
+        self.assertEqual(interpret_discord_account_api(403, {"taken": False}), BLOCKED)
+        self.assertEqual(interpret_discord_account_api(200, {}), ERROR)
+
+    def test_discord_dnsrobot_page_is_strict(self):
+        self.assertEqual(interpret_discord_dnsrobot_page("Available"), AVAILABLE)
+        self.assertEqual(interpret_discord_dnsrobot_page("Taken"), TAKEN)
+        self.assertEqual(interpret_discord_dnsrobot_page("Rate limited"), BLOCKED)
+        self.assertEqual(interpret_discord_dnsrobot_page("Unknown"), BLOCKED)
+        self.assertEqual(interpret_discord_dnsrobot_page("Pending"), BLOCKED)
+        self.assertEqual(interpret_discord_dnsrobot_page("Unexpected"), ERROR)
+        self.assertEqual(interpret_discord_dnsrobot_page(None), ERROR)
+
+    def test_discord_dnsrobot_network_contract_remains_strict_for_diagnostics(self):
+        self.assertEqual(interpret_discord_dnsrobot(200, {"taken": False}), AVAILABLE)
+        self.assertEqual(interpret_discord_dnsrobot(200, {"taken": True}), TAKEN)
+        self.assertEqual(interpret_discord_dnsrobot(403, {"taken": False}), BLOCKED)
+        self.assertEqual(interpret_discord_dnsrobot(200, {"status": "available"}), ERROR)
 
 
 class TestValidators(unittest.TestCase):
@@ -107,12 +183,46 @@ class TestValidators(unittest.TestCase):
                                                         "PROXY_URL"))
         self.assertIn("port", checkers.validate_http_url(
             "https://proxy.example:not-a-port", "PROXY_URL") or "")
+        self.assertIn("valid URL", checkers.validate_http_url(
+            "https://[invalid", "PROXY_URL") or "")
         self.assertIsNone(checkers.validate_probe_url_template(
             "https://checker.example/lookup/{username}"))
+        self.assertIn("https://", checkers.validate_probe_url_template(
+            "http://checker.example/lookup/{username}") or "")
         self.assertIn("placeholder", checkers.validate_probe_url_template(
             "https://checker.example/lookup") or "")
+        self.assertIsNone(checkers.validate_account_api_url(
+            "https://discord.example/api/account"))
+        self.assertIn("https://", checkers.validate_account_api_url(
+            "http://discord.example/api/account") or "")
+        self.assertIn("JSON body", checkers.validate_account_api_url(
+            "https://discord.example/{username}") or "")
         self.assertTrue(checkers.is_valid_header_name("X-API-Key"))
         self.assertFalse(checkers.is_valid_header_name("Bad\nHeader"))
+        self.assertEqual(
+            checkers.playwright_proxy_config("http://proxy-user:proxy-pass@proxy.example:8080"),
+            {
+                "server": "http://proxy.example:8080",
+                "username": "proxy-user",
+                "password": "proxy-pass",
+            },
+        )
+        self.assertIn("path", checkers.validate_proxy_url(
+            "http://proxy.example/route") or "")
+        self.assertIn("control", checkers.validate_http_url(
+            "https://checker.example/lookup/\x01") or "")
+        self.assertIn("control", checkers.validate_proxy_url(
+            "http://user%0Aname:pass@proxy.example:8080") or "")
+        self.assertIn("placeholder", checkers.validate_probe_url_template(
+            "https://checker.example/{username!r}") or "")
+        self.assertIn("invalid braces", checkers.validate_probe_url_template(
+            "https://checker.example/{username}/{other}") or "")
+        self.assertIsNone(checkers.validate_request_headers(
+            {"X-API-Key": "secret"}, "probe headers"))
+        self.assertIn("header name", checkers.validate_request_headers(
+            {"Bad\nHeader": "secret"}, "probe headers") or "")
+        self.assertIn("header value", checkers.validate_request_headers(
+            {"X-API-Key": "bad\nvalue"}, "probe headers") or "")
 
     def test_sensitive_error_text_is_redacted(self):
         detail = checkers._redact_sensitive_text(
@@ -122,6 +232,7 @@ class TestValidators(unittest.TestCase):
         self.assertNotIn("private-value", detail)
         self.assertNotIn("private-header-value", detail)
         self.assertIn("***", detail)
+        self.assertNotIn("\n", checkers._redact_sensitive_text("remote\nerror"))
 
 
 class TestCheckers(unittest.TestCase):
@@ -172,6 +283,93 @@ class TestCheckers(unittest.TestCase):
             probe_headers=headers))
         self.assertEqual(r.status, AVAILABLE)
         self.assertEqual(session.get.call_args.kwargs["headers"], headers)
+        self.assertFalse(session.get.call_args.kwargs["allow_redirects"])
+
+    def test_discord_account_api_posts_username_and_reads_taken(self):
+        session = _session_with_json(200, {"taken": False})
+        headers = {"Authorization": "Bearer oauth-token"}
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="account",
+            account_api_url="https://discord.example/api/account/username",
+            account_api_headers=headers))
+        self.assertEqual(r.status, AVAILABLE)
+        session.post.assert_called_once_with(
+            "https://discord.example/api/account/username",
+            json={"username": "vortex"},
+            proxy=None,
+            headers=headers,
+            allow_redirects=False,
+        )
+
+    def test_discord_account_api_uses_first_party_default(self):
+        session = _session_with_json(200, {"taken": True})
+        r = self.run_async(checkers.check_discord_account_api(session, "vortex"))
+        self.assertEqual(r.status, TAKEN)
+        self.assertEqual(
+            session.post.call_args.args[0],
+            checkers.DEFAULT_DISCORD_ACCOUNT_API_URL,
+        )
+
+    def test_discord_account_api_normalizes_case(self):
+        session = _session_with_json(200, {"taken": False})
+        r = self.run_async(checkers.check_discord_account_api(session, "Vortex"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(session.post.call_args.kwargs["json"], {"username": "vortex"})
+
+    def test_discord_dnsrobot_loads_page_without_credentials(self):
+        session = _session_with_json(200, {"taken": False})
+        browser, page, context = _browser_with_status("Available")
+        r = self.run_async(checkers.check_discord(
+            session, "Vortex", mode="dnsrobot", dnsrobot_browser=browser,
+            account_api_headers={"Authorization": "Bearer must-not-forward"},
+            probe_headers={"X-Checker-Token": "must-not-forward"}))
+        self.assertEqual(r.status, AVAILABLE)
+        page.goto.assert_called_once_with(
+            checkers.dnsrobot_username_checker_url("Vortex"),
+            wait_until="domcontentloaded",
+            timeout=unittest.mock.ANY,
+        )
+        page.wait_for_function.assert_called_once_with(
+            checkers.DNSROBOT_PAGE_STATUS_SCRIPT,
+            timeout=unittest.mock.ANY,
+        )
+        page.evaluate.assert_called_once_with(checkers.DNSROBOT_PAGE_STATUS_SCRIPT)
+        session.post.assert_not_called()
+        browser.new_context.assert_called_once()
+        context.close.assert_awaited_once()
+        self.assertEqual(
+            checkers.dnsrobot_username_checker_url("a.b"),
+            "https://dnsrobot.net/username-checker?u=a.b",
+        )
+
+    def test_discord_dnsrobot_without_browser_is_unknown(self):
+        session = _session_with_json(200, {"taken": False})
+        r = self.run_async(checkers.check_discord_dnsrobot(session, "vortex"))
+        self.assertEqual(r.status, ERROR)
+        session.post.assert_not_called()
+
+    def test_discord_dnsrobot_block_is_unknown(self):
+        browser, _, _ = _browser_with_status("Rate limited")
+        r = self.run_async(checkers.check_discord_dnsrobot(
+            _session_with_json(200, {}), "vortex", browser=browser))
+        self.assertEqual(r.status, BLOCKED)
+
+    def test_discord_account_api_rejects_bad_url_without_request(self):
+        session = _session_with_json(200, {"taken": False})
+        r = self.run_async(checkers.check_discord_account_api(
+            session, "vortex", api_url="file:///tmp/account"))
+        self.assertEqual(r.status, ERROR)
+        session.post.assert_not_called()
+
+        r = self.run_async(checkers.check_discord_account_api(
+            session, "vortex", api_url="https://checker.example/{username}"))
+        self.assertEqual(r.status, ERROR)
+        session.post.assert_not_called()
+
+    def test_discord_account_api_malformed_success_is_unknown(self):
+        r = self.run_async(checkers.check_discord_account_api(
+            _session_with_json(200, {"message": "ok"}), "vortex"))
+        self.assertEqual(r.status, ERROR)
 
     def test_discord_probe_rejects_bad_template_without_request(self):
         session = _session_with_status(404)
@@ -185,6 +383,14 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_discord(
             _session_with_status(404), "vortex", mode="probe"))
         self.assertEqual(r.status, SKIPPED)
+
+    def test_account_api_mode_alias_uses_json_post(self):
+        session = _session_with_json(200, {"taken": True})
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="account_api",
+            account_api_url="https://discord.example/api/account"))
+        self.assertEqual(r.status, TAKEN)
+        session.post.assert_called_once()
 
     def test_network_error_handled(self):
         broken = MagicMock()

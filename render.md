@@ -1,5 +1,8 @@
 # 🚀 Multi-Sniper on Render — Complete Setup Guide
 
+> Follow the ordered cross-host checklist in [SETUP.md](SETUP.md) first; this
+> document contains Render-specific fields and operational notes.
+>
 > Everything you need to run this Discord username-sniper bot on
 > [Render](https://render.com): account setup, the exact service to create,
 > every environment variable, every **token/credential** you need, and
@@ -40,10 +43,10 @@ Read this once — it explains every choice below.
 | Requirement | What it means |
 | ----------- | ------------- |
 | **Long-running process** | The bot must stay connected to Discord 24/7. It can never "sleep" on inactivity. |
-| **No HTTP port, no web listener** | `bot.py` never accepts connections. It only makes **outbound** HTTPS calls (Discord gateway, Mojang, guns.lol). |
+| **No HTTP port, no web listener** | `bot.py` never accepts connections. It only makes **outbound** HTTPS calls (Discord gateway, Mojang, guns.lol, and optionally DNS Robot through Chromium). |
 | **Outbound HTTPS (443)** | Both the Discord WebSocket and the username checks use TLS. No inbound firewall rules needed. |
-| **Python 3.9+** | The code uses modern type hints. Render's Python runtime is fine. |
-| **Modest RAM (~50–100 MB)** | One aiohttp session + one Discord gateway connection + small in-memory caches. Any instance type fits. |
+| **Python 3.10+** | The code uses modern type hints. Render's Python runtime is fine. |
+| **Enough memory for the selected mode** | HTTP-only mode is small; `dnsrobot` also keeps headless Chromium running. A 512 MB instance is preferred, while 256 MB can be tight under concurrent browser work. |
 | **Environment variables** | All config comes from env vars (Render's Environment tab replaces your local `.env`). |
 | **No database, no disk** | State is RAM-only by design (cooldown buckets, result cache). Do **not** add Postgres/Redis/disk. |
 | **`DISCORD_TOKEN` before first start** | If it's missing, the bot exits at startup (`❌ DISCORD_TOKEN missing…`) and Render restarts it in a loop. Set env vars **before** the first deploy. |
@@ -59,9 +62,9 @@ secret: the Discord bot token.
 | | **Background Worker** ✅ recommended | Free Web Service |
 | --- | --- | --- |
 | Fits this bot? | **Yes** — design for exactly this process type | **No** — Render expects an HTTP listener + health check, and the bot has none |
-| Free instance type? | ❌ **Not offered** (as of Aug 2026, free instances exist only for Web Services, Postgres, Key Value, static sites) | ✅ Free, but spins **down after 15 min of no inbound traffic**, then takes ~1 min to wake |
-| Always-on Discord connection | Yes (paid instance, no spin-down) | No — bot goes offline every 15 min unless something pings it |
-| Cost | ~**$7/mo** (Starter instance, per service) | $0 (but not viable for this bot) |
+| Free instance type? | ❌ No free Background Worker path is documented for this setup; verify Render's current plan matrix | Free Web Services may sleep and expect an HTTP listener |
+| Always-on Discord connection | Use a plan that does not suspend the worker | No reliable always-on connection for this process |
+| Cost | Check [Render pricing](https://render.com/pricing) for the current worker rate | $0 may be available, but it is not a viable worker for this bot |
 
 **Conclusion:** deploy as a **Background Worker on a paid instance type**.
 There is no supported free path on Render for this bot today. (Free alternatives
@@ -73,9 +76,9 @@ on other hosts are in [CLOUD_SETUP.md](CLOUD_SETUP.md#15-cost-comparison-table),
 
 ```bash
 # 1. From the repo root: create a venv and install deps
-python -m venv venv
-source venv/bin/activate            # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
 
 # 2. Copy the template and put in your real Discord token
 cp .env.example .env
@@ -97,7 +100,7 @@ Only continue to Render when the bot works locally. You also need:
 - ✅ A **private GitHub repo** containing this project (`.env` is git-ignored —
   `git status` must never show it).
 - ✅ A **Discord application + bot token** (Section 5).
-- ✅ **Renderer account** (Section 6).
+- ✅ **Render account** (Section 6).
 
 > ⚠️ Never paste `DISCORD_TOKEN` into chat, commits, or logs. It goes into your
 > local `.env` and Render's Environment tab — nowhere else.
@@ -242,16 +245,18 @@ intent ON → bot invited to your server → channel IDs copied.
    | **Region** | Closest to your Discord server — e.g. *Oregon (US West)*, *Virginia (US East)*, *Frankfurt (EU Central)*, *Singapore (Asia Pacific)* |
    | **Branch** | `main` |
    | **Runtime** | `Python 3` (latest stable is fine) |
-   | **Build Command** | `pip install -r requirements.txt` |
+   | **Build Command** | `python -m pip install -r requirements.txt` (add `&& python -m playwright install --with-deps chromium` when using `dnsrobot`) |
    | **Start Command** | `python bot.py` (the repo's `Procfile` already declares `worker: python bot.py`, so the Procfile default also works) |
    | **Instance Type** | `Starter` (paid, ~$7/mo per service) — **Free is not offered for Background Workers** |
 
-5. Click **Create Background Worker**.
-6. Render now clones your repo, builds, and starts. **Before it starts** (or
-   immediately after), set the environment variables — Section 8.
+5. Click **Create Background Worker**. If the form includes environment
+   variables, add `DISCORD_TOKEN` there before submitting. Otherwise open the
+   service's **Environment** tab immediately after creation. Render clones,
+   builds, and starts; an automatic build before variables are entered exits
+   safely until you save them and redeploy.
 
-> 💡 Advice: set the required env vars **before** triggering the first deploy
-> so the bot isn't crash-looping on a missing `DISCORD_TOKEN`.
+> 💡 Advice: set the required env vars before triggering the first successful
+> deploy so the bot does not restart in a loop on a missing `DISCORD_TOKEN`.
 
 ---
 
@@ -271,8 +276,10 @@ intent ON → bot invited to your server → channel IDs copied.
 5. **Optional tuning** (safe defaults exist — skip unless you know why):
    `CHECK_TIMEOUT`, `RESPONSE_BUDGET_SECONDS`, `REACTION_TIMEOUT`,
    `USER_MAX_CHECKS`, `USER_WINDOW_SECONDS`, `RESULT_CACHE_TTL`,
-   `DISCORD_CHECK_MODE`, `DISCORD_PROBE_*`, `PROXY_URL`.
-   Full descriptions live in [`.env.example`](.env.example).
+   `DISCORD_CHECK_MODE`, `DISCORD_ACCOUNT_API_*`, `DISCORD_PROBE_*`,
+   `PROXY_URL`. Set `DISCORD_CHECK_MODE=dnsrobot` to load the DNS Robot page
+   in Chromium; it needs no extra secret. Full descriptions live in
+   [`.env.example`](.env.example).
 6. Click **Save Changes**. Render redeploys automatically.
 7. (Optional) Group related vars under **Environment Groups** for reuse across
    services.
@@ -329,9 +336,10 @@ listed in the *Uses* column.
 | 4 | **Render CLI token** | ❌ Optional | Local `render` CLI | `render login` → browser → **Authorize CLI** | Expires periodically; re-run `render login` |
 | 5 | **GitHub token (PAT/SSH)** | ❌ Optional | Pushing to a *private* repo from your machine, or scripted deploys | GitHub → Settings → Developer settings → **Personal access tokens** → generate | You choose expiry (30/90 days); rotate manually |
 | 6 | **Deploy Hook URL** | ❌ Optional | Trigger a redeploy from CI/curl | Service → Settings → **Deploy Hook** → **Generate** | Contains an embedded secret; anyone with URL can redeploy |
-| 7 | **Discord probe token** (`DISCORD_PROBE_TOKEN`) | ❌ Optional | Only if you run your own +2 username checker | You create it in *your own* checker service (or your proxy's API key) | Up to you |
-| 8 | **Proxy credentials** (`PROXY_URL`) | ❌ Optional | Route outbound checks via a residential proxy | Your proxy provider's dashboard (e.g. Bright Data, Oxylabs, or self-hosted) | Provider-specific |
-| 9 | Render payment method | ❌ Optional | Only if you run a paid worker instance (recommended) | Render Dashboard → **Billing** → add card | Card details are never a token; stored by Render |
+| 7 | **Account API credential** (`DISCORD_ACCOUNT_API_TOKEN`) | ❌ Optional | Only in `DISCORD_CHECK_MODE=account` when the authorized endpoint requires it | Your authorized account API/OAuth provider; never use a personal Discord client token | Provider-specific |
+| 8 | **Discord probe token** (`DISCORD_PROBE_TOKEN`) | ❌ Optional | Only if you run your own +2 username checker | You create it in *your own* checker service (or your proxy's API key) | Up to you |
+| 9 | **Proxy credentials** (`PROXY_URL`) | ❌ Optional | Route outbound checks via a residential proxy | Your proxy provider's dashboard (e.g. Bright Data, Oxylabs, or self-hosted) | Provider-specific |
+| 10 | Render payment method | ❌ Optional | Only if you run a paid worker instance (recommended) | Render Dashboard → **Billing** → add card | Card details are never a token; stored by Render |
 
 ### 10.1 Discord bot token — full acquisition walkthrough
 
@@ -346,10 +354,16 @@ discord.com/developers/applications
   → Privileged Gateway Intents → MESSAGE CONTENT INTENT → ON
 ```
 
-- **There is no "Discord username-availability token."** Discord has no public
-  API for that, which is why the bot's Discord check is `off` by default and
-  why `DISCORD_CHECK_MODE=probe` needs **your own** checker URL + token.
-  Do not buy or search for such a token — it doesn't exist.
+- **There is no Discord bot permission that unlocks username availability.**
+  The bot's check is `off` by default. `dnsrobot` loads
+  `https://dnsrobot.net/username-checker` in isolated Chromium and needs no
+  extra secret. Add `python -m playwright install --with-deps chromium` to
+  the Render build command for this mode. `account` mode uses the first-party
+  account-flow eligibility
+  route (or a compatible authorized gateway) and may work without a credential;
+  if your authorized provider requires one, store it as
+  `DISCORD_ACCOUNT_API_TOKEN`. Never use or request a personal Discord client
+  token.
 - **Rotating:** Portal → Bot → Reset Token → paste new token into Render's
   Environment tab → Save Changes. The old token dies immediately.
 
@@ -485,7 +499,9 @@ auto-deploys make this optional.
 - ❌ No AWS / GCP / Azure keys
 - ❌ No Render token for the standard dashboard deploy
 - ❌ No Minecraft or guns.lol API key (public endpoints)
-- ❌ No "Discord username API" token (doesn't exist — see 10.1)
+- ❌ No separate Discord bot permission or token is required for the default
+  Account API route; only add `DISCORD_ACCOUNT_API_TOKEN` for an authorized
+  gateway that explicitly requires it
 - ❌ No database credentials, no Redis password
 - ❌ No SSH keys on Render (and free instances don't support SSH anyway)
 
@@ -504,7 +520,7 @@ services:
     name: multi-sniper
     runtime: python
     plan: starter            # workers have no free instance type
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python -m pip install -r requirements.txt && python -m playwright install --with-deps chromium
     startCommand: python bot.py
     envVars:
       - key: DISCORD_TOKEN
