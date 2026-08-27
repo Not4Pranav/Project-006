@@ -106,6 +106,15 @@ class ProxyPool:
         self._recovery_cooldown = max(0.0, recovery_cooldown)
         self._allow_direct_fallback = allow_direct_fallback
         self._last_health_check: float = 0.0
+        # Rotation hot path: ``next()`` runs for every outbound request, so it
+        # reads a cached list of alive proxies instead of re-filtering the
+        # whole pool. Anything that changes liveness marks the cache dirty.
+        self._alive_cache: list[ProxyHealth] = []
+        self._benched: list[ProxyHealth] = []
+        self._cache_valid: bool = False
+        # Throttle the "everything is down" warning: during a real outage it
+        # would otherwise fire once per outbound request.
+        self._last_all_down_warning: float = 0.0
 
         for url in proxies or []:
             url = url.strip()
@@ -113,6 +122,7 @@ class ProxyPool:
                 health = ProxyHealth(url=url)
                 self._proxies.append(health)
                 self._by_url[url] = health
+        self._rebuild_cache()
 
     # -- introspection ------------------------------------------------------
 
@@ -130,14 +140,39 @@ class ProxyPool:
 
     # -- rotation -----------------------------------------------------------
 
-    def _recover_cooled_down(self) -> None:
-        """Un-bench proxies whose cooldown window has elapsed."""
+    def _rebuild_cache(self) -> None:
+        """Recompute the alive and benched lists from the pool state."""
 
-        now = time.monotonic()
+        alive: list[ProxyHealth] = []
+        benched: list[ProxyHealth] = []
         for proxy in self._proxies:
-            if (not proxy.is_alive
-                    and now - proxy.last_failure_time > self._recovery_cooldown):
+            (alive if proxy.is_alive else benched).append(proxy)
+        self._alive_cache = alive
+        self._benched = benched
+        self._cache_valid = True
+
+    def _invalidate_cache(self) -> None:
+        self._cache_valid = False
+
+    def _recover_cooled_down(self) -> None:
+        """Un-bench proxies whose cooldown window has elapsed.
+
+        Walks only the benched list, so a healthy pool pays nothing (empty
+        list) and a degraded pool pays O(benched) instead of O(pool) - the
+        exact recovery semantics of a full-pool walk, without the scan.
+        """
+
+        if not self._benched:
+            return
+        now = time.monotonic()
+        remaining: list[ProxyHealth] = []
+        for proxy in self._benched:
+            if now - proxy.last_failure_time > self._recovery_cooldown:
                 proxy.consecutive_failures = 0
+                self._cache_valid = False
+            else:
+                remaining.append(proxy)
+        self._benched = remaining
 
     def next(self) -> str | None:
         """Return the next healthy proxy URL, or ``None`` for a direct call."""
@@ -146,19 +181,28 @@ class ProxyPool:
             return None
 
         self._recover_cooled_down()
-        alive = [p for p in self._proxies if p.is_alive]
+        if not self._cache_valid:
+            self._rebuild_cache()
+        alive = self._alive_cache
 
         if not alive:
             if self._allow_direct_fallback:
                 return None
             # Every proxy is benched. Rather than leak the real IP, reset the
             # counters and keep cycling; the health sweep will re-bench the
-            # ones that are genuinely dead.
-            log.warning("All %d proxies are down; resetting and retrying them",
-                        self.size)
+            # ones that are genuinely dead. Warn at most once every 30s so an
+            # outage does not spam the log once per outbound request.
+            now = time.monotonic()
+            if now - self._last_all_down_warning >= 30.0:
+                self._last_all_down_warning = now
+                log.warning("All %d proxies are down; resetting and retrying them",
+                            self.size)
             for proxy in self._proxies:
                 proxy.consecutive_failures = 0
             alive = list(self._proxies)
+            self._alive_cache = alive
+            self._benched = []
+            self._cache_valid = True
 
         idx = self._index % len(alive)
         self._index = idx + 1
@@ -171,8 +215,17 @@ class ProxyPool:
 
     def report_success(self, url: str | None) -> None:
         proxy = self._by_url.get(url) if url else None
-        if proxy is not None:
-            proxy.record_success()
+        if proxy is None:
+            return
+        was_alive = proxy.is_alive
+        proxy.record_success()
+        if not was_alive:
+            # A benched proxy just answered again: back into rotation.
+            try:
+                self._benched.remove(proxy)
+            except ValueError:  # direct record_* call already benched it
+                pass
+            self._invalidate_cache()
 
     def report_failure(self, url: str | None) -> None:
         proxy = self._by_url.get(url) if url else None
@@ -181,6 +234,9 @@ class ProxyPool:
         was_alive = proxy.is_alive
         proxy.record_failure()
         if was_alive and not proxy.is_alive:
+            if proxy not in self._benched:
+                self._benched.append(proxy)
+            self._invalidate_cache()
             log.warning(
                 "Proxy %s benched after %d consecutive failures",
                 _short_url(proxy.url), proxy.consecutive_failures,
@@ -206,44 +262,51 @@ class ProxyPool:
     ) -> None:
         """Probe every proxy with one lightweight request each.
 
-        Probes run in parallel but *bounded*: a large public list can hold
-        thousands of proxies, and firing thousands of sockets at once would
-        exhaust the connector (and the host's file descriptors) rather than
-        finish faster.
+        Probes run through a small fixed worker pool pulling from a shared
+        cursor: bounded like a semaphore, but without chunk barriers, so one
+        slow proxy never holds up the start of the next probe.
         """
 
         if not self._proxies:
             return
 
         request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
-        width = usable_concurrency(concurrency)
-        gate = asyncio.Semaphore(width)
+        proxies = list(self._proxies)
+        width = min(usable_concurrency(concurrency), len(proxies))
+        cursor = 0
+        cursor_lock = asyncio.Lock()
 
         async def probe(proxy: ProxyHealth) -> None:
-            async with gate:
-                try:
-                    async with session.get(
-                        target_url,
-                        proxy=proxy.url,
-                        timeout=request_timeout,
-                        allow_redirects=False,
-                    ) as response:
-                        if response.status < 500:
-                            proxy.record_success()
-                        else:
-                            proxy.record_failure()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - any failure means "unusable"
-                    proxy.record_failure()
+            try:
+                async with session.get(
+                    target_url,
+                    proxy=proxy.url,
+                    timeout=request_timeout,
+                    allow_redirects=False,
+                ) as response:
+                    if response.status < 500:
+                        proxy.record_success()
+                    else:
+                        proxy.record_failure()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - any failure means "unusable"
+                proxy.record_failure()
 
-        # Chunked for the same reason as probe_proxies: the pool can hold
-        # thousands, and one coroutine per proxy up front is wasted memory.
-        chunk_size = max(width * 4, 256)
-        proxies = list(self._proxies)
-        for start in range(0, len(proxies), chunk_size):
-            await asyncio.gather(
-                *(probe(p) for p in proxies[start:start + chunk_size]))
+        async def worker() -> None:
+            nonlocal cursor
+            while True:
+                async with cursor_lock:
+                    if cursor >= len(proxies):
+                        return
+                    proxy = proxies[cursor]
+                    cursor += 1
+                await probe(proxy)
+
+        await asyncio.gather(*(worker() for _ in range(width)))
+        # record_success/record_failure ran directly on the health objects,
+        # so the rotation cache must be refreshed before the next hand-out.
+        self._invalidate_cache()
         self._last_health_check = time.monotonic()
 
     def add(self, urls: list[str]) -> int:
@@ -257,6 +320,8 @@ class ProxyPool:
                 self._proxies.append(health)
                 self._by_url[url] = health
                 added += 1
+        if added:
+            self._invalidate_cache()
         return added
 
     def keep_only(self, urls: list[str]) -> int:
@@ -269,6 +334,7 @@ class ProxyPool:
         self._proxies = [self._by_url[u] for u in wanted]
         self._by_url = {p.url: p for p in self._proxies}
         self._index = 0
+        self._invalidate_cache()
         return max(0, removed)
 
     async def verify(
@@ -301,6 +367,7 @@ class ProxyPool:
         if len(alive) < max(1, keep_minimum):
             for proxy in self._proxies:
                 proxy.consecutive_failures = 0
+            self._invalidate_cache()
             return len(alive), 0
 
         removed = len(self._proxies) - len(alive)
@@ -309,6 +376,7 @@ class ProxyPool:
         self._proxies = alive
         self._by_url = {p.url: p for p in alive}
         self._index = 0
+        self._rebuild_cache()
         return len(alive), removed
 
     def drop_dead(self, keep_minimum: int = 1) -> int:
@@ -329,6 +397,7 @@ class ProxyPool:
             self._proxies = alive
             self._by_url = {p.url: p for p in alive}
             self._index = 0
+            self._rebuild_cache()
         return removed
 
     async def periodic_health_check(
@@ -634,41 +703,53 @@ async def probe_proxies(
     Bounded by ``concurrency``: a public list can hold tens of thousands of
     entries, and firing them all at once exhausts sockets rather than
     finishing sooner. Never raises - a proxy that errors simply did not pass.
+
+    A fixed pool of ``width`` workers pulls URLs from a shared cursor instead
+    of gathering one chunk at a time. Chunked gathers wait for their slowest
+    member (usually a full timeout) before starting the next batch; the
+    worker pool keeps every slot busy, so a list full of dead proxies - the
+    normal case for a public list - verifies in roughly ``len(urls)/width``
+    timeouts instead of paying a barrier after every batch.
     """
 
     if not urls:
         return []
 
     request_timeout = aiohttp.ClientTimeout(total=max(0.1, timeout))
-    width = usable_concurrency(concurrency)
-    gate = asyncio.Semaphore(width)
+    width = min(usable_concurrency(concurrency), len(urls))
+    cursor = 0
+    cursor_lock = asyncio.Lock()
+    alive: list[str] = []
 
     async def probe(url: str) -> bool:
-        async with gate:
-            try:
-                async with session.get(
-                    target_url,
-                    proxy=url,
-                    timeout=request_timeout,
-                    allow_redirects=False,
-                ) as response:
-                    return response.status < 500
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - any failure means "unusable"
-                return False
+        try:
+            async with session.get(
+                target_url,
+                proxy=url,
+                timeout=request_timeout,
+                allow_redirects=False,
+            ) as response:
+                return response.status < 500
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - any failure means "unusable"
+            return False
 
-    # Build tasks in chunks rather than one task per URL up front: a 169,000
-    # entry list would otherwise allocate 169,000 coroutines before the first
-    # probe runs, which costs hundreds of megabytes on a host that may only
-    # have 512 MB. The semaphore still governs how many are actually in
-    # flight; this only governs how many exist at once.
-    alive: list[str] = []
-    chunk_size = max(width * 4, 256)
-    for start in range(0, len(urls), chunk_size):
-        chunk = urls[start:start + chunk_size]
-        outcomes = await asyncio.gather(*(probe(url) for url in chunk))
-        alive.extend(url for url, ok in zip(chunk, outcomes) if ok)
+    async def worker() -> None:
+        nonlocal cursor
+        while True:
+            async with cursor_lock:
+                if cursor >= len(urls):
+                    return
+                url = urls[cursor]
+                cursor += 1
+            if await probe(url):
+                alive.append(url)
+
+    # Only ``width`` coroutines ever exist, so a 169,000-entry list costs the
+    # same memory as a small one. Order is not preserved (results land in
+    # completion order); callers treat the result as a set.
+    await asyncio.gather(*(worker() for _ in range(width)))
     return alive
 
 
@@ -865,6 +946,41 @@ async def _load_source(source: str, timeout: float) -> list[str]:
     return load_proxy_file(source)
 
 
+async def _probe_urls_pipelined(
+    session: aiohttp.ClientSession,
+    urls: list[str],
+    target: str,
+    timeout: float,
+    concurrency: int,
+    results: list[tuple[str, bool, str]],
+) -> None:
+    """Probe ``urls`` through a fixed worker pool, appending to ``results``.
+
+    Same cursor pattern as ``probe_proxies``: bounded concurrency without
+    building one coroutine per entry, and no chunk barrier letting a single
+    slow timeout idle the rest of the pool.
+    """
+
+    if not urls:
+        return
+    width = min(max(1, concurrency), len(urls))
+    cursor = 0
+    cursor_lock = asyncio.Lock()
+
+    async def worker() -> None:
+        nonlocal cursor
+        while True:
+            async with cursor_lock:
+                if cursor >= len(urls):
+                    return
+                url = urls[cursor]
+                cursor += 1
+            ok, detail = await _probe_one(session, url, target, timeout)
+            results.append((url, ok, detail))
+
+    await asyncio.gather(*(worker() for _ in range(width)))
+
+
 async def _check_list(path: str, target: str, timeout: float,
                       limit: int = 0, concurrency: int = 100,
                       keep: str = "", skip_socks: bool = False,
@@ -914,20 +1030,14 @@ async def _check_list(path: str, target: str, timeout: float,
 
     print(f"Probing {target} through each proxy "
           f"(timeout {timeout:.0f}s, {concurrency} at a time)...\n")
-    gate = asyncio.Semaphore(max(1, concurrency))
     results: list[tuple[str, bool, str]] = []
-
-    async def probe(session, url):
-        async with gate:
-            ok, detail = await _probe_one(session, url, target, timeout)
-            results.append((url, ok, detail))
-            return ok
 
     started = time.monotonic()
     connector = aiohttp.TCPConnector(
         limit=max(1, concurrency) * 2, force_close=True)
     async with aiohttp.ClientSession(connector=connector) as session:
-        await asyncio.gather(*(probe(session, url) for url in usable))
+        await _probe_urls_pipelined(
+            session, usable, target, timeout, concurrency, results)
 
         # --want: a public list is mostly dead, so keep drawing fresh batches
         # until the target is met or the reserve runs out.
@@ -939,7 +1049,8 @@ async def _check_list(path: str, target: str, timeout: float,
                 max(concurrency, int((want - found) / hit_rate)))
             batch, reserve = reserve[:batch_size], reserve[batch_size:]
             print(f"  ... {found}/{want} working, testing {len(batch)} more")
-            await asyncio.gather(*(probe(session, url) for url in batch))
+            await _probe_urls_pipelined(
+                session, batch, target, timeout, concurrency, results)
     elapsed = time.monotonic() - started
 
     alive_urls = [url for url, ok, _detail in results if ok]

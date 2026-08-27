@@ -125,8 +125,9 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# Startup proxy verification probes 1,000 proxies at once, and each in-flight
-# probe holds a file descriptor. systemd's default is often 1,024.
+# Proxy verification probes up to 1,000 proxies at once (in the background
+# after login), and each in-flight probe holds a file descriptor. systemd's
+# default is often 1,024.
 LimitNOFILE=16384
 
 # Hardening: the bot needs no privileges beyond outbound HTTPS.

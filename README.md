@@ -99,6 +99,7 @@ python test_checkers.py           # 138 tests
 python test_bot.py                # 63 tests
 python test_stress.py             # 17 tests
 python test_integration.py        # 13 tests
+python test_audit.py              # 21 deep-audit tests (loopback servers)
 
 # 6. Run
 python bot.py
@@ -122,7 +123,7 @@ python checkers.py vortex --no-extra
 3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
 4. **Share duplicate work** — if the same username is already being checked for someone else, this message waits on that one lookup instead of starting a second (see *Busy channels* below).
 5. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
-6. **Fallback** — any platform that could not answer (blocked, rate-limited, network error) gets a second opinion from instantusername.com before it is reported as unknown.
+6. **Fallback** — any platform that could not answer (blocked, rate-limited, network error) gets a second opinion from instantusername.com before it is reported as unknown; a platform that merely *stalls* gets the second opinion hedged in parallel after 1 s, with the platform's own verdict able to overrule within a 250 ms grace window.
 7. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
 8. **Answer as results land** — the reply is posted instantly and edited as each platform reports (or, in react mode, each emoji is added the moment that platform answers). Only the ❌ / ⚠️ summary has to wait for everyone.
 9. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
@@ -147,13 +148,20 @@ Everything after step 1 shares a single response budget (4.5 s by default, hard-
 | **Streaming answers** | The reply is painted instantly and updated per platform — a fast result is never held hostage by a slow site |
 | Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency, not the sum |
 | Result cache | Repeat lookups answer in microseconds, zero requests |
-| **Connection pre-warming** | TLS to all 8 hosts is established at startup, so the first lookup skips DNS + TCP + TLS |
+| **Connection pre-warming** | TLS to all hosts — including the fallback provider — is established at startup, so the first lookup skips DNS + TCP + TLS |
+| **Hedged fallback second opinion** | If a platform stalls past 1 s, instantusername.com is raced in parallel — a hanging endpoint no longer adds its full timeout on top of the rescue. The platform's own verdict still overrules within a 250 ms grace window, so ground truth wins whenever it arrives |
+| **GitHub status-only check** | `github.com/<name>`'s 404/200 contract replaces the JSON API — same answer, no 60-requests-per-hour rate limit to exhaust |
 | **Bounded page reads (96 KB)** | Steam/Instagram/X markers sit at the top of the document; the rest of a multi-MB page is never downloaded |
 | **Hedged Minecraft request** | The backup Mojang endpoint starts only if the primary stalls 150 ms — one request when healthy, no doubled latency when not |
-| TCP pooling + keep-alive (30 s) | No repeated handshakes between lookups |
+| **Connect deadline (2 s)** | A socket that cannot even connect (dead proxy, black-holed host) fails over to the next proxy instead of eating the whole check budget |
+| **Instant startup** | Gateway login never waits on the remote proxy list: download + verification run in the background and the pool is upgraded in place |
+| TCP pooling + keep-alive (30 s), Happy Eyeballs | No repeated handshakes between lookups; IPv4/IPv6 race to whichever connects first |
 | DNS cache (5 min) | No repeated resolution per check |
+| O(1) proxy rotation | Handing out the next healthy proxy no longer walks the pool, even with thousands of entries and hundreds benched |
+| Event-driven reply edits | The live reply wakes only when a result lands or an edit becomes due — no busy polling |
 | Sub-second flood guard (5 / 0.5 s) | Back-to-back checks are not throttled in practice |
 | Per-request proxy rotation | The 8 checks spread across 8 IPs instead of queueing behind one |
+| Pipelined proxy verification | Startup probing keeps every probe slot busy — one slow timeout never stalls the batch behind it |
 | One retry on transient errors | A single connection reset does not become a ⚠️ |
 | gzip/deflate compression | Smaller bodies for the HTML-scraped platforms |
 
@@ -197,7 +205,8 @@ GET https://api.instantusername.com/check/<service>/<username>
     -> {"available": true, "url": "..."}
 ```
 
-- It runs **only** when the platform's own check came back blocked or errored, so a healthy lookup never pays for it.
+- It runs **only** when the platform's own check came back blocked or errored — or when it stalls past 1 s, in which case the second opinion is *hedged* in parallel instead of waiting out the timeout. Either way, a healthy lookup never pays for it.
+- When the hedged second opinion answers before a slow endpoint, the platform's own verdict still overrules it within a short 250 ms grace window — first-party ground truth wins whenever it arrives in time.
 - It runs **inside the same shared deadline** — the fallback can never push an answer past the response budget.
 - It only overrides the result when it is itself definitive (`available` / `taken`). A failed fallback leaves the original honest *Unknown* in place.
 - The service catalogue is fetched from `/services.json` at startup, so platforms instantusername adds later are picked up without a code change. If that fetch fails, a built-in map is used.
@@ -215,7 +224,7 @@ Set `INSTANTUSERNAME_FALLBACK=false` to disable the second source entirely — f
 | Minecraft | 🕹️ | 204 or 404 | 200 with profile JSON | 403 / 405 / 429 |
 | guns.lol | 🔫 | 404/410, or an unclaimed-page marker | 200 without that marker | 403 / 429 / 503, Cloudflare challenge |
 | Discord | 🐈‍⬛ | mode-dependent | mode-dependent | mode-dependent (see below) |
-| GitHub | 💻 | 404 | 200 with a `login` field | 403 / 429 (rate limit) |
+| GitHub | 💻 | 404 | 200 profile page | 403 / 429 (rate limit) |
 | Steam | 🎮 | 404, or "profile could not be found" | 200 with profile content | 403 / 429 / 503 |
 | Reddit | 👀 | 404 | 200 with user-about JSON | 403 / 429 / 503 |
 | Instagram | 📸 | 404, or "this page isn't available" | 200 profile page | login wall, checkpoint, 401 / 403 / 429 |
@@ -280,7 +289,7 @@ Blank lines and `#` comments are ignored, duplicates are dropped, credentials co
 
 ### Big public lists: `PROXY_LIST_URL`
 
-Scraped public lists are far too large to keep in a repo (the one this bot ships with is ~169,000 entries) and go stale within hours, so they are **fetched at startup instead of stored**:
+Scraped public lists are far too large to keep in a repo (the one this bot ships with is ~169,000 entries) and go stale within hours, so they are **fetched in the background at startup instead of stored**:
 
 ```env
 # Default: the shared list. Set blank to switch remote loading off.
@@ -289,7 +298,7 @@ PROXY_LIST_URL=https://drive.google.com/file/d/<id>/view
 
 Google Drive `…/view` links, GitHub `blob` links and plain raw URLs all work — share links are rewritten to their direct-download form automatically, and an HTML sign-in page is detected and rejected rather than parsed as proxies.
 
-What happens on boot, in order:
+What happens on boot — **entirely in the background, after the bot is already online** (a slow list download can never delay the gateway login; the pool is upgraded in place while lookups are being answered):
 
 | Step | Why |
 |---|---|
@@ -327,8 +336,7 @@ Three things make that possible, and they are worth knowing about before you tun
 - **File descriptors.** 1,000 concurrent sockets need 1,000 file descriptors, and the usual Linux default is 1,024.
   The bot raises its own soft limit at startup, and if the host refuses it **narrows the probe width to fit and
   says so** rather than dying with "too many open files".
-- **Chunking.** Probes are built in chunks instead of one coroutine per entry, so testing 100,000 proxies does not
-  allocate 100,000 coroutines up front. Peak memory stays flat whether the list has 1,000 entries or 169,000.
+- **Pipelining.** Probing runs through a fixed worker pool pulling from a shared cursor: only as many coroutines as the probe width ever exist (peak memory stays flat whether the list has 1,000 entries or 169,000), and one hanging proxy never stalls the batch behind it — every probe slot stays busy until the list runs out.
 
 Sizing the pool is a real trade-off, not a "bigger is better":
 
@@ -410,7 +418,7 @@ Discord has no public username-availability API, so this check is **off by defau
 | Mode | How it works | Needs |
 |---|---|---|
 | `off` *(default)* | Skipped; reported as `skipped` | — |
-| `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `python -m playwright install chromium` |
+| `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `pip install 'playwright>=1.48,<2'` + `python -m playwright install chromium` |
 | `account` / `account_api` | POSTs `{"username": "..."}` to Discord's username-eligibility route | Optionally an authorised credential |
 | `probe` | GETs your own authorised checker URL template (`200` = taken, `404` = free) | `DISCORD_PROBE_URL` |
 
@@ -436,7 +444,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `REPLY_MENTION_AUTHOR` | `false` | Ping the requester in the reply |
 | `STREAM_REACTIONS` | `true` | Answer per platform as it reports (fastest); `false` batches |
 | `PORT` / `KEEPALIVE_PORT` | *(blank)* | Serve a health endpoint so free hosts keep the bot alive |
-| `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts at startup |
+| `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts (plus the fallback provider) at startup |
 | `INSTANTUSERNAME_FALLBACK` | `true` | Ask instantusername.com when a platform's own check fails |
 | `COALESCE_DUPLICATES` | `true` | Members asking the same name at once share one lookup |
 
@@ -446,6 +454,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 |---|---|---|---|
 | `RESPONSE_BUDGET_SECONDS` | `4.5` | 0.5 – 4.8 | Total budget for checks + reactions |
 | `CHECK_TIMEOUT` | `3` | 0.05 – budget | Per-request outbound timeout |
+| `CONNECT_DEADLINE` | `2` | 0.1 – CHECK_TIMEOUT | Per-socket connect cap; dead proxies fail over faster |
 | `REACTION_TIMEOUT` | `0.75` | 0.05 – budget−0.05 | Cap per Discord reaction call |
 | `USER_MAX_CHECKS` | `5` | 1 – 10000 | Checks allowed per user per window |
 | `USER_WINDOW_SECONDS` | `0.5` | ≥ 0.01 | Flood-guard window — sub-second so checks feel instant |
@@ -468,7 +477,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `PROXY_URL` | *(blank)* | Single proxy; also joins the pool if one is configured |
 | `PROXY_URLS` | *(blank)* | Comma/newline separated pool |
 | `PROXY_FILE` | `proxies.txt` | Proxy list file loaded automatically; blank disables it |
-| `PROXY_LIST_URL` | *(shared list)* | Remote list downloaded at startup; blank disables it |
+| `PROXY_LIST_URL` | *(shared list)* | Remote list fetched in the background at startup; blank disables it |
 | `PROXY_CACHE_FILE` | `.proxy-cache.txt` | Where the downloaded list is cached |
 | `PROXY_LIST_TTL` | `21600` | Seconds before the remote list is downloaded again |
 | `PROXY_LIST_TIMEOUT` | `20` | Download timeout in seconds |
@@ -506,10 +515,11 @@ python test_checkers.py       # 138 offline tests (interpreters, request layer, 
 python test_bot.py            # 63 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 python test_integration.py    # 13 integration tests (real sockets: proxies, boot, CLI)
+python test_audit.py          # 21 deep-audit tests (bounded reads, rotation fuzz, hedge grid)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
 
-# all four suites, 231 tests, no network and no Discord token required
-for f in test_checkers test_bot test_stress test_integration; do python $f.py || break; done
+# all five suites, 252 tests, no internet and no Discord token required
+for f in test_checkers test_bot test_stress test_integration test_audit; do python $f.py || break; done
 
 python -m pyflakes *.py       # lint
 python checkers.py Notch      # manual CLI report
@@ -522,11 +532,13 @@ python checkers.py Notch      # manual CLI report
 | `proxies.py` | `ProxyPool` rotation and health, `ProxyProvider` handed to checkers |
 | `test_checkers.py` / `test_bot.py` / `test_stress.py` | Offline test suites (no network required) |
 | `test_integration.py` | End-to-end tests against real local sockets (proxy servers, list host, boot) |
+| `test_audit.py` | Adversarial audits: chunked-read correctness, ~90k-op rotation fuzz vs a reference model, a 200-case hedge timing grid, real-socket fan-out proofs |
 
-`test_integration.py` is the only suite that opens sockets. It starts real HTTP forward proxies,
-a real proxy-list host and a stand-in for `api.instantusername.com` on loopback ports, then boots an
-actual `SniperBot` through `setup_hook()` and feeds it a message — so the wiring between the modules
-is covered, not just each module in isolation. It still needs no internet and no Discord token.
+`test_integration.py` and `test_audit.py` are the suites that open sockets - always on loopback,
+never the internet. The integration suite starts real HTTP forward proxies, a real proxy-list host
+and a stand-in for `api.instantusername.com`, then boots an actual `SniperBot` through
+`setup_hook()` and feeds it a message. The audit suite adds slow/chunked loopback servers and fake
+clocks to attack the latency paths directly. Neither needs a Discord token.
 
 The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pure functions of `(status, body)`, which is why the suites can cover every platform without touching the network.
 
@@ -542,7 +554,7 @@ The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pur
 | Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` |
 | ⚠️ on every platform | Outbound HTTPS is blocked, or every proxy is down (check the startup banner and `Proxy … benched` logs) |
 | Discord shows `skipped` | Expected: `DISCORD_CHECK_MODE=off` is the default |
-| `DNS Robot browser unavailable` | Run `python -m playwright install chromium` |
+| `DNS Robot browser unavailable` | Run `pip install 'playwright>=1.48,<2'` then `python -m playwright install chromium` |
 | ⏳ on ordinary use | Raise `USER_MAX_CHECKS` or lower `USER_WINDOW_SECONDS` |
 
 ---
