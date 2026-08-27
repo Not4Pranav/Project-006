@@ -285,7 +285,9 @@ HTTP_POOL_LIMIT_PER_HOST=40
 # ENABLE_EXTRA_PLATFORMS=false
 ```
 
-**Never** commit `.env`. On PaaS, use the provider's environment-variable UI; on a VPS, `chmod 600 .env`. If a token ever leaks, reset it in the Discord Developer Portal immediately.
+If you use proxies, upload `proxies.txt` alongside `.env` (same secrecy rules — it holds credentials, and it is gitignored). On PaaS hosts with no persistent filesystem, put the list in the `PROXY_URLS` environment variable instead; the same formats are accepted.
+
+**Never** commit `.env` or `proxies.txt`. On PaaS, use the provider's environment-variable UI; on a VPS, `chmod 600 .env`. If a token ever leaks, reset it in the Discord Developer Portal immediately.
 
 ---
 

@@ -93,7 +93,7 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 105 offline tests
+python test_checkers.py     # 116 offline tests
 python test_bot.py          # 54 pipeline tests
 python test_stress.py       # 17 stress tests
 ```
@@ -152,14 +152,29 @@ Set `RESPONSE_MODE=react` if you would rather have emoji reactions on the origin
 
 Instagram and X gate unauthenticated traffic hard, and every platform rate-limits by IP. A proxy pool spreads the eight checks in one lookup across eight different IPs.
 
+**The quickest way — paste your vendor's list into a file:**
+
+```bash
+cp proxies.txt.example proxies.txt
+# then paste your proxies in, one per line, exactly as your vendor gave them:
+#   gate.example-vendor.com:7000:myuser:mypassword
+#   203.0.113.9:8080
+```
+
+That file is read automatically at startup and is gitignored, so credentials never reach a commit. Point somewhere else with `PROXY_FILE=/etc/multi-sniper/proxies.txt`, or set `PROXY_FILE=` to switch it off.
+
+Formats are normalised for you — `host:port`, `host:port:user:pass`, `user:pass@host:port`, `user:pass:host:port` and full `http://` URLs all work, mixed freely in one file. Blank lines and `#` comments are ignored, duplicates dropped, bad lines skipped with a warning.
+
+Environment variables work too, and are merged with the file:
+
 ```env
-PROXY_URLS=http://user:pass@proxy1.example:8080,http://user:pass@proxy2.example:8080
+PROXY_URLS=user:pass@proxy1.example:8080,user:pass@proxy2.example:8080
 ```
 
 At startup the banner switches to a pool summary, and you can watch health in the logs:
 
 ```
-🧊 Proxy pool       : 3 proxies | 3 alive
+🧊 Proxy pool       : 3 proxies | 3 alive (from proxies.txt)
    └─ http://proxy1.example:8080 (alive, 0% fail), ...
 ```
 
@@ -169,7 +184,7 @@ Behaviour worth knowing:
 - Failures are recorded from **real check traffic**, not just the 30 s health sweep.
 - When every proxy is down, the pool keeps retrying proxies rather than going direct, so your real IP is not exposed. Set `PROXY_ALLOW_DIRECT_FALLBACK=true` to change that.
 
-Validate proxy URLs before deploying — the bot refuses to start on a malformed one, and a proxy URL must not contain a path, query string, or fragment.
+Validate proxy URLs before deploying — the bot refuses to start on a malformed one, and a proxy URL must not contain a path, query string, or fragment. **SOCKS proxies are not supported** and stop startup with a clear message; a silent skip would run the bot with no proxy at all and expose your real IP.
 
 ---
 

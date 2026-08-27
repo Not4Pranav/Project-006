@@ -1235,5 +1235,125 @@ class TestFallbackWiring(unittest.TestCase):
         self.assertEqual(instagram.status, ERROR)
 
 
+
+class TestProxyListFormats(unittest.TestCase):
+    """A vendor proxy list must work whatever shape it is handed to us in."""
+
+    def normalize(self, raw):
+        from proxies import normalize_proxy
+        return normalize_proxy(raw)
+
+    def test_every_common_vendor_format(self):
+        cases = {
+            "http://user:pass@1.2.3.4:8080": "http://user:pass@1.2.3.4:8080",
+            "https://1.2.3.4:3128": "https://1.2.3.4:3128",
+            "1.2.3.4:8080": "http://1.2.3.4:8080",
+            "1.2.3.4:8080:user:pass": "http://user:pass@1.2.3.4:8080",
+            "user:pass@1.2.3.4:8080": "http://user:pass@1.2.3.4:8080",
+            "user:pass:1.2.3.4:8080": "http://user:pass@1.2.3.4:8080",
+            "gate.vendor.com:9000": "http://gate.vendor.com:9000",
+            "gate.vendor.com:9000:bob:secret":
+                "http://bob:secret@gate.vendor.com:9000",
+            "  1.2.3.4:8080  ": "http://1.2.3.4:8080",
+            "1.2.3.4:8080,": "http://1.2.3.4:8080",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(self.normalize(raw), expected)
+
+    def test_special_characters_in_credentials_are_encoded(self):
+        self.assertEqual(
+            self.normalize("1.2.3.4:8080:bob:p@ss word"),
+            "http://bob:p%40ss%20word@1.2.3.4:8080")
+        # A password containing '@' still parses when written inline.
+        self.assertEqual(
+            self.normalize("bob:p@ss@1.2.3.4:8080"),
+            "http://bob:p%40ss@1.2.3.4:8080")
+
+    def test_junk_is_rejected_not_guessed(self):
+        for raw in ["", "   ", "# a comment", "garbage", "1.2.3.4:notaport",
+                    "a:b:c", "1.2.3.4:8080:onlyuser", "://1.2.3.4:8080", None]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.normalize(raw))
+
+    def test_socks_is_kept_so_startup_can_reject_it(self):
+        # Silently dropping it would start the bot with no proxy at all and
+        # leak the host IP, which is the opposite of what proxies are for.
+        self.assertEqual(self.normalize("socks5://1.2.3.4:1080"),
+                         "socks5://1.2.3.4:1080")
+
+    def test_parse_list_normalizes_and_deduplicates(self):
+        from proxies import parse_proxy_list
+        raw = """
+        # my vendor list
+        1.2.3.4:8080:user:pass
+        http://user:pass@1.2.3.4:8080
+        5.6.7.8:3128
+
+        garbage-line
+        """
+        self.assertEqual(parse_proxy_list(raw), [
+            "http://user:pass@1.2.3.4:8080",
+            "http://5.6.7.8:3128",
+        ])
+
+    def test_parse_list_accepts_commas_and_crlf(self):
+        from proxies import parse_proxy_list
+        self.assertEqual(
+            parse_proxy_list("1.1.1.1:80, 2.2.2.2:80\r\n3.3.3.3:80"),
+            ["http://1.1.1.1:80", "http://2.2.2.2:80", "http://3.3.3.3:80"])
+
+    def test_every_parsed_proxy_passes_startup_validation(self):
+        from proxies import parse_proxy_list
+        raw = "1.2.3.4:8080:user:pass\n5.6.7.8:3128\nhttps://9.9.9.9:443"
+        for proxy in parse_proxy_list(raw):
+            self.assertIsNone(checkers.validate_proxy_url(proxy), proxy)
+
+
+class TestProxyFile(unittest.TestCase):
+    """proxies.txt is read automatically, and a missing file is not an error."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, text):
+        path = os.path.join(self.tmp.name, "proxies.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_reads_and_normalizes_a_vendor_file(self):
+        from proxies import load_proxy_file
+        path = self.write(
+            "# residential pool\n"
+            "gate.vendor.com:7000:user1:pass1\n"
+            "gate.vendor.com:7001:user1:pass1\n"
+            "\n"
+            "203.0.113.9:8080\n")
+        self.assertEqual(load_proxy_file(path), [
+            "http://user1:pass1@gate.vendor.com:7000",
+            "http://user1:pass1@gate.vendor.com:7001",
+            "http://203.0.113.9:8080",
+        ])
+
+    def test_missing_file_is_silent(self):
+        from proxies import load_proxy_file
+        self.assertEqual(
+            load_proxy_file(os.path.join(self.tmp.name, "nope.txt")), [])
+        self.assertEqual(load_proxy_file(""), [])
+
+    def test_directory_instead_of_file_does_not_crash(self):
+        from proxies import load_proxy_file
+        self.assertEqual(load_proxy_file(self.tmp.name), [])
+
+    def test_empty_and_comment_only_files(self):
+        from proxies import load_proxy_file
+        self.assertEqual(load_proxy_file(self.write("")), [])
+        self.assertEqual(load_proxy_file(self.write("# nothing here\n\n")), [])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

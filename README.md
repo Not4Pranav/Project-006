@@ -227,15 +227,45 @@ Minecraft is checked against `api.mojang.com` first and falls back to `api.minec
 
 ## Proxy pool
 
-Proxies are optional. Configure them and every outbound check is routed through the rotation:
+Proxies are optional. Configure them and every outbound check is routed through the rotation.
+
+### The easy way: `proxies.txt`
+
+Drop your vendor's list into a file called **`proxies.txt`** in the project folder, one proxy per line. It is picked up automatically at startup — no environment variable, no reformatting:
+
+```text
+# proxies.txt
+gate.example-vendor.com:7000:myuser:mypassword
+gate.example-vendor.com:7001:myuser:mypassword
+203.0.113.9:8080
+```
+
+`proxies.txt` is **gitignored**, so credentials never end up in a commit. Copy `proxies.txt.example` to get started, and set `PROXY_FILE=/path/to/list.txt` to read it from somewhere else (or `PROXY_FILE=` to switch the file off).
+
+Every common vendor format is accepted and normalised for you:
+
+| Written as | Understood as |
+|---|---|
+| `1.2.3.4:8080` | `http://1.2.3.4:8080` |
+| `1.2.3.4:8080:user:pass` | `http://user:pass@1.2.3.4:8080` |
+| `user:pass@1.2.3.4:8080` | `http://user:pass@1.2.3.4:8080` |
+| `user:pass:1.2.3.4:8080` | `http://user:pass@1.2.3.4:8080` |
+| `http://user:pass@1.2.3.4:8080` | unchanged |
+| `https://1.2.3.4:3128` | unchanged |
+
+Blank lines and `#` comments are ignored, duplicates are dropped, credentials containing `@ : space` are percent-encoded, and an unreadable line is skipped with a warning instead of taking the bot down. SOCKS proxies are **rejected at startup** with a clear message — silently ignoring them would run the bot with no proxy at all and leak your real IP.
+
+### Or via environment variables
 
 ```env
 # Single proxy (backward compatible)
 PROXY_URL=http://user:pass@proxy.example:8080
 
-# Pool — comma or newline separated
-PROXY_URLS=http://proxy1:8080,http://proxy2:8080,http://user:pass@proxy3:8080
+# Pool — comma or newline separated, same formats as the file
+PROXY_URLS=proxy1:8080,proxy2:8080,user:pass@proxy3:8080
 ```
+
+All three sources are merged in that order — `PROXY_URL`, then `PROXY_URLS`, then the file — with duplicates removed.
 
 What the pool does:
 
@@ -338,6 +368,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 |---|---|---|
 | `PROXY_URL` | *(blank)* | Single proxy; also joins the pool if one is configured |
 | `PROXY_URLS` | *(blank)* | Comma/newline separated pool |
+| `PROXY_FILE` | `proxies.txt` | Proxy list file loaded automatically; blank disables it |
 | `PROXY_ALLOW_DIRECT_FALLBACK` | `false` | Go direct when every proxy is down (leaks the host IP) |
 
 ### Discord check
@@ -359,7 +390,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 ## Development and testing
 
 ```bash
-python test_checkers.py       # 105 offline tests (interpreters, request layer, proxies, fallback)
+python test_checkers.py       # 116 offline tests (interpreters, request layer, proxies, fallback)
 python test_bot.py            # 54 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints

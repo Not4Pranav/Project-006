@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 
@@ -285,18 +287,163 @@ class ProxyProvider:
         return self.pool is not None or self.static_url is not None
 
 
+# ---------------------------------------------------------------------------
+# Proxy list parsing
+# ---------------------------------------------------------------------------
+#
+# Proxy vendors hand out lists in half a dozen shapes. All of these mean the
+# same thing and are all accepted:
+#
+#     http://user:pass@1.2.3.4:8080     already a URL
+#     1.2.3.4:8080                      bare host:port
+#     1.2.3.4:8080:user:pass            host:port:user:pass  (most common)
+#     user:pass@1.2.3.4:8080            credentials, no scheme
+#     user:pass:1.2.3.4:8080            credentials first
+#
+# Everything is normalised to a URL aiohttp and Playwright both accept.
+
+# The file read at startup when no proxies are configured in the environment.
+DEFAULT_PROXY_FILE = "proxies.txt"
+
+_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_PORT_PATTERN = re.compile(r"^\d{1,5}$")
+_COLON_FORM_PATTERN = re.compile(r"^([^:@/]+):(\d{1,5}):(.+)$")
+# Characters that are already safe inside a URL's userinfo section.
+_USERINFO_SAFE = re.compile(r"^[A-Za-z0-9._~%!$&'()*+,;=-]*$")
+
+
+def _encode_userinfo(value: str) -> str:
+    """Percent-encode a username or password unless it already is."""
+
+    if _USERINFO_SAFE.fullmatch(value):
+        return value
+    return quote(value, safe="")
+
+
+def normalize_proxy(raw: str, default_scheme: str = "http") -> str | None:
+    """Turn one line from a vendor's proxy list into a usable proxy URL.
+
+    Returns ``None`` for blanks, comments, and anything that cannot be read
+    as a proxy - callers log and skip those rather than crashing on one bad
+    line in an otherwise good list.
+    """
+
+    if not isinstance(raw, str):
+        return None
+    item = raw.strip().strip(",")
+    if not item or item.startswith("#"):
+        return None
+
+    explicit_scheme = bool(_SCHEME_PATTERN.match(item))
+    if explicit_scheme:
+        scheme, _, rest = item.partition("://")
+        scheme = scheme.lower()
+    else:
+        scheme, rest = default_scheme, item
+    if not rest:
+        return None
+    # SOCKS is deliberately NOT dropped here: silently ignoring it would
+    # start the bot with no proxy at all and leak the host IP. It is kept so
+    # startup validation can reject it loudly.
+
+    credentials = ""
+    # host:port:user:pass - the shape most vendors ship. Matched first because
+    # the password may itself contain '@' or ':'.
+    colon_form = _COLON_FORM_PATTERN.match(rest)
+    if colon_form:
+        host_port = f"{colon_form.group(1)}:{colon_form.group(2)}"
+        credentials = colon_form.group(3)
+        if ":" not in credentials:
+            return None          # "host:port:something" is not user:pass
+    elif "@" in rest:
+        # A password may contain '@', so split on the LAST one.
+        credentials, _, host_port = rest.rpartition("@")
+    else:
+        parts = rest.split(":")
+        if len(parts) == 4 and _PORT_PATTERN.fullmatch(parts[3]):
+            host_port = f"{parts[2]}:{parts[3]}"          # user:pass:host:port
+            credentials = f"{parts[0]}:{parts[1]}"
+        elif len(parts) <= 2:
+            host_port = rest
+        else:
+            return None
+
+    host, _, port = host_port.partition(":")
+    if not host or (port and not _PORT_PATTERN.fullmatch(port)):
+        return None
+    if not port and not explicit_scheme:
+        # "garbage" is a typo, not a proxy. A port-less entry is only honoured
+        # when the scheme was spelled out (http://proxy.example.com).
+        return None
+
+    if credentials:
+        user, _, password = credentials.partition(":")
+        if not user:
+            return None
+        encoded = _encode_userinfo(user)
+        if password:
+            encoded += ":" + _encode_userinfo(password)
+        return f"{scheme}://{encoded}@{host_port}"
+    return f"{scheme}://{host_port}"
+
+
 def parse_proxy_list(raw: str) -> list[str]:
-    """Parse a comma-or-newline separated proxy list, dropping duplicates."""
+    """Parse a comma-or-newline separated proxy list, dropping duplicates.
+
+    Entries are normalised (see ``normalize_proxy``), so a raw vendor list
+    can be pasted into ``PROXY_URLS`` or ``proxies.txt`` unchanged.
+    """
 
     if not raw:
         return []
     proxies: list[str] = []
     seen: set[str] = set()
-    for item in raw.replace("\n", ",").split(","):
-        item = item.strip()
-        if item and item not in seen:
-            seen.add(item)
-            proxies.append(item)
+    skipped = 0
+    for item in raw.replace("\r", "\n").replace("\n", ",").split(","):
+        stripped = item.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        normalized = normalize_proxy(stripped)
+        if normalized is None:
+            skipped += 1
+            # Show the entry without whatever precedes an '@', so a malformed
+            # line never spills credentials into the log.
+            log.warning("Ignoring unreadable proxy entry: %s",
+                        stripped.rpartition("@")[2][:40])
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            proxies.append(normalized)
+    if skipped:
+        log.warning("%d proxy entr%s could not be parsed and %s skipped",
+                    skipped, "y" if skipped == 1 else "ies",
+                    "was" if skipped == 1 else "were")
+    return proxies
+
+
+def load_proxy_file(path: str = DEFAULT_PROXY_FILE) -> list[str]:
+    """Read a proxy list from a file, one per line (or comma separated).
+
+    A missing file is not an error: it simply means no proxies are configured
+    this way. Blank lines and ``#`` comments are ignored.
+    """
+
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            raw = handle.read()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        log.warning("Could not read proxy file %s: %s", path, exc)
+        return []
+
+    proxies = parse_proxy_list(raw)
+    if proxies:
+        log.info("Loaded %d prox%s from %s",
+                 len(proxies), "y" if len(proxies) == 1 else "ies",
+                 os.path.basename(path))
     return proxies
 
 
@@ -309,3 +456,8 @@ def _short_url(url: str) -> str:
         return f"{parsed.scheme}://{parsed.hostname}{port}"
     except ValueError:
         return url[:40]
+
+
+# Public alias: other modules render proxies for logs and errors with this,
+# which never reveals the credentials embedded in a proxy URL.
+short_proxy_url = _short_url

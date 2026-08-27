@@ -63,7 +63,10 @@ import discord
 from dotenv import load_dotenv
 
 import checkers
-from proxies import ProxyPool, ProxyProvider, parse_proxy_list
+from proxies import (
+    DEFAULT_PROXY_FILE, ProxyPool, ProxyProvider, load_proxy_file,
+    parse_proxy_list, short_proxy_url,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -168,6 +171,52 @@ DISCORD_PROBE_HEADERS = _discord_probe_headers()
 
 # Proxy pool: comma-separated list of proxies for rotation + failover
 PROXY_URLS_RAW = os.getenv("PROXY_URLS", "").strip()
+# Default proxy list file. Drop a vendor list into proxies.txt (one per line,
+# any common format) and it is used automatically - no environment variable
+# needed. PROXY_FILE points somewhere else; PROXY_FILE= (blank) disables it.
+PROXY_FILE = os.getenv("PROXY_FILE", DEFAULT_PROXY_FILE).strip()
+
+
+# The proxy file is read once per path: startup validation, the pool, and the
+# banner all ask for it, and one log line is enough.
+_PROXY_FILE_CACHE: dict[str, list[str]] = {}
+
+
+def _proxy_file_entries() -> list[str]:
+    if PROXY_FILE not in _PROXY_FILE_CACHE:
+        _PROXY_FILE_CACHE[PROXY_FILE] = load_proxy_file(PROXY_FILE)
+    return list(_PROXY_FILE_CACHE[PROXY_FILE])
+
+
+def _proxy_source_summary() -> str:
+    """Name the places the proxy list was actually loaded from."""
+
+    sources = []
+    if PROXY_URL:
+        sources.append("PROXY_URL")
+    if PROXY_URLS_RAW:
+        sources.append("PROXY_URLS")
+    if PROXY_FILE and _proxy_file_entries():
+        sources.append(PROXY_FILE)
+    return " + ".join(sources) if sources else "none"
+
+
+def configured_proxies() -> list[str]:
+    """Every proxy this run should rotate through, in priority order.
+
+    PROXY_URL first (explicit single proxy), then PROXY_URLS, then the
+    proxy file. Duplicates are dropped, so listing a proxy twice is safe.
+    """
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for proxy in (parse_proxy_list(PROXY_URL or "")
+                  + parse_proxy_list(PROXY_URLS_RAW)
+                  + _proxy_file_entries()):
+        if proxy not in seen:
+            seen.add(proxy)
+            ordered.append(proxy)
+    return ordered
 ENABLE_EXTRA_PLATFORMS = os.getenv("ENABLE_EXTRA_PLATFORMS", "true").strip().lower() in (
     "true", "1", "yes", "on", "")
 
@@ -396,9 +445,7 @@ class SniperBot(discord.Client):
         )
 
         # Initialize proxy pool
-        proxy_list = parse_proxy_list(PROXY_URLS_RAW)
-        if PROXY_URL and PROXY_URL not in proxy_list:
-            proxy_list.insert(0, PROXY_URL)
+        proxy_list = configured_proxies()
         if proxy_list:
             self.proxy_pool = ProxyPool(
                 proxy_list, allow_direct_fallback=PROXY_ALLOW_DIRECT_FALLBACK)
@@ -1129,7 +1176,8 @@ class SniperBot(discord.Client):
         # Proxy pool status
         if self.proxy_pool is not None:
             print(f"🧊 Proxy pool       : {self.proxy_pool.size} proxies | "
-                  f"{self.proxy_pool.alive_count} alive")
+                  f"{self.proxy_pool.alive_count} alive "
+                  f"(from {_proxy_source_summary()})")
             print(f"   └─ {self.proxy_pool.status_summary()}")
         elif PROXY_URL:
             print("🧊 Proxy            : on (single)")
@@ -1320,15 +1368,24 @@ def main() -> None:
         raise SystemExit(
             "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', 'account', "
             "'account_api', or 'probe'.")
-    if PROXY_URL:
-        proxy_error = checkers.validate_proxy_url(PROXY_URL)
-        if proxy_error:
-            raise SystemExit(f"❌ {proxy_error}")
-    # Validate each proxy in the pool
-    for proxy in parse_proxy_list(PROXY_URLS_RAW):
+    # Validate every proxy that will actually be used, whether it came from
+    # PROXY_URL, PROXY_URLS, or the proxy file.
+    resolved_proxies = configured_proxies()
+    if PROXY_FILE and not resolved_proxies and os.path.exists(PROXY_FILE):
+        raise SystemExit(
+            f"❌ {PROXY_FILE} exists but contains no usable proxy. Use one "
+            "line per proxy, for example 1.2.3.4:8080 or "
+            "1.2.3.4:8080:user:pass, or delete the file to run without "
+            "proxies.")
+    for proxy in resolved_proxies:
         proxy_error = checkers.validate_proxy_url(proxy)
         if proxy_error:
-            raise SystemExit(f"❌ Proxy in POOL: {proxy_error}")
+            raise SystemExit(
+                f"❌ Proxy in POOL: {proxy_error} "
+                f"(offending entry: {short_proxy_url(proxy)})"
+                + ("\n   SOCKS proxies are not supported: aiohttp needs an "
+                   "http:// or https:// proxy endpoint."
+                   if proxy.lower().startswith("socks") else ""))
     if DISCORD_ACCOUNT_API_TOKEN:
         if not checkers.is_valid_header_name(DISCORD_ACCOUNT_API_TOKEN_HEADER):
             raise SystemExit(
