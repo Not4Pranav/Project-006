@@ -13,3 +13,9 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# proxy lists (contain credentials) - keep the example only
+proxies.txt
+proxies*.txt
+!proxies.txt.example
+.proxy-cache.txt

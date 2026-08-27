@@ -38,9 +38,9 @@ import asyncio
 import re
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
-from urllib.parse import unquote, urlencode, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import aiohttp
 import logging
@@ -117,8 +117,10 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    # Only advertise encodings aiohttp can always decode. Advertising "br"
+    # without the optional Brotli package makes real sites answer with a body
+    # aiohttp cannot read, turning good checks into ERROR results.
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # API-specific headers for JSON endpoints
@@ -126,8 +128,7 @@ API_HEADERS = {
     "User-Agent": BROWSER_HEADERS["User-Agent"],
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 
@@ -185,11 +186,55 @@ GUNSLOL_UNCLAIMED_MARKERS = (
 _MISSING_PAYLOAD = object()
 
 
+def _normalize_page(page: str) -> str:
+    """Casefold page text and fold typographic quotes to ASCII.
+
+    Instagram and X render "doesn\u2019t" with a typographic apostrophe, so a
+    literal "doesn't" marker would never match the page they actually serve.
+    """
+
+    return (page.replace("\u2019", "'").replace("\u2018", "'")
+                .replace("\u201c", '"').replace("\u201d", '"')
+                .casefold())
+
+
 GUNSLOL_CHALLENGE_MARKERS = (
     "just a moment...",
     "attention required",
     "cf-chl-",
     "/cdn-cgi/challenge-platform",
+)
+
+
+# Instagram and X are matched against narrow, page-specific phrases. Broad
+# words such as "challenge" or "captcha" appear inside ordinary profile HTML
+# (bios, scripts, CSS class names) and used to mark live profiles as BLOCKED.
+INSTAGRAM_MISSING_MARKERS = (
+    "sorry, this page isn't available",
+    "the link you followed may be broken",
+    "page not found \u2022 instagram",
+)
+INSTAGRAM_BLOCKED_MARKERS = (
+    "login \u2022 instagram",
+    "log in to instagram",
+    "login to instagram",
+    "checkpoint_required",
+    "/challenge/",
+    "please wait a few minutes before you try again",
+)
+TWITTER_MISSING_MARKERS = (
+    "this account doesn't exist",
+    "this user doesn't exist",
+    "hmm...this page doesn't exist",
+    "this page doesn't exist",
+)
+TWITTER_BLOCKED_MARKERS = (
+    "rate limit exceeded",
+    "solve this captcha",
+    "confirm you're not a robot",
+    "arkose",
+    "/i/flow/login",
+    "something went wrong, but don't fret",
 )
 
 
@@ -226,7 +271,7 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
             return TAKEN
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
+        content = _normalize_page(page)
         if any(marker in content for marker in GUNSLOL_CHALLENGE_MARKERS):
             return BLOCKED
         if any(marker in content for marker in GUNSLOL_UNCLAIMED_MARKERS):
@@ -234,7 +279,8 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
         return TAKEN
     if status in (404, 410):
         if isinstance(page, str) and any(
-                marker in page.casefold() for marker in GUNSLOL_CHALLENGE_MARKERS):
+                marker in _normalize_page(page)
+                for marker in GUNSLOL_CHALLENGE_MARKERS):
             return BLOCKED
         return AVAILABLE
     if status == 400:
@@ -374,7 +420,7 @@ def interpret_steam(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
+        content = _normalize_page(page)
         # Steam serves a "profile not found" page with 200 for missing profiles
         if "the specified profile could not be found" in content:
             return AVAILABLE
@@ -421,13 +467,14 @@ def interpret_instagram(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
-        # Login wall / challenge
-        if "login to instagram" in content or "challenge" in content:
-            return BLOCKED
-        # "Sorry, this page isn't available" indicates a non-existing profile
-        if "sorry, this page isn't available" in content:
+        content = _normalize_page(page)
+        # A missing profile is the strongest signal, so test it first: a login
+        # wall page can also mention "log in", and the old ordering made every
+        # free name look BLOCKED.
+        if any(marker in content for marker in INSTAGRAM_MISSING_MARKERS):
             return AVAILABLE
+        if any(marker in content for marker in INSTAGRAM_BLOCKED_MARKERS):
+            return BLOCKED
         return TAKEN
     if status == 404:
         return AVAILABLE
@@ -449,15 +496,10 @@ def interpret_twitter(status: int, page: str | None = None) -> str:
     if status == 200:
         if not isinstance(page, str) or not page.strip():
             return BLOCKED
-        content = page.casefold()
-        # Account doesn't exist markers
-        if ("this account doesn't exist" in content
-                or "this user doesn't exist" in content
-                or "hmm...this page doesn't exist" in content):
+        content = _normalize_page(page)
+        if any(marker in content for marker in TWITTER_MISSING_MARKERS):
             return AVAILABLE
-        # Challenge / rate limit
-        if any(marker in content for marker in (
-                "rate limit exceeded", "captcha", "challenge")):
+        if any(marker in content for marker in TWITTER_BLOCKED_MARKERS):
             return BLOCKED
         return TAKEN
     if status == 404:
@@ -496,123 +538,199 @@ def _decoded_url_component_has_control_chars(value: str | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Retry helper
+# Request layer: proxy resolution, health reporting, and transient retries
 # ---------------------------------------------------------------------------
 
-async def _retry_request(
-    coro_factory,
-    max_retries: int = 1,
-    base_delay: float = 0.15,
-) -> object:
-    """Retry an async request factory on transient failures.
+# Failures worth retrying once: connection resets, proxy hiccups, timeouts.
+# A definitive HTTP status is never retried, and neither is a ValueError from
+# a malformed URL, which would fail identically every time.
+_TRANSIENT_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    aiohttp.ServerTimeoutError,
+    asyncio.TimeoutError,
+)
+# Failures that say something about the proxy rather than the target site.
+_PROXY_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError)
 
-    ``coro_factory`` is called fresh on each retry (it must return a new
-    coroutine). Only network/timeout errors trigger a retry; definitive
-    HTTP status responses are not retried.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await coro_factory()
-        except _REQUEST_ERRORS as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                delay = base_delay * (2 ** attempt)
-                await asyncio.sleep(delay)
-    raise last_exc  # type: ignore[misc]
+DEFAULT_MAX_RETRIES = 1
+DEFAULT_RETRY_DELAY = 0.05
 
 
-# ---------------------------------------------------------------------------
-# Fetch functions (with optional proxy pool support)
-# ---------------------------------------------------------------------------
+def _resolve_proxy(proxy: object) -> str | None:
+    """Resolve a proxy: accept a string, a callable factory, or ``None``."""
 
-def _resolve_proxy(proxy: str | None) -> str | None:
-    """Resolve proxy: accept a string, a callable, or None."""
     if proxy is None:
         return None
     if callable(proxy):
         return proxy()
-    return proxy
+    return proxy if isinstance(proxy, str) else None
 
+
+def _report_proxy(proxy: object, url: str | None, *, ok: bool) -> None:
+    """Feed one request outcome back to a pool that wants to hear about it.
+
+    Pools expose ``report_success`` / ``report_failure``; plain strings and
+    ``None`` do not, so this is a no-op for them. Reporting must never be able
+    to break a check, hence the broad guard.
+    """
+
+    if not url:
+        return
+    reporter = getattr(proxy, "report_success" if ok else "report_failure", None)
+    if not callable(reporter):
+        return
+    try:
+        reporter(url)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Proxy health reporting failed: %s", exc)
+
+
+async def _with_proxy(
+    proxy: object,
+    operation,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_RETRY_DELAY,
+):
+    """Run ``operation(proxy_url)`` with rotation, reporting, and one retry.
+
+    The proxy is resolved *per attempt*, so a retry automatically lands on the
+    next proxy in the rotation instead of hammering the one that just failed.
+    """
+
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        resolved = _resolve_proxy(proxy)
+        try:
+            result = await operation(resolved)
+        except _PROXY_ERRORS as exc:
+            _report_proxy(proxy, resolved, ok=False)
+            last_exc = exc
+            if attempt < max_retries and isinstance(exc, _TRANSIENT_ERRORS):
+                delay = base_delay * (2 ** attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                continue
+            raise
+        else:
+            _report_proxy(proxy, resolved, ok=True)
+            return result
+    raise last_exc  # pragma: no cover - loop always returns or raises
+
+
+async def _read_json_body(response: aiohttp.ClientResponse) -> object | None:
+    """Decode a JSON body, keeping malformed successful bodies distinguishable."""
+
+    try:
+        try:
+            return await response.json(content_type=None)
+        except TypeError:
+            return await response.json()
+    except (TypeError, ValueError, aiohttp.ContentTypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fetch functions (with proxy pool support)
+# ---------------------------------------------------------------------------
 
 async def _fetch_status(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> int:
     """GET one endpoint and return its status without following redirects."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(
-        url,
-        proxy=resolved_proxy,
-        headers=headers,
-        allow_redirects=False,
-    ) as response:
-        return response.status
+    async def attempt(resolved_proxy: str | None) -> int:
+        async with session.get(
+            url,
+            proxy=resolved_proxy,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            return response.status
+
+    return await _with_proxy(proxy, attempt)
 
 
 async def _fetch_json_get(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
     """GET JSON and keep malformed successful bodies distinguishable."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(url, proxy=resolved_proxy, headers=headers) as response:
-        try:
-            try:
-                body = await response.json(content_type=None)
-            except TypeError:
-                body = await response.json()
-        except (TypeError, ValueError, aiohttp.ContentTypeError):
-            body = None
-        return response.status, body
+    async def attempt(resolved_proxy: str | None) -> tuple[int, object | None]:
+        async with session.get(
+            url, proxy=resolved_proxy, headers=headers,
+        ) as response:
+            return response.status, await _read_json_body(response)
+
+    return await _with_proxy(proxy, attempt)
 
 
 async def _fetch_json(
     session: aiohttp.ClientSession,
     url: str,
     payload: Mapping[str, object],
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
     """POST JSON and return the status plus a decoded response, if any."""
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.post(
-        url,
-        json=dict(payload),
-        proxy=resolved_proxy,
-        headers=headers,
-        allow_redirects=False,
-    ) as response:
-        try:
-            try:
-                body = await response.json(content_type=None)
-            except TypeError:
-                body = await response.json()
-        except (TypeError, ValueError, aiohttp.ContentTypeError):
-            body = None
-        return response.status, body
+    body = dict(payload)
+
+    async def attempt(resolved_proxy: str | None) -> tuple[int, object | None]:
+        async with session.post(
+            url,
+            json=body,
+            proxy=resolved_proxy,
+            headers=headers,
+            allow_redirects=False,
+        ) as response:
+            return response.status, await _read_json_body(response)
+
+    return await _with_proxy(proxy, attempt)
+
+
+# Profile pages can be megabytes of JS. Every marker this bot looks for lives
+# in the first screenful of markup (title, meta, error banner), so the body is
+# read only up to this cap and the rest of the transfer is abandoned.
+MAX_PAGE_BYTES = 96 * 1024
 
 
 async def _fetch_page(
     session: aiohttp.ClientSession,
     url: str,
-    proxy: str | None = None,
+    proxy: object = None,
     headers: Mapping[str, str] | None = None,
+    max_bytes: int = MAX_PAGE_BYTES,
 ) -> tuple[int, str]:
-    """GET a URL and return its status and decoded HTML without redirects."""
+    """GET a URL and return its status and a bounded prefix of its HTML.
 
-    resolved_proxy = _resolve_proxy(proxy)
-    async with session.get(
-        url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
-    ) as response:
-        return response.status, await response.text(errors="replace")
+    Reading a capped prefix instead of the whole body is a large latency win
+    on the page-scraped platforms (Steam, Instagram, X) and cannot change a
+    verdict: the markers are always near the top of the document.
+    """
+
+    async def attempt(resolved_proxy: str | None) -> tuple[int, str]:
+        async with session.get(
+            url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
+        ) as response:
+            if max_bytes and max_bytes > 0:
+                raw = await response.content.read(max_bytes)
+                encoding = response.charset or "utf-8"
+                try:
+                    text = raw.decode(encoding, errors="replace")
+                except LookupError:  # server advertised a charset Python lacks
+                    text = raw.decode("utf-8", errors="replace")
+            else:
+                text = await response.text(errors="replace")
+            return response.status, text
+
+    return await _with_proxy(proxy, attempt)
 
 
 def _safe_url(template: str, username: str) -> str:
@@ -755,9 +873,24 @@ def _request_error(platform: str, emoji: str, exc: Exception) -> Result:
 
 # Mojang occasionally returns random 403s at api.mojang.com, so retry the
 # equivalent minecraftservices lookup once.
+# How long the primary Mojang endpoint gets before the backup is hedged in.
+MINECRAFT_HEDGE_DELAY = 0.15
+
 MINECRAFT_ENDPOINTS: Sequence[str] = (
     "https://api.mojang.com/users/profiles/minecraft/{username}",
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{username}",
+)
+
+# Hosts contacted by the checkers, used to pre-open pooled TLS connections.
+PREWARM_URLS: tuple[str, ...] = (
+    "https://api.mojang.com/",
+    "https://api.minecraftservices.com/",
+    "https://guns.lol/",
+    "https://api.github.com/",
+    "https://steamcommunity.com/",
+    "https://www.reddit.com/",
+    "https://www.instagram.com/",
+    "https://x.com/",
 )
 
 DEFAULT_DISCORD_ACCOUNT_API_URL = (
@@ -909,8 +1042,31 @@ def _remaining_page_seconds(deadline: float) -> float:
 # Platform checkers (async)
 # ---------------------------------------------------------------------------
 
+async def _minecraft_lookup(session, template: str, username: str, proxy) -> Result:
+    """One Mojang endpoint lookup, normalized into a Result."""
+
+    try:
+        status, payload = await _fetch_json_get(
+            session, _safe_url(template, username), proxy)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Minecraft", MINECRAFT_EMOJI, exc)
+    outcome_status = interpret_minecraft(status, payload)
+    detail = f"HTTP {status}"
+    if status == 200 and outcome_status == BLOCKED:
+        detail += " (unexpected profile response)"
+    return Result("Minecraft", MINECRAFT_EMOJI, outcome_status, detail)
+
+
 async def check_minecraft(session, username: str, proxy=None) -> Result:
-    """Check Minecraft/Mojang availability (emoji 🕹️)."""
+    """Check Minecraft/Mojang availability (emoji 🕹️).
+
+    Mojang hands out sporadic 403s at api.mojang.com, so a second endpoint
+    exists as a fallback. It is issued as a *hedged* request: the backup only
+    starts if the primary has not answered within MINECRAFT_HEDGE_DELAY, and
+    the first definitive answer wins with the other cancelled. A healthy
+    primary therefore still costs exactly one request, while a slow or blocked
+    one no longer doubles this check's latency.
+    """
 
     if not MINECRAFT_PATTERN.fullmatch(username):
         return Result(
@@ -918,25 +1074,36 @@ async def check_minecraft(session, username: str, proxy=None) -> Result:
             "name must be 3-16 chars of A-Z a-z 0-9 _",
         )
 
-    outcome: Result | None = None
-    for template in MINECRAFT_ENDPOINTS:
-        try:
-            status, payload = await _fetch_json_get(
-                session, _safe_url(template, username), proxy)
-            outcome_status = interpret_minecraft(status, payload)
-            detail = f"HTTP {status}"
-            if status == 200 and outcome_status == BLOCKED:
-                detail += " (unexpected profile response)"
-            outcome = Result(
-                "Minecraft", MINECRAFT_EMOJI,
-                outcome_status, detail,
-            )
-            if outcome.status not in (BLOCKED, ERROR):
-                return outcome
-        except _REQUEST_ERRORS as exc:
-            outcome = _request_error("Minecraft", MINECRAFT_EMOJI, exc)
+    async def hedged(template: str, delay: float):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await _minecraft_lookup(session, template, username, proxy)
 
-    return outcome or Result("Minecraft", MINECRAFT_EMOJI, ERROR, "no endpoint attempted")
+    tasks = [
+        asyncio.ensure_future(hedged(template, index * MINECRAFT_HEDGE_DELAY))
+        for index, template in enumerate(MINECRAFT_ENDPOINTS)
+    ]
+    fallback: Result | None = None
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                outcome = await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                fallback = fallback or _request_error(
+                    "Minecraft", MINECRAFT_EMOJI, exc)
+                continue
+            if outcome.status not in (BLOCKED, ERROR):
+                return outcome        # definitive: stop waiting for the rest
+            fallback = fallback or outcome
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+    return fallback or Result(
+        "Minecraft", MINECRAFT_EMOJI, ERROR, "no endpoint attempted")
 
 
 async def check_gunslol(session, username: str, proxy=None) -> Result:
@@ -1301,12 +1468,195 @@ async def check_twitter(session, username: str, proxy=None) -> Result:
 
 
 # ---------------------------------------------------------------------------
+# instantusername.com fallback provider
+# ---------------------------------------------------------------------------
+#
+# When a platform's own endpoint stops answering usefully - Cloudflare wall,
+# rate limit, login gate, network error - the check would otherwise report
+# "Unknown". instantusername.com exposes a small credential-free JSON API that
+# answers the same question, so it is used as a second opinion *only* for the
+# platforms that came back inconclusive.
+#
+#   GET https://api.instantusername.com/services.json
+#       -> {"services": [{"service": "GitHub",
+#                         "endpoint": "/check/github/{username}"}, ...]}
+#   GET https://api.instantusername.com/check/<service>/<username>
+#       -> {"available": true|false, "url": "..."}
+
+INSTANTUSERNAME_BASE_URL = "https://api.instantusername.com"
+INSTANTUSERNAME_SERVICES_URL = f"{INSTANTUSERNAME_BASE_URL}/services.json"
+
+# Our platform name -> their service slug. Seeded with the slugs the service
+# has shipped for years; refresh_instantusername_services() can extend this at
+# runtime from their live catalogue.
+INSTANTUSERNAME_SERVICES: dict[str, str] = {
+    "GitHub": "github",
+    "Steam": "steam",
+    "Reddit": "reddit",
+    "Instagram": "instagram",
+    "Twitter/X": "twitter",
+}
+
+# Their service names, normalized, mapped onto our platform names. Used when
+# refreshing from the live catalogue so newly added services (for example
+# Discord or Minecraft) are picked up without a code change.
+_INSTANTUSERNAME_ALIASES: dict[str, str] = {
+    "github": "GitHub",
+    "steam": "Steam",
+    "reddit": "Reddit",
+    "instagram": "Instagram",
+    "twitter": "Twitter/X",
+    "x": "Twitter/X",
+    "xtwitter": "Twitter/X",
+    "discord": "Discord",
+    "minecraft": "Minecraft",
+}
+
+
+def _normalize_service_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).casefold())
+
+
+def interpret_instantusername(status: int, payload: object | None) -> str:
+    """Map one instantusername.com check response to a normalized status."""
+
+    if status == 404:
+        # Unknown service slug: not an availability answer.
+        return ERROR
+    if status in (401, 403, 429):
+        return BLOCKED
+    if status != 200 or not isinstance(payload, Mapping):
+        return ERROR
+    available = payload.get("available")
+    if type(available) is not bool:
+        return ERROR
+    return AVAILABLE if available else TAKEN
+
+
+async def refresh_instantusername_services(
+    session: aiohttp.ClientSession,
+    proxy: object = None,
+    timeout: float = 6.0,
+) -> int:
+    """Learn the live service catalogue so new platforms map automatically.
+
+    Failure is not an error: the seeded map keeps working. Returns how many
+    of our platforms are currently covered.
+    """
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
+    try:
+        async with session.get(
+            INSTANTUSERNAME_SERVICES_URL,
+            proxy=_resolve_proxy(proxy),
+            timeout=request_timeout,
+            headers=API_HEADERS,
+        ) as response:
+            if response.status != 200:
+                return len(INSTANTUSERNAME_SERVICES)
+            payload = await _read_json_body(response)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.debug("instantusername catalogue unavailable: %s",
+                  _redact_sensitive_text(exc))
+        return len(INSTANTUSERNAME_SERVICES)
+
+    services = payload.get("services") if isinstance(payload, Mapping) else None
+    if not isinstance(services, Sequence):
+        return len(INSTANTUSERNAME_SERVICES)
+
+    known = {name for name, _emoji in PLATFORMS}
+    for entry in services:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_name = entry.get("service")
+        endpoint = entry.get("endpoint")
+        if not isinstance(raw_name, str) or not isinstance(endpoint, str):
+            continue
+        platform = _INSTANTUSERNAME_ALIASES.get(_normalize_service_name(raw_name))
+        if platform not in known:
+            continue
+        # "/check/github/{username}" -> "github"
+        parts = [part for part in endpoint.split("/") if part]
+        if len(parts) >= 2 and parts[0] == "check":
+            INSTANTUSERNAME_SERVICES[platform] = parts[1]
+
+    return len(INSTANTUSERNAME_SERVICES)
+
+
+async def check_instantusername(
+    session: aiohttp.ClientSession,
+    platform: str,
+    emoji: str,
+    username: str,
+    proxy: object = None,
+) -> Result:
+    """Ask instantusername.com about one platform. Never raises."""
+
+    service = INSTANTUSERNAME_SERVICES.get(platform)
+    if not service:
+        return Result(platform, emoji, ERROR, "no instantusername service")
+    try:
+        url = (f"{INSTANTUSERNAME_BASE_URL}/check/"
+               f"{quote(service, safe='')}/{quote(username, safe='')}")
+        status, payload = await _fetch_json_get(
+            session, url, proxy, headers=API_HEADERS)
+    except _REQUEST_ERRORS as exc:
+        return Result(platform, emoji, ERROR,
+                      f"instantusername: {_redact_sensitive_text(exc)}")
+    outcome = interpret_instantusername(status, payload)
+    return Result(platform, emoji, outcome,
+                  f"instantusername HTTP {status}")
+
+
+async def _with_fallback(
+    primary,
+    session: aiohttp.ClientSession,
+    platform: str,
+    emoji: str,
+    username: str,
+    proxy: object = None,
+) -> Result:
+    """Run a platform's own check, then a second opinion if it was useless.
+
+    The fallback only runs when the primary could not answer (BLOCKED/ERROR),
+    so the fast path costs nothing extra, and it only replaces the result when
+    the fallback is itself definitive.
+    """
+
+    result = await primary
+    if result.status not in (BLOCKED, ERROR):
+        return result
+    if platform not in INSTANTUSERNAME_SERVICES:
+        return result
+
+    fallback = await check_instantusername(
+        session, platform, emoji, username, proxy)
+    if fallback.status in (AVAILABLE, TAKEN):
+        log.info("%s: primary was %s, instantusername says %s",
+                 platform, result.status, fallback.status)
+        return fallback
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Parallel fan-out and deadline support
 # ---------------------------------------------------------------------------
 
-def timeout_results(detail: str = "check deadline reached") -> list[Result]:
-    """Return one honest unknown/error result per platform."""
-    return [Result(platform, emoji, ERROR, detail) for platform, emoji in PLATFORMS]
+def timeout_results(
+    detail: str = "check deadline reached",
+    include_extra: bool = True,
+) -> list[Result]:
+    """Return one honest unknown/error result per platform that would run.
+
+    ``include_extra`` mirrors ``run_all_checks(enable_extra_platforms=...)`` so
+    a timed-out lookup reports exactly the platforms that were configured,
+    instead of inventing errors for checks that are switched off.
+    """
+
+    platforms = PLATFORMS if include_extra else CORE_PLATFORMS
+    return [Result(platform, emoji, ERROR, detail) for platform, emoji in platforms]
 
 
 async def _run_bounded(
@@ -1331,10 +1681,10 @@ async def _run_bounded(
         return _request_error(fallback.platform, fallback.emoji, exc)
 
 
-async def run_all_checks(
+def build_check_workers(
     session: aiohttp.ClientSession,
     username: str,
-    proxy: str | None = None,
+    proxy: object = None,
     discord_mode: str = "off",
     discord_probe_url: str | None = None,
     discord_probe_headers: Mapping[str, str] | None = None,
@@ -1344,22 +1694,33 @@ async def run_all_checks(
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
-) -> list[Result]:
-    """Fan out every platform check in parallel.
+    instantusername_fallback: bool = True,
+) -> list[Awaitable[Result]]:
+    """Build one bounded coroutine per configured platform, in PLATFORMS order.
 
-    ``timeout`` is a *shared wall-clock budget* for the fan-out. Every worker
-    begins at the same time, so the total duration is at most the one timeout,
-    not the sum of platform timeouts. Timed-out workers return ERROR results.
+    Nothing runs until the caller awaits or schedules them, which lets a caller
+    either gather them (ordered results) or consume them as they complete.
 
-    When ``enable_extra_platforms`` is True, GitHub, Steam, Reddit, Instagram,
-    and Twitter/X are also checked in parallel.
+    Each worker is independent and holds no shared mutable state, so any number
+    of lookups (different users, different usernames) can run at the same time.
     """
 
     fallbacks = timeout_results()
-    workers = [
-        _run_bounded(check_minecraft(session, username, proxy), fallbacks[0], timeout),
-        _run_bounded(check_gunslol(session, username, proxy), fallbacks[1], timeout),
-        _run_bounded(
+
+    def bounded(coro, deadline_result: Result) -> Awaitable[Result]:
+        """Attach the instantusername second opinion, then the deadline."""
+
+        if (instantusername_fallback
+                and deadline_result.platform in INSTANTUSERNAME_SERVICES):
+            coro = _with_fallback(
+                coro, session, deadline_result.platform,
+                deadline_result.emoji, username, proxy)
+        return _run_bounded(coro, deadline_result, timeout)
+
+    workers: list[Awaitable[Result]] = [
+        bounded(check_minecraft(session, username, proxy), fallbacks[0]),
+        bounded(check_gunslol(session, username, proxy), fallbacks[1]),
+        bounded(
             check_discord(
                 session,
                 username,
@@ -1373,7 +1734,7 @@ async def run_all_checks(
                 dnsrobot_semaphore=dnsrobot_semaphore,
                 dnsrobot_timeout=timeout,
             ),
-            fallbacks[2], timeout,
+            fallbacks[2],
         ),
     ]
 
@@ -1382,19 +1743,141 @@ async def run_all_checks(
             Result(p, e, ERROR, "check deadline reached") for p, e in FAST_PLATFORMS
         ]
         workers.extend([
-            _run_bounded(
-                check_github(session, username, proxy), extra_fallbacks[0], timeout),
-            _run_bounded(
-                check_steam(session, username, proxy), extra_fallbacks[1], timeout),
-            _run_bounded(
-                check_reddit(session, username, proxy), extra_fallbacks[2], timeout),
-            _run_bounded(
-                check_instagram(session, username, proxy), extra_fallbacks[3], timeout),
-            _run_bounded(
-                check_twitter(session, username, proxy), extra_fallbacks[4], timeout),
+            bounded(check_github(session, username, proxy), extra_fallbacks[0]),
+            bounded(check_steam(session, username, proxy), extra_fallbacks[1]),
+            bounded(check_reddit(session, username, proxy), extra_fallbacks[2]),
+            bounded(check_instagram(session, username, proxy), extra_fallbacks[3]),
+            bounded(check_twitter(session, username, proxy), extra_fallbacks[4]),
         ])
 
+    return workers
+
+
+async def run_all_checks(
+    session: aiohttp.ClientSession,
+    username: str,
+    proxy: object = None,
+    discord_mode: str = "off",
+    discord_probe_url: str | None = None,
+    discord_probe_headers: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    discord_account_api_url: str | None = None,
+    discord_account_api_headers: Mapping[str, str] | None = None,
+    dnsrobot_browser=None,
+    dnsrobot_semaphore: asyncio.Semaphore | None = None,
+    enable_extra_platforms: bool = True,
+    instantusername_fallback: bool = True,
+) -> list[Result]:
+    """Fan out every platform check in parallel and return ordered results.
+
+    ``timeout`` is a *shared wall-clock budget* for the fan-out. Every worker
+    begins at the same time, so the total duration is at most the one timeout,
+    not the sum of platform timeouts. Timed-out workers return ERROR results.
+
+    Results come back in ``PLATFORMS`` order. Use ``stream_all_checks`` when
+    you would rather act on each platform the moment it answers.
+    """
+
+    workers = build_check_workers(
+        session, username, proxy,
+        discord_mode=discord_mode,
+        discord_probe_url=discord_probe_url,
+        discord_probe_headers=discord_probe_headers,
+        timeout=timeout,
+        discord_account_api_url=discord_account_api_url,
+        discord_account_api_headers=discord_account_api_headers,
+        dnsrobot_browser=dnsrobot_browser,
+        dnsrobot_semaphore=dnsrobot_semaphore,
+        enable_extra_platforms=enable_extra_platforms,
+        instantusername_fallback=instantusername_fallback,
+    )
     return list(await asyncio.gather(*workers))
+
+
+async def stream_all_checks(
+    session: aiohttp.ClientSession,
+    username: str,
+    proxy: object = None,
+    discord_mode: str = "off",
+    discord_probe_url: str | None = None,
+    discord_probe_headers: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+    discord_account_api_url: str | None = None,
+    discord_account_api_headers: Mapping[str, str] | None = None,
+    dnsrobot_browser=None,
+    dnsrobot_semaphore: asyncio.Semaphore | None = None,
+    enable_extra_platforms: bool = True,
+    instantusername_fallback: bool = True,
+) -> AsyncIterator[Result]:
+    """Yield each platform result the moment that platform answers.
+
+    Same parallel fan-out and same shared deadline as ``run_all_checks``, but
+    the caller does not have to wait for the slowest platform before acting on
+    the fastest one. Results arrive in completion order, not PLATFORMS order.
+    """
+
+    workers = build_check_workers(
+        session, username, proxy,
+        discord_mode=discord_mode,
+        discord_probe_url=discord_probe_url,
+        discord_probe_headers=discord_probe_headers,
+        timeout=timeout,
+        discord_account_api_url=discord_account_api_url,
+        discord_account_api_headers=discord_account_api_headers,
+        dnsrobot_browser=dnsrobot_browser,
+        dnsrobot_semaphore=dnsrobot_semaphore,
+        enable_extra_platforms=enable_extra_platforms,
+        instantusername_fallback=instantusername_fallback,
+    )
+    tasks = [asyncio.ensure_future(worker) for worker in workers]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                yield await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error("Checker task failed: %s", _redact_sensitive_text(exc))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
+async def prewarm_connections(
+    session: aiohttp.ClientSession,
+    proxy: object = None,
+    timeout: float = 4.0,
+) -> int:
+    """Open a pooled TLS connection to every platform host up front.
+
+    The first request to a host pays DNS + TCP + TLS (often 100-300 ms). Doing
+    that once at startup, in the background, means the first real lookup reuses
+    a warm keep-alive connection instead. Failures are ignored on purpose: this
+    is an optimisation, never a startup requirement.
+
+    Returns the number of hosts successfully warmed.
+    """
+
+    request_timeout = aiohttp.ClientTimeout(total=max(0.5, timeout))
+
+    async def warm(url: str) -> bool:
+        try:
+            async with session.head(
+                url,
+                proxy=_resolve_proxy(proxy),
+                timeout=request_timeout,
+                allow_redirects=False,
+            ) as response:
+                response.release()
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            return False
+
+    warmed = await asyncio.gather(*(warm(url) for url in PREWARM_URLS))
+    return sum(1 for ok in warmed if ok)
 
 
 # ---------------------------------------------------------------------------

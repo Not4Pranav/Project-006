@@ -1,0 +1,27 @@
+# Multi-Sniper proxy list
+#
+# Copy this file to proxies.txt and paste your proxies in, one per line.
+# It is loaded automatically at startup - no environment variable needed -
+# and proxies.txt is gitignored, so your credentials never get committed.
+#
+# Any of these formats work; they are all normalised for you:
+#
+#   1.2.3.4:8080                      bare host:port
+#   1.2.3.4:8080:user:pass            host:port:user:pass  (most vendors)
+#   user:pass@1.2.3.4:8080            credentials, no scheme
+#   user:pass:1.2.3.4:8080            credentials first
+#   http://user:pass@1.2.3.4:8080     already a URL
+#   https://1.2.3.4:3128              HTTPS proxy endpoint
+#
+# Blank lines and lines starting with # are ignored. Duplicates are dropped.
+# SOCKS proxies are NOT supported and will stop the bot at startup with a
+# clear message rather than silently exposing your real IP.
+#
+# Check your list any time with:   python proxies.py
+#
+# Distil a huge public list into 100 verified working proxies:
+#   python proxies.py "<list url>" --want 1000 --skip-socks --keep proxies.txt
+
+# gate.example-vendor.com:7000:myuser:mypassword
+# gate.example-vendor.com:7001:myuser:mypassword
+# 203.0.113.9:8080
