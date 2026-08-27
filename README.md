@@ -6,14 +6,24 @@ Post a bare username in a watched Discord channel. The bot checks it across **8 
 
 ```
 you:  vortex
-bot:  🕹️ 💻 👀        ← free on Minecraft, GitHub, and Reddit
+
+bot:  Minecraft: Available
+      guns.lol: Unavailable
+      Discord: Unavailable
+      GitHub: Available
+      Steam: Unavailable
+      Reddit: Available
+      Instagram: Unknown
+      Twitter/X: Unavailable
 ```
+
+The reply appears **immediately** and fills in live as each platform reports. Prefer emoji reactions on the original message instead? Set `RESPONSE_MODE=react`.
 
 ---
 
 ## Contents
 
-- [What the reactions mean](#what-the-reactions-mean)
+- [How it answers](#how-it-answers)
 - [Quick start](#quick-start)
 - [How a lookup works](#how-a-lookup-works)
 - [Speed: why answers are instant](#speed-why-answers-are-instant)
@@ -28,18 +38,38 @@ bot:  🕹️ 💻 👀        ← free on Minecraft, GitHub, and Reddit
 
 ---
 
-## What the reactions mean
+## How it answers
+
+`RESPONSE_MODE` picks the style — `reply` (default), `react`, or `both`.
+
+### Reply mode (default)
+
+One message per lookup, listing every platform:
+
+| Word | Meaning |
+|---|---|
+| **Available** | The name is free there |
+| **Unavailable** | Taken |
+| **Invalid** | The name can never be used there (too short, illegal characters) |
+| **Unknown** | Blocked, rate-limited, or timed out — the bot refuses to guess |
+| **Checking...** | Still waiting; replaced as soon as that platform answers |
+
+Platforms that are switched off are hidden (`REPLY_INCLUDE_SKIPPED=true` shows them as *Not checked*), and the requester is not pinged (`REPLY_MENTION_AUTHOR=true` changes that).
+
+### React mode
 
 | Reaction | Meaning |
 |---|---|
 | 🕹️ 🔫 🐈‍⬛ 💻 🎮 👀 📸 🐦 | The name is **free** on that platform |
-| ❌ | Every platform answered, and none of them were free |
-| ⚠️ | At least one check could not be confirmed (block, rate limit, timeout) — treat the result as unknown |
+| ❌ | Every platform answered, and none were free |
+| ⚠️ | At least one check could not be confirmed — treat the result as unknown |
 | ⏳ | You tripped the per-user flood guard; try again immediately |
 
-The bot never reacts to bots, webhooks, messages in other channels, or anything that is not a single bare username token.
+Either way the bot never responds to bots, webhooks, other channels, or anything that is not a single bare username token.
 
 ---
+
+**Hosting it free, 24/7?** See **[CLOUD_SETUP.md](CLOUD_SETUP.md)**.
 
 ## Quick start
 
@@ -70,7 +100,7 @@ python test_bot.py                # 37 tests
 python bot.py
 ```
 
-Discord-side setup (creating the application, the **Message Content Intent**, and the invite URL) is covered step by step in **[SETUP.md](SETUP.md)**.
+Discord-side setup (creating the application, the **Message Content Intent**, and the invite URL) is covered step by step in **[SETUP.md](SETUP.md)**. To keep it running 24/7 for free, see **[CLOUD_SETUP.md](CLOUD_SETUP.md)**.
 
 Try it without Discord at all:
 
@@ -88,7 +118,7 @@ python checkers.py vortex --no-extra
 3. **Cache** — a recent definitive answer is returned instantly, with no network calls.
 4. **Parallel fan-out** — all 8 checks start at once under one shared wall-clock deadline, so total latency is the *slowest single platform*, not the sum.
 5. **Normalise** — every response maps to `available` / `taken` / `invalid` / `blocked` / `skipped` / `error`.
-6. **React as results land** — each free platform's emoji is added the moment that platform answers. The ❌ / ⚠️ summary is the only verdict that has to wait for everyone.
+6. **Answer as results land** — the reply is posted instantly and edited as each platform reports (or, in react mode, each emoji is added the moment that platform answers). Only the ❌ / ⚠️ summary has to wait for everyone.
 7. **Log hits** — optionally mirror free names into a private channel, always after the user-visible reaction.
 
 Everything after step 1 shares a single response budget (4.5 s by default, hard-clamped below Discord's 5 s interaction feel), so a slow platform can never delay the reaction.
@@ -108,7 +138,7 @@ Everything after step 1 shares a single response budget (4.5 s by default, hard-
 
 | Technique | Effect |
 |---|---|
-| **Streaming reactions** | Each emoji lands the instant that platform answers — a fast free result is never held hostage by a slow site |
+| **Streaming answers** | The reply is painted instantly and updated per platform — a fast result is never held hostage by a slow site |
 | Parallel fan-out with a shared deadline | 8 platforms cost one platform's latency, not the sum |
 | Result cache | Repeat lookups answer in microseconds, zero requests |
 | **Connection pre-warming** | TLS to all 8 hosts is established at startup, so the first lookup skips DNS + TCP + TLS |
@@ -222,7 +252,12 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `TARGET_CHANNEL_ID` | *(blank = all)* | The single channel to watch |
 | `LOG_CHANNEL_ID` | *(blank = off)* | Private channel that receives free-name hits |
 | `ENABLE_EXTRA_PLATFORMS` | `true` | Include GitHub, Steam, Reddit, Instagram, Twitter/X |
-| `STREAM_REACTIONS` | `true` | React per platform as it answers (fastest); `false` batches them |
+| `RESPONSE_MODE` | `reply` | `reply` (text list), `react` (emoji), or `both` |
+| `REPLY_EDIT_INTERVAL` | `0.7` | Minimum seconds between live edits of the reply |
+| `REPLY_INCLUDE_SKIPPED` | `false` | Show disabled platforms as *Not checked* |
+| `REPLY_MENTION_AUTHOR` | `false` | Ping the requester in the reply |
+| `STREAM_REACTIONS` | `true` | Answer per platform as it reports (fastest); `false` batches |
+| `PORT` / `KEEPALIVE_PORT` | *(blank)* | Serve a health endpoint so free hosts keep the bot alive |
 | `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts at startup |
 
 ### Latency and throttling
@@ -271,8 +306,9 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 ## Development and testing
 
 ```bash
-python test_checkers.py       # 79 offline tests (interpreters, request layer, proxies)
-python test_bot.py            # 37 pipeline tests (filters, budget, cache, reactions)
+python test_checkers.py       # 84 offline tests (interpreters, request layer, proxies)
+python test_bot.py            # 54 pipeline tests (filters, budget, cache, reply, reactions)
+python test_stress.py         # 8 stress tests (fuzzing, 200x concurrency, leaks)
 LIVE=1 python test_checkers.py   # additionally hit the real Mojang / guns.lol endpoints
 
 python -m pyflakes *.py       # lint
@@ -284,7 +320,7 @@ python checkers.py Notch      # manual CLI report
 | `bot.py` | Discord client, message pipeline, budget, cache, reactions |
 | `checkers.py` | Per-platform checkers, pure interpreters, request layer, CLI |
 | `proxies.py` | `ProxyPool` rotation and health, `ProxyProvider` handed to checkers |
-| `test_checkers.py` / `test_bot.py` | Offline test suites (no network required) |
+| `test_checkers.py` / `test_bot.py` / `test_stress.py` | Offline test suites (no network required) |
 
 The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pure functions of `(status, body)`, which is why the suites can cover every platform without touching the network.
 
@@ -295,7 +331,8 @@ The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pur
 | Symptom | Cause and fix |
 |---|---|
 | Bot ignores every message | **Message Content Intent** is off in the Developer Portal, or `TARGET_CHANNEL_ID` points at another channel |
-| Bot answers but adds no reaction | Missing the **Add Reactions** permission in that channel — check the log line |
+| Bot stays silent in reply mode | Missing the **Send Messages** permission in that channel — check the log line |
+| Bot answers but adds no reaction | Missing the **Add Reactions** permission (react mode only) |
 | Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` |
 | ⚠️ on every platform | Outbound HTTPS is blocked, or every proxy is down (check the startup banner and `Proxy … benched` logs) |
 | Discord shows `skipped` | Expected: `DISCORD_CHECK_MODE=off` is the default |

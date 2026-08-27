@@ -219,10 +219,88 @@ STREAM_REACTIONS = os.getenv("STREAM_REACTIONS", "true").strip().lower() in (
 PREWARM_CONNECTIONS = os.getenv("PREWARM_CONNECTIONS", "true").strip().lower() in (
     "true", "1", "yes", "on", "")
 
+# How the bot answers a lookup:
+#   reply  = post a readable "Platform: Status" list as a reply (default)
+#   react  = add one emoji per free platform to the original message
+#   both   = do both
+RESPONSE_MODE_RAW = os.getenv("RESPONSE_MODE", "reply").strip().lower()
+RESPONSE_MODE = RESPONSE_MODE_RAW if RESPONSE_MODE_RAW in (
+    "reply", "react", "both") else "reply"
+REPLY_ENABLED = RESPONSE_MODE in ("reply", "both")
+REACT_ENABLED = RESPONSE_MODE in ("react", "both")
+
+# Minimum gap between live edits of the reply while results stream in. The
+# first paint is always immediate; this only throttles the follow-up edits so
+# a lookup cannot burn Discord's per-channel edit rate limit.
+REPLY_EDIT_INTERVAL = _bounded_float(
+    "REPLY_EDIT_INTERVAL", 0.7, minimum=0.1, maximum=5.0)
+
+# Show platforms the config disabled (Discord when DISCORD_CHECK_MODE=off).
+REPLY_INCLUDE_SKIPPED = os.getenv(
+    "REPLY_INCLUDE_SKIPPED", "false").strip().lower() in ("true", "1", "yes", "on")
+
+# Ping the requester when replying. Off by default: it is noisy in a busy
+# sniping channel and the reply is already attached to their message.
+REPLY_MENTION_AUTHOR = os.getenv(
+    "REPLY_MENTION_AUTHOR", "false").strip().lower() in ("true", "1", "yes", "on")
+
+# Wording used in the reply for each normalized status.
+STATUS_LABELS = {
+    checkers.AVAILABLE: "Available",
+    checkers.TAKEN: "Unavailable",
+    checkers.INVALID: "Invalid",
+    checkers.BLOCKED: "Unknown",
+    checkers.ERROR: "Unknown",
+    checkers.SKIPPED: "Not checked",
+}
+PENDING_LABEL = "Checking..."
+
+# Optional tiny HTTP server. Free hosting tiers (Render, Koyeb, Replit) only
+# keep a service alive if it binds a port and answers health checks, so this
+# turns the worker into something they will host for free. Enabled whenever
+# PORT or KEEPALIVE_PORT is present in the environment.
+KEEPALIVE_PORT = _opt_int("KEEPALIVE_PORT") or _opt_int("PORT")
+
 # Feedback emojis
 EMOJI_NONE_AVAILABLE = "❌"
 EMOJI_ALL_FAILED = "⚠️"
 EMOJI_COOLDOWN = "\u23f3"  # ⏳
+
+def format_results(
+    results: list[checkers.Result],
+    pending: bool = False,
+    include_extra: bool | None = None,
+) -> str:
+    """Render results as a readable "Platform: Status" list.
+
+    Lines always follow the fixed platform order, even though results stream
+    back in completion order, so the message never reshuffles under the reader
+    while it is being updated. Platforms that have not answered yet show as
+    pending rather than silently missing.
+    """
+
+    if include_extra is None:
+        include_extra = ENABLE_EXTRA_PLATFORMS
+    expected = checkers.PLATFORMS if include_extra else checkers.CORE_PLATFORMS
+    by_platform = {result.platform: result for result in results}
+
+    lines: list[str] = []
+    for platform, _emoji in expected:
+        result = by_platform.get(platform)
+        if result is None:
+            if not pending:
+                continue
+            lines.append(f"{platform}: {PENDING_LABEL}")
+            continue
+        if result.status == checkers.SKIPPED and not REPLY_INCLUDE_SKIPPED:
+            continue
+        label = STATUS_LABELS.get(result.status, "Unknown")
+        lines.append(f"{platform}: {label}")
+
+    if not lines:
+        return "No platforms were checked."
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -264,6 +342,9 @@ class SniperBot(discord.Client):
         self._health_task: asyncio.Task | None = None
         self._initial_health_task: asyncio.Task | None = None
         self._prewarm_task: asyncio.Task | None = None
+        self._keepalive_runner = None
+        self._started_at = time.monotonic()
+        self._checks_served = 0
         # on_ready fires again after every gateway resume; print once.
         self._banner_shown = False
 
@@ -303,6 +384,9 @@ class SniperBot(discord.Client):
             self._initial_health_task = asyncio.create_task(
                 self._initial_health_check())
 
+        if KEEPALIVE_PORT:
+            await self._start_keepalive_server()
+
         if PREWARM_CONNECTIONS:
             # Background: never delay the gateway login for an optimisation.
             self._prewarm_task = asyncio.create_task(self._prewarm())
@@ -329,6 +413,45 @@ class SniperBot(discord.Client):
         """Keep the pool and the provider handed to the checkers in sync."""
 
         self.proxy_provider.pool = pool
+
+    async def _start_keepalive_server(self) -> None:
+        """Serve a small health endpoint so free hosts keep the bot running.
+
+        Free tiers on Render/Koyeb/Replit only keep a service alive if it binds
+        the port they hand out and answers health checks. This is deliberately
+        tiny: it exposes no configuration, no secrets, and no control surface.
+        """
+
+        from aiohttp import web
+
+        async def health(_request: web.Request) -> web.Response:
+            uptime = time.monotonic() - self._started_at
+            return web.json_response({
+                "status": "ok" if self.is_ready() else "starting",
+                "bot": str(self.user) if self.user else None,
+                "uptime_seconds": round(uptime, 1),
+                "checks_served": self._checks_served,
+                "cached_names": len(self._cache),
+                "proxies_alive": (
+                    self.proxy_pool.alive_count if self.proxy_pool else 0),
+            })
+
+        app = web.Application()
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        try:
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", KEEPALIVE_PORT)
+            await site.start()
+            self._keepalive_runner = runner
+            log.info("Keepalive HTTP server listening on 0.0.0.0:%d",
+                     KEEPALIVE_PORT)
+        except OSError as exc:
+            log.warning("Could not start keepalive server on port %d: %s",
+                        KEEPALIVE_PORT, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Keepalive server failed to start: %s", exc)
 
     async def _prewarm(self) -> None:
         """Open keep-alive connections to the platform hosts up front."""
@@ -382,6 +505,13 @@ class SniperBot(discord.Client):
                 except Exception as exc:  # noqa: BLE001
                     log.debug("Background task ended with an error: %s", exc)
         finally:
+            if self._keepalive_runner is not None:
+                try:
+                    await self._keepalive_runner.cleanup()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Keepalive shutdown failed: %s", exc)
+                finally:
+                    self._keepalive_runner = None
             try:
                 if self.http_sniper and not self.http_sniper.closed:
                     await self.http_sniper.close()
@@ -591,6 +721,81 @@ class SniperBot(discord.Client):
             return checkers.timeout_results(
                 "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS)
 
+    async def _send_reply(
+        self,
+        message: discord.Message,
+        text: str,
+        timeout: float,
+    ) -> discord.Message | None:
+        """Post the answer as a reply, bounded so REST can never stall us."""
+
+        if timeout <= 0:
+            log.warning("Skipping reply: response deadline exhausted")
+            return None
+        try:
+            return await asyncio.wait_for(
+                message.reply(text, mention_author=REPLY_MENTION_AUTHOR),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Reply exceeded the %.2fs cap", timeout)
+        except discord.Forbidden:
+            log.warning("Missing 'Send Messages' permission in #%s",
+                        getattr(message.channel, "name", message.channel.id))
+        except discord.HTTPException as exc:
+            log.warning("Reply failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Unexpected reply failure: %s",
+                        checkers._redact_sensitive_text(exc))
+        return None
+
+    async def _edit_reply(
+        self,
+        sent: discord.Message,
+        text: str,
+        timeout: float,
+    ) -> bool:
+        """Update an already-posted reply. Returns False if editing is futile."""
+
+        if timeout <= 0:
+            return True
+        try:
+            await asyncio.wait_for(sent.edit(content=text), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            log.warning("Reply edit exceeded the %.2fs cap", timeout)
+        except discord.NotFound:
+            log.warning("Reply was deleted before it could be updated")
+            return False
+        except discord.Forbidden:
+            log.warning("Not allowed to edit the reply")
+            return False
+        except discord.HTTPException as exc:
+            log.warning("Reply edit failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Unexpected reply-edit failure: %s",
+                        checkers._redact_sensitive_text(exc))
+        return True
+
+    async def _publish_results(
+        self,
+        message: discord.Message,
+        results: list[checkers.Result],
+        deadline: float,
+    ) -> None:
+        """One-shot output for a complete result set (cache hits, batched mode)."""
+
+        jobs = []
+        if REACT_ENABLED:
+            jobs.append(self._react_all(
+                message, self._verdict_emojis(results), deadline))
+        if REPLY_ENABLED:
+            jobs.append(self._send_reply(
+                message, format_results(results),
+                min(REACTION_TIMEOUT, deadline - time.monotonic())))
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
+
     @staticmethod
     def _verdict_emojis(results: list[checkers.Result]) -> list[str]:
         """Translate normalized checker results into reaction emojis."""
@@ -625,23 +830,88 @@ class SniperBot(discord.Client):
                     platform, emoji, checkers.ERROR, "check deadline reached"))
         return ordered
 
-    async def _stream_checks_and_react(
+    async def _live_reply(
+        self,
+        message: discord.Message,
+        results: list[checkers.Result],
+        done: asyncio.Event,
+        deadline: float,
+    ) -> None:
+        """Paint the reply immediately, then refresh it as results arrive.
+
+        The first paint happens on the very first tick so the member sees an
+        answer almost instantly; later paints are throttled to
+        REPLY_EDIT_INTERVAL so a lookup cannot exhaust Discord's edit rate
+        limit. The final paint always runs, so the message never ends up
+        showing a stale, half-finished list.
+        """
+
+        sent: discord.Message | None = None
+        last_text: str | None = None
+        last_paint = 0.0
+        editable = True
+        send_failures = 0
+
+        while True:
+            finished = done.is_set()
+            now = time.monotonic()
+            due = last_paint == 0.0 or now - last_paint >= REPLY_EDIT_INTERVAL
+            text = format_results(results, pending=not finished)
+
+            if text != last_text and (due or finished) and editable:
+                cap = min(REACTION_TIMEOUT, max(0.0, deadline - now))
+                if finished:
+                    # The final state matters more than the budget: allow the
+                    # closing paint even if the response window just closed.
+                    cap = max(cap, REACTION_TIMEOUT)
+                if sent is None:
+                    sent = await self._send_reply(message, text, cap)
+                    if sent is None:
+                        # Give up quickly on a channel we cannot post in
+                        # rather than retrying every interval.
+                        send_failures += 1
+                        if finished or send_failures >= 2:
+                            return
+                else:
+                    editable = await self._edit_reply(sent, text, cap)
+                last_text = text
+                last_paint = time.monotonic()
+
+            if finished:
+                return
+            if not editable:
+                # Cannot update the message any further; wait for the checks to
+                # finish so the caller still gets a complete result list.
+                await done.wait()
+                continue
+            try:
+                await asyncio.wait_for(done.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _stream_checks_and_respond(
         self,
         message: discord.Message,
         username: str,
         check_budget: float,
         deadline: float,
     ) -> list[checkers.Result]:
-        """React to each free platform the instant that platform answers.
+        """Answer each platform the instant it reports, then settle the rest.
 
         Every check still starts simultaneously under the same shared budget;
-        the difference is that a fast platform's emoji is no longer held
-        hostage by the slowest one. Time-to-first-reaction drops from "slowest
-        check" to "fastest free check".
+        the difference is that a fast platform is no longer held hostage by the
+        slowest one. Time-to-first-answer drops from "slowest check" to
+        "fastest check".
         """
 
         results: list[checkers.Result] = []
         reaction_tasks: list[asyncio.Task] = []
+        done = asyncio.Event()
+        reply_task: asyncio.Task | None = None
+        if REPLY_ENABLED:
+            reply_task = asyncio.create_task(
+                self._live_reply(message, results, done, deadline))
+
         stream = checkers.stream_all_checks(
             self.http_sniper, username,
             proxy=self.proxy_provider,
@@ -657,19 +927,19 @@ class SniperBot(discord.Client):
         )
 
         # Hard outer bound, mirroring the batched path: a checker that ignores
-        # its own timeout must never hold the reaction past the budget.
-        results_by: object = stream.__aiter__()
+        # its own timeout must never hold the answer past the budget.
+        stream_iter = stream.__aiter__()
         checks_end = time.monotonic() + check_budget
         try:
             while True:
                 remaining_checks = checks_end - time.monotonic()
                 if remaining_checks <= 0:
-                    log.warning("Check budget exhausted with %d/%d platforms in",
-                                len(results), len(checkers.PLATFORMS))
+                    log.warning("Check budget exhausted with %d platforms in",
+                                len(results))
                     break
                 try:
                     result = await asyncio.wait_for(
-                        results_by.__anext__(), timeout=remaining_checks)
+                        stream_iter.__anext__(), timeout=remaining_checks)
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError:
@@ -677,7 +947,7 @@ class SniperBot(discord.Client):
                     break
 
                 results.append(result)
-                if not result.available:
+                if not (REACT_ENABLED and result.available):
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -690,6 +960,8 @@ class SniperBot(discord.Client):
         except asyncio.CancelledError:
             for task in reaction_tasks:
                 task.cancel()
+            if reply_task is not None:
+                reply_task.cancel()
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("Checker stream failed: %s",
@@ -697,17 +969,29 @@ class SniperBot(discord.Client):
         finally:
             await stream.aclose()
 
-        results = self._fill_missing(results)
+        # Replace the shared list's contents in place so the reply task, which
+        # holds a reference to it, renders the completed set.
+        results[:] = self._fill_missing(results)
+        done.set()
+
+        if reply_task is not None:
+            try:
+                await reply_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Reply task failed: %s",
+                            checkers._redact_sensitive_text(exc))
 
         # Nothing was free: the single summary emoji can only be decided once
         # every platform has reported.
-        if not any(result.available for result in results):
+        if REACT_ENABLED and not any(result.available for result in results):
             await self._react_all(
                 message, self._verdict_emojis(results), deadline)
 
         if reaction_tasks:
             await asyncio.gather(*reaction_tasks, return_exceptions=True)
-        return results
+        return list(results)
 
     async def _write_hit_log(
         self,
@@ -786,6 +1070,9 @@ class SniperBot(discord.Client):
         else:
             print("🕹️ Platforms        : Minecraft | guns.lol | "
                   f"Discord (mode: {DISCORD_CHECK_MODE})")
+        if KEEPALIVE_PORT:
+            await self._start_keepalive_server()
+
         if PREWARM_CONNECTIONS:
             # Background: never delay the gateway login for an optimisation.
             self._prewarm_task = asyncio.create_task(self._prewarm())
@@ -802,6 +1089,11 @@ class SniperBot(discord.Client):
             print("🧊 Proxy            : on (single)")
         else:
             print("🧊 Proxy            : off (direct)")
+        print(f"💬 Answer mode      : {RESPONSE_MODE}"
+              + (f" (live edits every {REPLY_EDIT_INTERVAL:.2f}s)"
+                 if REPLY_ENABLED else ""))
+        if KEEPALIVE_PORT:
+            print(f"🌐 Keepalive HTTP   : 0.0.0.0:{KEEPALIVE_PORT} (/health)")
         print(f"⏳ User cooldown    : {USER_MAX_CHECKS} checks / "
               f"{USER_WINDOW_SECONDS:.2f}s")
         print(f"⚡ Response budget  : {RESPONSE_BUDGET_SECONDS:.2f}s "
@@ -835,13 +1127,15 @@ class SniperBot(discord.Client):
             await self._react_all(message, [EMOJI_COOLDOWN], deadline)
             return
 
+        self._checks_served += 1
+
         # 5. Serve repeat lookups from cache when possible. A cache hit needs
         # no sockets at all, so it is by far the fastest path.
         cached = self._cached(username)
         if cached is not None:
             log.info("cache hit for %r", username)
             results = cached
-            await self._react_all(message, self._verdict_emojis(results), deadline)
+            await self._publish_results(message, results, deadline)
         else:
             # Reserve time for the reaction. All checkers get this same
             # wall-clock cap, not sequential caps.
@@ -850,18 +1144,16 @@ class SniperBot(discord.Client):
                 results = checkers.timeout_results(
                     "response deadline reached",
                     include_extra=ENABLE_EXTRA_PLATFORMS)
-                await self._react_all(
-                    message, self._verdict_emojis(results), deadline)
+                await self._publish_results(message, results, deadline)
             elif STREAM_REACTIONS:
-                # 6a. Fastest path: react to each platform as it answers.
-                results = await self._stream_checks_and_react(
+                # 6a. Fastest path: answer each platform as it reports.
+                results = await self._stream_checks_and_respond(
                     message, username, check_budget, deadline)
             else:
-                # 6b. Batched path: wait for every platform, then react.
+                # 6b. Batched path: wait for every platform, then answer once.
                 results = await self._run_checks_with_deadline(
                     username, check_budget)
-                await self._react_all(
-                    message, self._verdict_emojis(results), deadline)
+                await self._publish_results(message, results, deadline)
 
             if self._cacheable(results):
                 self._store(username, results)
@@ -888,6 +1180,10 @@ def main() -> None:
             "your bot token from the Discord Developer Portal.")
     if _has_http_control_chars(TOKEN):
         raise SystemExit("❌ DISCORD_TOKEN must not contain control characters.")
+    if RESPONSE_MODE_RAW and RESPONSE_MODE_RAW != RESPONSE_MODE:
+        raise SystemExit(
+            f"❌ RESPONSE_MODE={RESPONSE_MODE_RAW!r} is not valid. "
+            "Use 'reply', 'react', or 'both'.")
     if DISCORD_CHECK_MODE not in (
             "off", "dnsrobot", "account", "account_api", "probe"):
         raise SystemExit(

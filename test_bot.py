@@ -14,11 +14,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import contextlib
 
+import discord
+
 import bot as bot_module
 import checkers
 from test_checkers import _browser_with_status, _session_with_status
 
 WATCHED = 42  # pretend channel id
+
+
+def discord_forbidden():
+    response = MagicMock()
+    response.status = 403
+    response.reason = "Forbidden"
+    return discord.Forbidden(response, "no permission")
+
+
+def discord_not_found():
+    response = MagicMock()
+    response.status = 404
+    response.reason = "Not Found"
+    return discord.NotFound(response, "gone")
 
 
 def make_message(content, user_id=1, channel_id=WATCHED, author_bot=False,
@@ -32,6 +48,10 @@ def make_message(content, user_id=1, channel_id=WATCHED, author_bot=False,
     msg.channel.id = channel_id
     msg.content = content
     msg.add_reaction = AsyncMock()
+    sent = MagicMock()
+    sent.edit = AsyncMock()
+    msg.reply = AsyncMock(return_value=sent)
+    msg._sent = sent
     return msg
 
 
@@ -46,6 +66,40 @@ def make_bot(session_status=404):
 def reactions(message):
     """The emojis the bot reacted with, in order."""
     return [call.args[0] for call in message.add_reaction.await_args_list]
+
+
+def reply_texts(message):
+    """Every body the bot posted or edited into its reply, in order."""
+    texts = [call.args[0] for call in message.reply.await_args_list]
+    texts += [call.kwargs.get("content") for call
+              in message._sent.edit.await_args_list]
+    return texts
+
+
+def final_reply(message):
+    """The last text the member ends up seeing."""
+    texts = reply_texts(message)
+    return texts[-1] if texts else None
+
+
+class ReactModeMixin:
+    """Force emoji-reaction mode for suites that assert on reactions."""
+
+    RESPONSE_MODE = "react"
+
+    def setUp(self):
+        super().setUp()
+        saved = (bot_module.RESPONSE_MODE, bot_module.REPLY_ENABLED,
+                 bot_module.REACT_ENABLED)
+
+        def restore():
+            (bot_module.RESPONSE_MODE, bot_module.REPLY_ENABLED,
+             bot_module.REACT_ENABLED) = saved
+
+        self.addCleanup(restore)
+        bot_module.RESPONSE_MODE = self.RESPONSE_MODE
+        bot_module.REPLY_ENABLED = self.RESPONSE_MODE in ("reply", "both")
+        bot_module.REACT_ENABLED = self.RESPONSE_MODE in ("react", "both")
 
 
 @contextlib.contextmanager
@@ -70,7 +124,7 @@ def patch_workers(results=None, factory=None):
         yield
 
 
-class TestFilters(unittest.TestCase):
+class TestFilters(ReactModeMixin, unittest.TestCase):
     def run_msg(self, message):
         b = make_bot()
         asyncio.run(b.on_message(message))
@@ -117,8 +171,9 @@ class TestFilters(unittest.TestCase):
             bot_module.TARGET_CHANNEL_ID = old
 
 
-class TestReactions(unittest.TestCase):
+class TestReactions(ReactModeMixin, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.old_mode = bot_module.DISCORD_CHECK_MODE
         self.old_probe_url = bot_module.DISCORD_PROBE_URL
         self.old_extra = bot_module.ENABLE_EXTRA_PLATFORMS
@@ -250,7 +305,7 @@ class TestReactions(unittest.TestCase):
         self.assertNotIn("vortex", b._cache)
 
 
-class TestCooldown(unittest.TestCase):
+class TestCooldown(ReactModeMixin, unittest.TestCase):
     def test_fourth_check_in_window_gets_hourglass(self):
         old_max = bot_module.USER_MAX_CHECKS
         bot_module.USER_MAX_CHECKS = 3
@@ -280,7 +335,7 @@ class TestCooldown(unittest.TestCase):
             bot_module.USER_MAX_CHECKS = old_max
 
 
-class TestCache(unittest.TestCase):
+class TestCache(ReactModeMixin, unittest.TestCase):
     def test_repeat_lookup_uses_cache(self):
         old_extra = bot_module.ENABLE_EXTRA_PLATFORMS
         bot_module.ENABLE_EXTRA_PLATFORMS = False
@@ -329,7 +384,7 @@ class TestCache(unittest.TestCase):
             bot_module.CACHE_TTL_TAKEN = old_taken
 
 
-class TestStreamingReactions(unittest.TestCase):
+class TestStreamingReactions(ReactModeMixin, unittest.TestCase):
     """A fast free platform must not wait for a slow one."""
 
     def test_fast_platform_reacts_before_slow_one_finishes(self):
@@ -388,6 +443,215 @@ class TestStreamingReactions(unittest.TestCase):
             bot_module.STREAM_REACTIONS = old
 
 
+class ReplyModeMixin(ReactModeMixin):
+    RESPONSE_MODE = "reply"
+
+
+class TestReplyMode(ReplyModeMixin, unittest.TestCase):
+    """The default output: a readable 'Platform: Status' reply, no reactions."""
+
+    def setUp(self):
+        super().setUp()
+        saved = bot_module.ENABLE_EXTRA_PLATFORMS
+        self.addCleanup(
+            lambda: setattr(bot_module, "ENABLE_EXTRA_PLATFORMS", saved))
+        bot_module.ENABLE_EXTRA_PLATFORMS = False
+
+    def test_reply_lists_each_platform_and_adds_no_reactions(self):
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
+                checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE),
+                checkers.Result("guns.lol", "🔫", checkers.TAKEN),
+                checkers.Result("Discord", "🐈‍⬛", checkers.BLOCKED),
+        ]):
+            asyncio.run(b.on_message(msg))
+
+        self.assertEqual(reactions(msg), [])          # no emoji spam
+        self.assertEqual(final_reply(msg), (
+            "Minecraft: Available\n"
+            "guns.lol: Unavailable\n"
+            "Discord: Unknown"
+        ))
+
+    def test_reply_does_not_ping_the_author(self):
+        b = make_bot(404)
+        msg = make_message("zxqw99182")
+        asyncio.run(b.on_message(msg))
+        self.assertFalse(msg.reply.await_args.kwargs["mention_author"])
+
+    def test_error_and_blocked_both_read_as_unknown(self):
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
+                checkers.Result("Minecraft", "🕹️", checkers.ERROR, "boom"),
+                checkers.Result("guns.lol", "🔫", checkers.BLOCKED, "cf"),
+                checkers.Result("Discord", "🐈‍⬛", checkers.INVALID),
+        ]):
+            asyncio.run(b.on_message(msg))
+        self.assertEqual(final_reply(msg), (
+            "Minecraft: Unknown\nguns.lol: Unknown\nDiscord: Invalid"))
+
+    def test_skipped_platforms_are_hidden_by_default(self):
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
+                checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE),
+                checkers.Result("guns.lol", "🔫", checkers.TAKEN),
+                checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+        ]):
+            asyncio.run(b.on_message(msg))
+        self.assertNotIn("Discord", final_reply(msg))
+
+    def test_skipped_platforms_can_be_shown(self):
+        saved = bot_module.REPLY_INCLUDE_SKIPPED
+        bot_module.REPLY_INCLUDE_SKIPPED = True
+        try:
+            b = make_bot()
+            msg = make_message("vortex")
+            with patch_workers([
+                    checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE),
+                    checkers.Result("guns.lol", "🔫", checkers.TAKEN),
+                    checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+            ]):
+                asyncio.run(b.on_message(msg))
+            self.assertIn("Discord: Not checked", final_reply(msg))
+        finally:
+            bot_module.REPLY_INCLUDE_SKIPPED = saved
+
+    def test_first_paint_is_immediate_and_final_paint_is_complete(self):
+        async def fast():
+            return checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE)
+
+        async def slow():
+            await asyncio.sleep(0.3)
+            return checkers.Result("guns.lol", "🔫", checkers.TAKEN)
+
+        b = make_bot()
+        msg = make_message("vortex")
+        started = time.monotonic()
+        paint_times = []
+        original = b._send_reply
+
+        async def timed(*args, **kwargs):
+            paint_times.append(time.monotonic() - started)
+            return await original(*args, **kwargs)
+
+        b._send_reply = timed
+        with patch_workers(factory=lambda: [fast(), slow()]):
+            asyncio.run(b.on_message(msg))
+
+        # Painted long before the 0.3s straggler finished...
+        self.assertTrue(paint_times)
+        self.assertLess(paint_times[0], 0.2)
+        # ...and the pending marker is gone from the final text.
+        self.assertNotIn(bot_module.PENDING_LABEL, final_reply(msg))
+        self.assertIn("guns.lol: Unavailable", final_reply(msg))
+
+    def test_pending_platforms_are_marked_while_streaming(self):
+        async def fast():
+            return checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE)
+
+        async def slow():
+            await asyncio.sleep(0.25)
+            return checkers.Result("guns.lol", "🔫", checkers.TAKEN)
+
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers(factory=lambda: [fast(), slow()]):
+            asyncio.run(b.on_message(msg))
+        self.assertIn(bot_module.PENDING_LABEL, reply_texts(msg)[0])
+
+    def test_missing_send_permission_is_survivable(self):
+        b = make_bot(404)
+        msg = make_message("zxqw99182")
+        msg.reply = AsyncMock(side_effect=discord_forbidden())
+        asyncio.run(b.on_message(msg))   # must not raise
+
+    def test_deleted_reply_stops_further_edits(self):
+        sent = MagicMock()
+        sent.edit = AsyncMock(side_effect=discord_not_found())
+
+        async def fast():
+            return checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE)
+
+        async def slow():
+            await asyncio.sleep(0.2)
+            return checkers.Result("guns.lol", "🔫", checkers.TAKEN)
+
+        b = make_bot()
+        msg = make_message("vortex")
+        msg.reply = AsyncMock(return_value=sent)
+        with patch_workers(factory=lambda: [fast(), slow()]):
+            asyncio.run(b.on_message(msg))   # must not raise
+        self.assertEqual(sent.edit.await_count, 1)  # gave up after NotFound
+
+    def test_both_mode_replies_and_reacts(self):
+        bot_module.RESPONSE_MODE = "both"
+        bot_module.REPLY_ENABLED = True
+        bot_module.REACT_ENABLED = True
+        b = make_bot()
+        msg = make_message("vortex")
+        with patch_workers([
+                checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE),
+                checkers.Result("guns.lol", "🔫", checkers.TAKEN),
+                checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+        ]):
+            asyncio.run(b.on_message(msg))
+        self.assertEqual(reactions(msg), ["🕹️"])
+        self.assertIn("Minecraft: Available", final_reply(msg))
+
+    def test_cache_hit_also_replies(self):
+        b = make_bot()
+        first = make_message("vortex", user_id=1)
+        second = make_message("vortex", user_id=2)
+        with patch_workers([
+                checkers.Result("Minecraft", "🕹️", checkers.AVAILABLE),
+                checkers.Result("guns.lol", "🔫", checkers.TAKEN),
+                checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
+        ]):
+            asyncio.run(b.on_message(first))
+            asyncio.run(b.on_message(second))
+        self.assertEqual(final_reply(first), final_reply(second))
+        self.assertEqual(second.reply.await_count, 1)   # single shot, no edits
+
+
+class TestFormatResults(unittest.TestCase):
+    """Pure rendering, independent of Discord."""
+
+    def test_order_follows_platforms_not_completion(self):
+        saved = bot_module.ENABLE_EXTRA_PLATFORMS
+        bot_module.ENABLE_EXTRA_PLATFORMS = False
+        try:
+            text = bot_module.format_results([
+                checkers.Result("Discord", "x", checkers.AVAILABLE),
+                checkers.Result("guns.lol", "x", checkers.TAKEN),
+                checkers.Result("Minecraft", "x", checkers.AVAILABLE),
+            ])
+            self.assertEqual(text.splitlines(), [
+                "Minecraft: Available",
+                "guns.lol: Unavailable",
+                "Discord: Available",
+            ])
+        finally:
+            bot_module.ENABLE_EXTRA_PLATFORMS = saved
+
+    def test_pending_lines_only_when_requested(self):
+        saved = bot_module.ENABLE_EXTRA_PLATFORMS
+        bot_module.ENABLE_EXTRA_PLATFORMS = False
+        try:
+            partial = [checkers.Result("Minecraft", "x", checkers.AVAILABLE)]
+            self.assertIn(bot_module.PENDING_LABEL,
+                          bot_module.format_results(partial, pending=True))
+            self.assertNotIn(bot_module.PENDING_LABEL,
+                             bot_module.format_results(partial, pending=False))
+        finally:
+            bot_module.ENABLE_EXTRA_PLATFORMS = saved
+
+    def test_empty_results_are_never_an_empty_message(self):
+        self.assertTrue(bot_module.format_results([]).strip())
+
+
 class TestCacheBounds(unittest.TestCase):
     """The result cache must stay bounded on a busy server."""
 
@@ -418,7 +682,7 @@ class TestCacheBounds(unittest.TestCase):
             bot_module.CACHE_TTL_TAKEN = old_ttl
 
 
-class TestLatencyBudget(unittest.TestCase):
+class TestLatencyBudget(ReactModeMixin, unittest.TestCase):
     def test_checker_crash_still_reacts_with_warning(self):
         async def crashes():
             raise RuntimeError("unexpected checker crash")

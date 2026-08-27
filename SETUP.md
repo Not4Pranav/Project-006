@@ -1,6 +1,6 @@
 # Multi-Sniper — setup and deployment guide
 
-Complete, copy-pasteable instructions for running the bot locally and keeping it online 24/7. For what the bot *does* and every configuration value, see **[README.md](README.md)**.
+Complete, copy-pasteable instructions for running the bot locally and deploying it. For what the bot *does* and every configuration value, see **[README.md](README.md)**. For **free** 24/7 hosting specifically, see **[CLOUD_SETUP.md](CLOUD_SETUP.md)**.
 
 The default configuration checks **Minecraft, guns.lol, GitHub, Steam, Reddit, Instagram, and Twitter/X**, with the Discord check switched off. Nothing beyond a bot token is required to get started.
 
@@ -64,7 +64,7 @@ python -m playwright install chromium
 3. Still under **Bot**, enable **Message Content Intent** under *Privileged Gateway Intents*. **The bot cannot read usernames without this** — it is the single most common setup mistake.
 4. Go to **OAuth2 → URL Generator**:
    - Scopes: `bot`
-   - Bot permissions: **Read Messages/View Channels**, **Add Reactions**, and **Send Messages** (only needed if you want hit logging)
+   - Bot permissions: **Read Messages/View Channels**, **Send Messages** (required for the default reply mode), **Read Message History** (required to reply to a message), and **Add Reactions** (only for `RESPONSE_MODE=react`)
 5. Open the generated URL and invite the bot to your server.
 6. Enable **Settings → Advanced → Developer Mode**, then right-click your channel → **Copy Channel ID** for `TARGET_CHANNEL_ID`.
 
@@ -93,8 +93,9 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 79 offline tests
-python test_bot.py          # 37 pipeline tests
+python test_checkers.py     # 84 offline tests
+python test_bot.py          # 54 pipeline tests
+python test_stress.py       # 8 stress tests
 ```
 
 Both suites must end in `OK`. Neither needs a Discord token or network access (three live tests are skipped unless you set `LIVE=1`).
@@ -130,7 +131,20 @@ Expected startup banner:
 ==============================================================
 ```
 
-Post a bare username in the watched channel. Within a second or two the bot reacts with one emoji per platform where the name is free (or ❌ / ⚠️). Stop with `Ctrl+C`.
+Post a bare username in the watched channel. The bot replies almost immediately and fills the list in as each platform reports:
+
+```
+Minecraft: Available
+guns.lol: Unavailable
+Discord: Unavailable
+GitHub: Available
+Steam: Unavailable
+Reddit: Available
+Instagram: Unknown
+Twitter/X: Unavailable
+```
+
+Set `RESPONSE_MODE=react` if you would rather have emoji reactions on the original message. Stop with `Ctrl+C`.
 
 ---
 
@@ -207,6 +221,8 @@ A `Procfile` is included:
 ```
 worker: python bot.py
 ```
+
+> Looking for a **free** 24/7 host? [CLOUD_SETUP.md](CLOUD_SETUP.md) covers Oracle Cloud Always Free, Render's free tier with the built-in keepalive server, and other zero-cost options.
 
 ### Render / Railway / Heroku-style
 
