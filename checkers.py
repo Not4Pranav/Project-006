@@ -10,25 +10,24 @@ Each checker maps an HTTP response to one normalized status:
     SKIPPED    checker deliberately disabled by configuration
     ERROR      timeout, network, or unexpected response failure
 
-The bot calls ``run_all_checks`` with one shared deadline so Minecraft,
-guns.lol, and the selected optional Discord mode run concurrently rather than
-adding their latencies together.
+The bot calls ``run_all_checks`` with one shared deadline so all platform
+checks run concurrently rather than adding their latencies together.
 
-Important: Discord's public bot API does not expose username search. The
-optional ``account`` mode uses the first-party account-flow eligibility route
-(or an authorized compatible gateway) and is still off by default. Its JSON
-answer is parsed strictly; malformed or blocked responses remain unknown.
-``dnsrobot`` literally loads the DNS Robot username-checker page in an
-isolated Playwright/Chromium context and reads its rendered Discord result; it
-does not forward account/probe credentials. ``probe`` remains available for an
-explicit external checker URL and is never silently pointed at Discord's
-homepage.
+Supported platforms:
+    Minecraft     Mojang profile API (with fallback endpoint)
+    guns.lol      Profile page with unclaimed/challenge detection
+    Discord       off | dnsrobot | account | account_api | probe
+    GitHub        Public user API (200/404 contract)
+    Steam         Community profile page
+    Reddit        JSON user-about endpoint
+    Instagram     Web profile info API
+    Twitter/X     Profile page status
 
 Run a one-off report without starting Discord:
 
     python checkers.py Notch
     python checkers.py vortex --mode account
-    python checkers.py zxqw99182vlt --mode probe \
+    python checkers.py zxqw99182vlt --mode probe \\
         --discord-probe-url 'https://checker.example/{username}'
 """
 
@@ -70,12 +69,39 @@ ERROR = "error"          # timeout / network failure
 MINECRAFT_EMOJI = "\U0001F579\uFE0F"
 GUNSLOL_EMOJI = "\U0001F52B"
 DISCORD_EMOJI = "\U0001F408\u200D\u2B1B"
+GITHUB_EMOJI = "\U0001F4BB"      # 💻
+STEAM_EMOJI = "\U0001F3AE"       # 🎮
+REDDIT_EMOJI = "\U0001F440"      # 👀
+INSTAGRAM_EMOJI = "\U0001F4F8"   # 📸
+TWITTER_EMOJI = "\U0001F426"     # 🐦
 
 # Kept in reaction order as well as timeout/error result order.
+# The first three are core; the rest are optional fast checks.
 PLATFORMS: tuple[tuple[str, str], ...] = (
     ("Minecraft", MINECRAFT_EMOJI),
     ("guns.lol", GUNSLOL_EMOJI),
     ("Discord", DISCORD_EMOJI),
+    ("GitHub", GITHUB_EMOJI),
+    ("Steam", STEAM_EMOJI),
+    ("Reddit", REDDIT_EMOJI),
+    ("Instagram", INSTAGRAM_EMOJI),
+    ("Twitter/X", TWITTER_EMOJI),
+)
+
+# Core platforms that always run (Discord is SKIPPED when mode=off but still counted).
+CORE_PLATFORMS: tuple[tuple[str, str], ...] = (
+    ("Minecraft", MINECRAFT_EMOJI),
+    ("guns.lol", GUNSLOL_EMOJI),
+    ("Discord", DISCORD_EMOJI),
+)
+
+# Fast optional platforms (checked in parallel with core, very quick endpoints).
+FAST_PLATFORMS: tuple[tuple[str, str], ...] = (
+    ("GitHub", GITHUB_EMOJI),
+    ("Steam", STEAM_EMOJI),
+    ("Reddit", REDDIT_EMOJI),
+    ("Instagram", INSTAGRAM_EMOJI),
+    ("Twitter/X", TWITTER_EMOJI),
 )
 
 # Realistic browser headers help regular profile pages return their ordinary
@@ -91,6 +117,17 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+# API-specific headers for JSON endpoints
+API_HEADERS = {
+    "User-Agent": BROWSER_HEADERS["User-Agent"],
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 
@@ -115,11 +152,19 @@ class Result:
 # Minecraft names: 3-16 chars, letters/digits/underscore only.
 MINECRAFT_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 # guns.lol profiles observed in the wild use dots too (for example id.search).
-# The public service does not document an exhaustive registration rule, so this
-# is deliberately only a transport-safe, conservative input rule.
 GUNSLOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,24}$")
 # Discord's new-style usernames: 2-32 chars, lowercase a-z 0-9 . _
 DISCORD_PATTERN = re.compile(r"^[a-z0-9._]{2,32}$")
+# GitHub usernames: 1-39 chars, alphanumeric and hyphens, cannot start/end with hyphen.
+GITHUB_PATTERN = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$")
+# Steam vanity URLs: alphanumeric, underscores, hyphens, 2-32 chars.
+STEAM_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
+# Reddit usernames: 3-20 chars, alphanumeric, underscore, hyphen.
+REDDIT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,20}$")
+# Instagram usernames: 1-30 chars, alphanumeric, underscores, periods.
+INSTAGRAM_PATTERN = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+# Twitter/X usernames: 1-15 chars, alphanumeric and underscore.
+TWITTER_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 # A Discord message must look like one bare username token before the bot
 # spends any request budget on it.
@@ -131,14 +176,10 @@ USERNAME_MESSAGE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 # ---------------------------------------------------------------------------
 
 # guns.lol currently serves some unclaimed names with an HTTP 200 page rather
-# than an HTTP 404. These are intentionally narrow markers: a generic "User
-# Not Found" can appear in a *claimed* profile's Discord-presence widget, so
-# it must not be treated as an availability signal.
+# than an HTTP 404. These are intentionally narrow markers.
 GUNSLOL_UNCLAIMED_MARKERS = (
     "username not found",
     "this user is not claimed",
-    # The ordinary unclaimed page has used this title. Keep the HTML context
-    # so a profile bio containing the same phrase is not enough to mark free.
     "<title>everything you want",
 )
 _MISSING_PAYLOAD = object()
@@ -157,10 +198,6 @@ def interpret_minecraft(
     payload: object = _MISSING_PAYLOAD,
 ) -> str:
     if status == 200:
-        # The status-only form is retained for small integrations that already
-        # validate Mojang responses elsewhere. The live checker passes the
-        # decoded body and requires the profile shape so a 200 HTML challenge
-        # cannot be mistaken for a claimed name.
         if payload is _MISSING_PAYLOAD:
             return TAKEN
         if (
@@ -182,18 +219,9 @@ def interpret_minecraft(
 
 
 def interpret_gunslol(status: int, page: str | None = None) -> str:
-    """Interpret guns.lol's status plus its small semantic error page.
-
-    A 200 status by itself normally means a claimed profile, but the service
-    may render an unclaimed page with a 200 status. Conversely, a Cloudflare
-    challenge can also be 200, so those known challenge markers are unknown,
-    not falsely reported as taken.
-    """
+    """Interpret guns.lol's status plus its small semantic error page."""
 
     if status == 200:
-        # ``None`` is retained as the status-only compatibility form. The live
-        # checker always supplies the response body, where an empty/non-text
-        # body is malformed and therefore unknown.
         if page is None:
             return TAKEN
         if not isinstance(page, str) or not page.strip():
@@ -217,12 +245,7 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
 
 
 def interpret_discord_probe(status: int) -> str:
-    """Interpret the documented contract for an authorized external checker.
-
-    The custom endpoint must use 200 for a claimed username and 404 for a
-    free one. Authentication and rate-limit responses are *not* availability
-    answers, so they remain unknown instead of being misreported as TAKEN.
-    """
+    """Interpret the documented contract for an authorized external checker."""
 
     if status == 200:
         return TAKEN
@@ -237,21 +260,7 @@ def interpret_discord_account_api(
     status: int,
     payload: object | None,
 ) -> str:
-    """Interpret a JSON response from Discord's account username check.
-
-    The account eligibility endpoint reports its answer in JSON (normally as
-    ``{"taken": true|false}``) while the HTTP status describes transport or
-    authorization failures. A successful status without a strict boolean is
-    deliberately treated as ERROR; guessing from a missing/malformed field can
-    turn an outage into a false availability result.
-
-    A few authorized account-api gateways expose the equivalent ``available``
-    field or wrap the result in ``data``. Supporting those shapes keeps the
-    adapter useful without weakening the boolean-only contract. The optional
-    numeric ``data.check.status`` shape is the compatibility format used by
-    some Discord username account services: 2 means available, 3–6 means
-    taken, 0 invalid, and 1 unknown.
-    """
+    """Interpret a JSON response from Discord's account username check."""
 
     if status in (401, 403, 429):
         return BLOCKED
@@ -272,10 +281,7 @@ def interpret_discord_account_api(
                 continue
             value = mapping[key]
             if type(value) is not bool:
-                # A recognized field with a string/number/null is malformed;
-                # do not let a second compatibility field hide that problem.
                 return ERROR
-            # ``available`` has the opposite meaning to ``taken``.
             boolean_outcomes.append(
                 (TAKEN if value else AVAILABLE) if key == "taken" else (
                     AVAILABLE if value else TAKEN))
@@ -283,7 +289,6 @@ def interpret_discord_account_api(
     boolean_outcome: str | None = None
     if boolean_outcomes:
         if len(set(boolean_outcomes)) != 1:
-            # Contradictory fields are an unknown response, not an answer.
             return ERROR
         boolean_outcome = boolean_outcomes[0]
 
@@ -292,8 +297,6 @@ def interpret_discord_account_api(
         check = data.get("check")
         if isinstance(check, Mapping) and "status" in check:
             account_status = check["status"]
-            # JSON booleans and floating-point lookalikes must not be accepted
-            # as the compatibility service's integer status codes.
             if type(account_status) is not int:
                 return ERROR
             numeric_outcome = {
@@ -315,23 +318,12 @@ def interpret_discord_account_api(
 
 
 def interpret_discord_dnsrobot(status: int, payload: object | None) -> str:
-    """Interpret a recorded JSON response from DNS Robot's browser flow.
-
-    The live ``dnsrobot`` mode does not call this endpoint from Python: it
-    loads DNS Robot in a browser and reads the rendered Discord card. Keeping
-    this helper preserves the strict network-response contract for diagnostics
-    and integrations that already capture that response.
-    """
-
+    """Interpret a recorded JSON response from DNS Robot's browser flow."""
     return interpret_discord_account_api(status, payload)
 
 
 def interpret_discord_dnsrobot_page(status: object | None) -> str:
-    """Map the visible Discord card on DNS Robot's page to a safe status.
-
-    Only the two positive labels are definitive. Pending, rate-limited,
-    unknown, missing, or unfamiliar labels never become AVAILABLE.
-    """
+    """Map the visible Discord card on DNS Robot's page to a safe status."""
 
     if not isinstance(status, str):
         return ERROR
@@ -345,9 +337,134 @@ def interpret_discord_dnsrobot_page(status: object | None) -> str:
     return ERROR
 
 
-# Backwards-friendly short name for callers that do not need to distinguish
-# the account API transport from the Discord platform it serves.
+# Backwards-friendly short name
 interpret_discord_account = interpret_discord_account_api
+
+
+# ---------------------------------------------------------------------------
+# New platform interpreters
+# ---------------------------------------------------------------------------
+
+def interpret_github(status: int, payload: object | None = None) -> str:
+    """Interpret GitHub's public user API response.
+
+    200 with a login field = taken. 404 = available.
+    403/429 = rate limited (BLOCKED). Other = error.
+    """
+    if status == 200:
+        if payload is None:
+            return TAKEN
+        if isinstance(payload, Mapping) and isinstance(payload.get("login"), str):
+            return TAKEN
+        return BLOCKED  # 200 but not a valid user response
+    if status == 404:
+        return AVAILABLE
+    if status in (403, 429):
+        return BLOCKED
+    return ERROR
+
+
+def interpret_steam(status: int, page: str | None = None) -> str:
+    """Interpret Steam community profile page.
+
+    Steam returns 200 for existing profiles and redirects or special pages
+    for non-existing ones. The page body can contain "The specified profile
+    could not be found" for missing profiles.
+    """
+    if status == 200:
+        if not isinstance(page, str) or not page.strip():
+            return BLOCKED
+        content = page.casefold()
+        # Steam serves a "profile not found" page with 200 for missing profiles
+        if "the specified profile could not be found" in content:
+            return AVAILABLE
+        # Cloudflare/challenge detection
+        if any(marker in content for marker in ("just a moment...", "cf-chl-")):
+            return BLOCKED
+        return TAKEN
+    if status == 404:
+        return AVAILABLE
+    if status in (403, 429, 503):
+        return BLOCKED
+    return ERROR
+
+
+def interpret_reddit(status: int, payload: object | None = None) -> str:
+    """Interpret Reddit's JSON user-about endpoint.
+
+    200 with user data = taken. 404 = available.
+    Reddit returns 404 JSON for missing users.
+    """
+    if status == 200:
+        if payload is None:
+            return BLOCKED
+        if isinstance(payload, Mapping):
+            # Reddit returns {"data": {...}} for existing users
+            data = payload.get("data")
+            if isinstance(data, Mapping) and data.get("name"):
+                return TAKEN
+        return BLOCKED  # 200 but not a valid user response
+    if status == 404:
+        return AVAILABLE
+    if status in (403, 429, 503):
+        return BLOCKED
+    return ERROR
+
+
+def interpret_instagram(status: int, page: str | None = None) -> str:
+    """Interpret Instagram profile page status.
+
+    Instagram returns 200 for existing profiles and may redirect or return
+    login pages. This is a best-effort check since Instagram aggressively
+    blocks non-authenticated requests.
+    """
+    if status == 200:
+        if not isinstance(page, str) or not page.strip():
+            return BLOCKED
+        content = page.casefold()
+        # Login wall / challenge
+        if "login to instagram" in content or "challenge" in content:
+            return BLOCKED
+        # "Sorry, this page isn't available" indicates a non-existing profile
+        if "sorry, this page isn't available" in content:
+            return AVAILABLE
+        return TAKEN
+    if status == 404:
+        return AVAILABLE
+    if status in (302, 301):
+        # Redirects may indicate a login wall
+        return BLOCKED
+    if status in (401, 403, 429):
+        return BLOCKED
+    return ERROR
+
+
+def interpret_twitter(status: int, page: str | None = None) -> str:
+    """Interpret Twitter/X profile page status.
+
+    Twitter returns 200 for existing profiles. For non-existing profiles,
+    the page may still return 200 but with "This account doesn't exist"
+    or 404. Due to heavy JS requirements, this is best-effort.
+    """
+    if status == 200:
+        if not isinstance(page, str) or not page.strip():
+            return BLOCKED
+        content = page.casefold()
+        # Account doesn't exist markers
+        if ("this account doesn't exist" in content
+                or "this user doesn't exist" in content
+                or "hmm...this page doesn't exist" in content):
+            return AVAILABLE
+        # Challenge / rate limit
+        if any(marker in content for marker in (
+                "rate limit exceeded", "captcha", "challenge")):
+            return BLOCKED
+        return TAKEN
+    if status == 404:
+        return AVAILABLE
+    if status in (403, 429):
+        return BLOCKED
+    return ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -358,19 +475,6 @@ _REQUEST_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ValueError)
 _HTTP_SCHEMES = {"http", "https"}
 _HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _URL_USERINFO_PATTERN = re.compile(r"(?i)(https?://)[^/\s@]+@")
-
-
-def _has_http_control_chars(value: object) -> bool:
-    """Whether a URL/header value contains a C0 or DEL control character."""
-
-    return isinstance(value, str) and any(
-        ord(char) < 0x20 or ord(char) == 0x7F for char in value)
-
-
-def _decoded_url_component_has_control_chars(value: str | None) -> bool:
-    """Check percent-decoded URL user-info before a client sends it."""
-
-    return value is not None and _has_http_control_chars(unquote(value))
 _SENSITIVE_QUERY_PATTERN = re.compile(
     r"(?i)([?&](?:access[_-]?token|api[_-]?key|authorization|password|secret|token)=)[^&#\s]+")
 _SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
@@ -382,22 +486,67 @@ _SENSITIVE_HEADER_PATTERN = re.compile(
 _BEARER_PATTERN = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
+def _has_http_control_chars(value: object) -> bool:
+    return isinstance(value, str) and any(
+        ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def _decoded_url_component_has_control_chars(value: str | None) -> bool:
+    return value is not None and _has_http_control_chars(unquote(value))
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+async def _retry_request(
+    coro_factory,
+    max_retries: int = 1,
+    base_delay: float = 0.15,
+) -> object:
+    """Retry an async request factory on transient failures.
+
+    ``coro_factory`` is called fresh on each retry (it must return a new
+    coroutine). Only network/timeout errors trigger a retry; definitive
+    HTTP status responses are not retried.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except _REQUEST_ERRORS as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Fetch functions (with optional proxy pool support)
+# ---------------------------------------------------------------------------
+
+def _resolve_proxy(proxy: str | None) -> str | None:
+    """Resolve proxy: accept a string, a callable, or None."""
+    if proxy is None:
+        return None
+    if callable(proxy):
+        return proxy()
+    return proxy
+
+
 async def _fetch_status(
     session: aiohttp.ClientSession,
     url: str,
     proxy: str | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> int:
-    """GET one endpoint and return its status without following redirects.
+    """GET one endpoint and return its status without following redirects."""
 
-    Probe endpoints can receive a credential-bearing header. Disabling
-    redirects prevents aiohttp from carrying that header to an unrelated host
-    selected by a 3xx response.
-    """
-
+    resolved_proxy = _resolve_proxy(proxy)
     async with session.get(
         url,
-        proxy=proxy,
+        proxy=resolved_proxy,
         headers=headers,
         allow_redirects=False,
     ) as response:
@@ -408,10 +557,12 @@ async def _fetch_json_get(
     session: aiohttp.ClientSession,
     url: str,
     proxy: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
     """GET JSON and keep malformed successful bodies distinguishable."""
 
-    async with session.get(url, proxy=proxy) as response:
+    resolved_proxy = _resolve_proxy(proxy)
+    async with session.get(url, proxy=resolved_proxy, headers=headers) as response:
         try:
             try:
                 body = await response.json(content_type=None)
@@ -429,26 +580,17 @@ async def _fetch_json(
     proxy: str | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> tuple[int, object | None]:
-    """POST JSON and return the status plus a decoded response, if any.
+    """POST JSON and return the status plus a decoded response, if any."""
 
-    Discord's account username eligibility endpoint returns a JSON object such
-    as ``{"taken": false}`` rather than using 404 for an available name. Keep
-    JSON decoding here so the account checker can reject an HTML/error response
-    without guessing at its meaning.
-    """
-
+    resolved_proxy = _resolve_proxy(proxy)
     async with session.post(
         url,
         json=dict(payload),
-        proxy=proxy,
+        proxy=resolved_proxy,
         headers=headers,
         allow_redirects=False,
     ) as response:
         try:
-            # ``content_type=None`` accepts JSON returned with a vendor or
-            # missing Content-Type. The fallback keeps small test doubles and
-            # compatible aiohttp-like clients that do not accept that keyword
-            # usable as well.
             try:
                 body = await response.json(content_type=None)
             except TypeError:
@@ -462,27 +604,19 @@ async def _fetch_page(
     session: aiohttp.ClientSession,
     url: str,
     proxy: str | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
-    """GET a URL and return its status and decoded HTML without redirects.
+    """GET a URL and return its status and decoded HTML without redirects."""
 
-    guns.lol's availability response is not always represented by the status
-    code alone, so that checker needs a small amount of response text. Keeping
-    redirects disabled prevents a profile URL redirecting to a generic page
-    from becoming a false TAKEN result. The shared aiohttp timeout still
-    bounds both download and decoding.
-    """
-
-    async with session.get(url, proxy=proxy, allow_redirects=False) as response:
+    resolved_proxy = _resolve_proxy(proxy)
+    async with session.get(
+        url, proxy=resolved_proxy, headers=headers, allow_redirects=False,
+    ) as response:
         return response.status, await response.text(errors="replace")
 
 
 def _safe_url(template: str, username: str) -> str:
-    """Substitute only the literal ``{username}`` field in a URL template.
-
-    ``str.format`` also permits attribute/index traversal and conversion
-    specifiers. Configuration is trusted more than message content, but there
-    is no reason to expose that formatting surface for a URL setting.
-    """
+    """Substitute only the literal ``{username}`` field in a URL template."""
 
     if not isinstance(template, str) or not isinstance(username, str):
         raise TypeError("URL template and username must be strings")
@@ -503,13 +637,13 @@ def validate_http_url(url: str, label: str = "URL") -> str | None:
         return f"{label} must not contain control characters"
     try:
         parsed = urlsplit(url)
-        hostname = parsed.hostname  # may raise for malformed bracketed IPv6
+        hostname = parsed.hostname
     except (TypeError, ValueError):
         return f"{label} is not a valid URL"
     if parsed.scheme.lower() not in _HTTP_SCHEMES or not hostname:
         return f"{label} must be an absolute http:// or https:// URL"
     try:
-        _ = parsed.port  # force validation of a malformed numeric port
+        _ = parsed.port
     except ValueError:
         return f"{label} has an invalid port"
     if any(char.isspace() for char in url):
@@ -521,13 +655,7 @@ def validate_http_url(url: str, label: str = "URL") -> str | None:
 
 
 def validate_proxy_url(url: str) -> str | None:
-    """Validate a proxy URL accepted by both aiohttp and Playwright.
-
-    Playwright needs the proxy server without a path, query, or fragment. Keep
-    the stricter validation in one place so the HTTP checkers and the optional
-    browser use the same configuration instead of silently taking different
-    routes.
-    """
+    """Validate a proxy URL accepted by both aiohttp and Playwright."""
 
     error = validate_http_url(url, "PROXY_URL")
     if error:
@@ -557,13 +685,7 @@ def validate_account_api_url(url: str) -> str | None:
 
 
 def validate_probe_url_template(template: str) -> str | None:
-    """Validate the user-supplied external-checker URL template.
-
-    The checker must receive the submitted username, so a static URL is not a
-    valid template. Only HTTPS endpoints are accepted so an optional probe
-    credential cannot be sent in cleartext; this also avoids accidental
-    ``file:``/other schemes when configuration is supplied by a user.
-    """
+    """Validate the user-supplied external-checker URL template."""
 
     if not isinstance(template, str) or not template:
         return "DISCORD_PROBE_URL is blank"
@@ -619,8 +741,6 @@ def _redact_sensitive_text(value: object) -> str:
     text = _SENSITIVE_ASSIGNMENT_PATTERN.sub(r"\1=***", text)
     text = _SENSITIVE_HEADER_PATTERN.sub(r"\1***", text)
     text = _BEARER_PATTERN.sub(r"\1***", text)
-    # Keep exception details to one log line even if a remote service returns
-    # control characters in an error message.
     text = " ".join(text.split())
     return text[:120] or type(value).__name__
 
@@ -634,33 +754,19 @@ def _request_error(platform: str, emoji: str, exc: Exception) -> Result:
 # ---------------------------------------------------------------------------
 
 # Mojang occasionally returns random 403s at api.mojang.com, so retry the
-# equivalent minecraftservices lookup once. The outer fan-out deadline prevents
-# this fallback from turning a single Discord message into a long wait.
+# equivalent minecraftservices lookup once.
 MINECRAFT_ENDPOINTS: Sequence[str] = (
     "https://api.mojang.com/users/profiles/minecraft/{username}",
     "https://api.minecraftservices.com/minecraft/profile/lookup/name/{username}",
 )
 
-# This is Discord's first-party username eligibility route used by the account
-# registration flow. It is intentionally opt-in: it is not part of the public
-# bot API, can be restricted by Discord, and must not be confused with a bot
-# account token or a request to discord.com/<username>.
 DEFAULT_DISCORD_ACCOUNT_API_URL = (
     "https://discord.com/api/v10/unique-username/"
     "username-attempt-unauthed"
 )
-# A descriptive alias for integrations that call this an account endpoint.
 DISCORD_ACCOUNT_API_URL = DEFAULT_DISCORD_ACCOUNT_API_URL
 
-# DNS Robot's username-checker page is a browser UI. Its client-side code
-# performs the Discord request from the page, so the literal integration below
-# launches a real browser, navigates to the page with ``?u=``, and reads the
-# rendered Discord card. These network constants are retained for diagnostics
-# and for ``interpret_discord_dnsrobot`` compatibility; the live dnsrobot mode
-# never sends them with aiohttp and never forwards account/probe credentials.
 DEFAULT_DISCORD_DNSROBOT_URL = "https://dnsrobot.net/username-checker"
-# Backwards-compatible diagnostic constants. The live browser adapter below
-# does not call this URL from aiohttp; DNS Robot's page calls it in the browser.
 DEFAULT_DISCORD_DNSROBOT_API_URL = (
     "https://discord.com/api/v9/unique-username/"
     "username-attempt-unauthed"
@@ -677,7 +783,6 @@ DNSROBOT_ALLOWED_HOSTS = {"dnsrobot.net", "www.dnsrobot.net"}
 
 def dnsrobot_username_checker_url(username: str) -> str:
     """Build the page URL used for one DNS Robot browser lookup."""
-
     return f"{DEFAULT_DISCORD_DNSROBOT_URL}?{urlencode({'u': username})}"
 
 
@@ -694,8 +799,6 @@ DNSROBOT_PAGE_STATUS_SCRIPT = r"""
     let node = name;
     for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
       const text = node.innerText || "";
-      // The category and latency may be adjacent text nodes (for example,
-      // "Messaging205ms"), so do not require a whitespace-separated word.
       if (!text.includes("Messaging")) continue;
 
       const visibleLabels = [node, ...node.querySelectorAll("*")]
@@ -707,8 +810,6 @@ DNSROBOT_PAGE_STATUS_SCRIPT = r"""
       if (label && label !== "Pending") return label;
     }
   }
-  // Pending or an absent Discord card is deliberately falsy so Playwright
-  // keeps waiting for the actual rendered result.
   return null;
 }
 """
@@ -724,7 +825,7 @@ def playwright_proxy_config(proxy: str | None) -> dict[str, str] | None:
         raise ValueError(error)
     parsed = urlsplit(proxy)
     hostname = parsed.hostname
-    if not hostname:  # Defensive: validate_proxy_url already checked this.
+    if not hostname:
         raise ValueError("PROXY_URL must contain a hostname")
     host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
     server = f"{parsed.scheme.lower()}://{host}"
@@ -739,13 +840,7 @@ def playwright_proxy_config(proxy: str | None) -> dict[str, str] | None:
 
 
 async def start_dnsrobot_browser(proxy: str | None = None):
-    """Start the optional Chromium runtime used by the literal DNS mode.
-
-    The caller owns both returned objects and must close the browser followed
-    by the Playwright runtime. Browser installation is intentionally separate:
-    ``python -m playwright install chromium`` is a setup/deployment step, not a
-    runtime network action.
-    """
+    """Start the optional Chromium runtime used by the literal DNS mode."""
 
     if async_playwright is None:
         raise RuntimeError(
@@ -766,7 +861,6 @@ async def start_dnsrobot_browser(proxy: str | None = None):
 
 def dnsrobot_page_timeout_ms(deadline: float) -> int:
     """Convert a remaining seconds budget to Playwright's integer milliseconds."""
-
     return max(1, int(max(0.001, deadline - time.monotonic()) * 1000))
 
 
@@ -774,7 +868,7 @@ def _dnsrobot_page_is_on_site(page_url: object) -> bool:
     """Reject redirects away from the exact DNS Robot checker page."""
 
     if page_url is None:
-        return True  # Small browser test doubles may not expose ``url``.
+        return True
     if not isinstance(page_url, str) or not page_url:
         return False
     try:
@@ -811,6 +905,10 @@ def _remaining_page_seconds(deadline: float) -> float:
     return max(0.001, deadline - time.monotonic())
 
 
+# ---------------------------------------------------------------------------
+# Platform checkers (async)
+# ---------------------------------------------------------------------------
+
 async def check_minecraft(session, username: str, proxy=None) -> Result:
     """Check Minecraft/Mojang availability (emoji 🕹️)."""
 
@@ -833,8 +931,6 @@ async def check_minecraft(session, username: str, proxy=None) -> Result:
                 "Minecraft", MINECRAFT_EMOJI,
                 outcome_status, detail,
             )
-            # A block or transient endpoint error deserves the fallback. A
-            # definitive AVAILABLE/TAKEN/INVALID answer does not.
             if outcome.status not in (BLOCKED, ERROR):
                 return outcome
         except _REQUEST_ERRORS as exc:
@@ -873,15 +969,7 @@ async def check_discord_account_api(
     api_url: str | None = None,
     api_headers: Mapping[str, str] | None = None,
 ) -> Result:
-    """Check a username through an explicitly enabled account API.
-
-    Discord's account eligibility route accepts ``POST`` JSON of the form
-    ``{"username": "name"}`` and returns ``{"taken": true|false}``. The
-    request is an eligibility check only; this function never calls the
-    username-claim endpoint and never sends the bot token. ``api_url`` defaults
-    to Discord's first-party account-flow route, but remains overrideable for
-    an authorized gateway that exposes the same JSON contract.
-    """
+    """Check a username through an explicitly enabled account API."""
 
     normalized_username = username.lower()
     if not DISCORD_PATTERN.fullmatch(normalized_username):
@@ -915,7 +1003,7 @@ async def check_discord_account_api(
         return _request_error("Discord", DISCORD_EMOJI, exc)
 
 
-# Short alias for integrations that refer to the adapter as the account check.
+# Short alias
 check_discord_account = check_discord_account_api
 
 
@@ -927,20 +1015,9 @@ async def check_discord_dnsrobot(
     browser_semaphore: asyncio.Semaphore | None = None,
     timeout: float | None = None,
 ) -> Result:
-    """Check Discord by literally loading DNS Robot's username-checker page.
+    """Check Discord by literally loading DNS Robot's username-checker page."""
 
-    A real Playwright browser navigates to
-    ``https://dnsrobot.net/username-checker?u=<name>``. DNS Robot's own
-    JavaScript then performs its browser-side check, and this adapter reads the
-    rendered Discord card. Python never sends an account/probe header or token
-    to either the page or its browser requests.
-
-    ``session`` and ``proxy`` remain in the signature for checker compatibility.
-    The proxy is applied when the browser is launched, not by adding headers to
-    the page. The caller owns the browser lifecycle.
-    """
-
-    del session, proxy  # The browser, not aiohttp, performs this mode's request.
+    del session, proxy
     normalized_username = username.lower()
     if not DISCORD_PATTERN.fullmatch(normalized_username):
         return Result(
@@ -995,7 +1072,7 @@ async def check_discord_dnsrobot(
         raise
     except PlaywrightTimeoutError:
         return Result("Discord", DISCORD_EMOJI, BLOCKED, dnsrobot_page_timeout_detail())
-    except Exception as exc:  # noqa: BLE001 - browser failures remain unknown
+    except Exception as exc:  # noqa: BLE001
         return _request_error("Discord", DISCORD_EMOJI, exc)
     finally:
         if context is not None:
@@ -1003,9 +1080,7 @@ async def check_discord_dnsrobot(
                 await context.close()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # noqa: BLE001 - cleanup must not leak a task
-                # The primary result is already safe; only log the sanitized
-                # cleanup failure through the returned error path when needed.
+            except Exception as exc:  # noqa: BLE001
                 _redact_sensitive_text(exc)
 
 
@@ -1022,16 +1097,7 @@ async def check_discord(
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     dnsrobot_timeout: float | None = None,
 ) -> Result:
-    """Check Discord in off, DNS Robot, account, or probe mode.
-
-    ``off`` is the safe default. ``dnsrobot`` literally loads
-    ``https://dnsrobot.net/username-checker?u=...`` in the supplied Playwright
-    browser and reads its rendered Discord result. ``account`` (also accepted as
-    ``account_api``) sends a JSON eligibility request to the configured account
-    API and interprets its strict boolean response. ``probe`` remains available
-    for an external GET checker using the 200/404 contract. No mode treats
-    ``discord.com/<username>`` as an availability endpoint.
-    """
+    """Check Discord in off, DNS Robot, account, or probe mode."""
 
     mode = (mode or "off").strip().lower()
     if mode == "off":
@@ -1041,9 +1107,7 @@ async def check_discord(
         )
     if mode == "dnsrobot":
         return await check_discord_dnsrobot(
-            session,
-            username,
-            proxy,
+            session, username, proxy,
             browser=dnsrobot_browser,
             browser_semaphore=dnsrobot_semaphore,
             timeout=dnsrobot_timeout,
@@ -1086,16 +1150,162 @@ async def check_discord(
 
 
 # ---------------------------------------------------------------------------
+# New platform checkers
+# ---------------------------------------------------------------------------
+
+async def check_github(session, username: str, proxy=None) -> Result:
+    """Check GitHub username availability (💻).
+
+    Uses the public GitHub API: 200 = taken, 404 = free.
+    Rate limit is generous (60 req/hr unauthenticated).
+    """
+
+    if not GITHUB_PATTERN.fullmatch(username):
+        return Result(
+            "GitHub", GITHUB_EMOJI, INVALID,
+            "name must be 1-39 chars of A-Z a-z 0-9 - (no leading/trailing -)",
+        )
+
+    try:
+        status, payload = await _fetch_json_get(
+            session,
+            f"https://api.github.com/users/{username}",
+            proxy,
+            headers=API_HEADERS,
+        )
+        outcome = interpret_github(status, payload)
+        detail = f"HTTP {status}"
+        if status == 200 and isinstance(payload, Mapping):
+            login = payload.get("login", "")
+            detail += f" (login={login})"
+        return Result("GitHub", GITHUB_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("GitHub", GITHUB_EMOJI, exc)
+
+
+async def check_steam(session, username: str, proxy=None) -> Result:
+    """Check Steam community username availability (🎮).
+
+    Uses the community profile page. Steam may return 200 with a
+    'profile not found' page for missing profiles.
+    """
+
+    if not STEAM_PATTERN.fullmatch(username):
+        return Result(
+            "Steam", STEAM_EMOJI, INVALID,
+            "name must be 2-32 chars of A-Z a-z 0-9 _ -",
+        )
+
+    try:
+        status, page = await _fetch_page(
+            session,
+            f"https://steamcommunity.com/id/{username}/",
+            proxy,
+        )
+        outcome = interpret_steam(status, page)
+        detail = f"HTTP {status}"
+        if status == 200 and outcome == AVAILABLE:
+            detail += " (profile not found page)"
+        return Result("Steam", STEAM_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Steam", STEAM_EMOJI, exc)
+
+
+async def check_reddit(session, username: str, proxy=None) -> Result:
+    """Check Reddit username availability (👀).
+
+    Uses Reddit's JSON user-about endpoint: 200 = taken, 404 = free.
+    """
+
+    if not REDDIT_PATTERN.fullmatch(username):
+        return Result(
+            "Reddit", REDDIT_EMOJI, INVALID,
+            "name must be 3-20 chars of A-Z a-z 0-9 _ -",
+        )
+
+    try:
+        status, payload = await _fetch_json_get(
+            session,
+            f"https://www.reddit.com/user/{username}/about.json",
+            proxy,
+            headers={
+                **API_HEADERS,
+                "User-Agent": "MultiSniper/2.0 (username checker bot)",
+            },
+        )
+        outcome = interpret_reddit(status, payload)
+        detail = f"HTTP {status}"
+        if status == 200 and isinstance(payload, Mapping):
+            data = payload.get("data")
+            if isinstance(data, Mapping):
+                detail += f" (name={data.get('name', '?')})"
+        return Result("Reddit", REDDIT_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Reddit", REDDIT_EMOJI, exc)
+
+
+async def check_instagram(session, username: str, proxy=None) -> Result:
+    """Check Instagram username availability (📸).
+
+    Instagram aggressively blocks non-authenticated and non-browser requests.
+    This is a best-effort check using the web profile page.
+    """
+
+    if not INSTAGRAM_PATTERN.fullmatch(username):
+        return Result(
+            "Instagram", INSTAGRAM_EMOJI, INVALID,
+            "name must be 1-30 chars of A-Z a-z 0-9 . _",
+        )
+
+    try:
+        status, page = await _fetch_page(
+            session,
+            f"https://www.instagram.com/{username}/",
+            proxy,
+        )
+        outcome = interpret_instagram(status, page)
+        detail = f"HTTP {status}"
+        if outcome == BLOCKED:
+            detail += " (likely login wall)"
+        return Result("Instagram", INSTAGRAM_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Instagram", INSTAGRAM_EMOJI, exc)
+
+
+async def check_twitter(session, username: str, proxy=None) -> Result:
+    """Check Twitter/X username availability (🐦).
+
+    Twitter/X is heavily JS-dependent and blocks most non-browser requests.
+    This is a best-effort check using the profile page status.
+    """
+
+    if not TWITTER_PATTERN.fullmatch(username):
+        return Result(
+            "Twitter/X", TWITTER_EMOJI, INVALID,
+            "name must be 1-15 chars of A-Z a-z 0-9 _",
+        )
+
+    try:
+        status, page = await _fetch_page(
+            session,
+            f"https://x.com/{username}",
+            proxy,
+        )
+        outcome = interpret_twitter(status, page)
+        detail = f"HTTP {status}"
+        if outcome == BLOCKED:
+            detail += " (rate limit or challenge)"
+        return Result("Twitter/X", TWITTER_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS as exc:
+        return _request_error("Twitter/X", TWITTER_EMOJI, exc)
+
+
+# ---------------------------------------------------------------------------
 # Parallel fan-out and deadline support
 # ---------------------------------------------------------------------------
 
 def timeout_results(detail: str = "check deadline reached") -> list[Result]:
-    """Return one honest unknown/error result per platform.
-
-    This lets the bot react with ⚠️ when a whole fan-out hits its response
-    budget instead of pretending that a name was taken.
-    """
-
+    """Return one honest unknown/error result per platform."""
     return [Result(platform, emoji, ERROR, detail) for platform, emoji in PLATFORMS]
 
 
@@ -1116,10 +1326,7 @@ async def _run_bounded(
         return result
     except asyncio.TimeoutError:
         return Result(fallback.platform, fallback.emoji, ERROR, "check deadline reached")
-    except Exception as exc:  # noqa: BLE001 - one checker must not cancel all results
-        # Checkers already handle normal network failures. This final guard
-        # isolates malformed optional configuration or unforeseen errors so one
-        # platform can never cancel every result/reaction.
+    except Exception as exc:  # noqa: BLE001
         log.error("Unexpected checker exception: %s", exc)
         return _request_error(fallback.platform, fallback.emoji, exc)
 
@@ -1136,16 +1343,20 @@ async def run_all_checks(
     discord_account_api_headers: Mapping[str, str] | None = None,
     dnsrobot_browser=None,
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
+    enable_extra_platforms: bool = True,
 ) -> list[Result]:
     """Fan out every platform check in parallel.
 
     ``timeout`` is a *shared wall-clock budget* for the fan-out. Every worker
     begins at the same time, so the total duration is at most the one timeout,
     not the sum of platform timeouts. Timed-out workers return ERROR results.
+
+    When ``enable_extra_platforms`` is True, GitHub, Steam, Reddit, Instagram,
+    and Twitter/X are also checked in parallel.
     """
 
     fallbacks = timeout_results()
-    workers = (
+    workers = [
         _run_bounded(check_minecraft(session, username, proxy), fallbacks[0], timeout),
         _run_bounded(check_gunslol(session, username, proxy), fallbacks[1], timeout),
         _run_bounded(
@@ -1164,13 +1375,30 @@ async def run_all_checks(
             ),
             fallbacks[2], timeout,
         ),
-    )
+    ]
+
+    if enable_extra_platforms:
+        extra_fallbacks = [
+            Result(p, e, ERROR, "check deadline reached") for p, e in FAST_PLATFORMS
+        ]
+        workers.extend([
+            _run_bounded(
+                check_github(session, username, proxy), extra_fallbacks[0], timeout),
+            _run_bounded(
+                check_steam(session, username, proxy), extra_fallbacks[1], timeout),
+            _run_bounded(
+                check_reddit(session, username, proxy), extra_fallbacks[2], timeout),
+            _run_bounded(
+                check_instagram(session, username, proxy), extra_fallbacks[3], timeout),
+            _run_bounded(
+                check_twitter(session, username, proxy), extra_fallbacks[4], timeout),
+        ])
+
     return list(await asyncio.gather(*workers))
 
 
 # ---------------------------------------------------------------------------
 # CLI self-test: python checkers.py <username>
-#   [--mode off|dnsrobot|account|account_api|probe]
 # ---------------------------------------------------------------------------
 
 async def _cli(argv: list[str] | None = None) -> int:
@@ -1191,10 +1419,22 @@ async def _cli(argv: list[str] | None = None) -> int:
                         help="optional http(s) proxy URL")
     parser.add_argument("--timeout", type=float, default=8.0,
                         help="shared check deadline in seconds (default: 8)")
+    parser.add_argument("--no-extra", action="store_true",
+                        help="disable extra platforms (GitHub, Steam, etc.)")
     ns = parser.parse_args(argv)
 
     deadline = max(0.1, ns.timeout)
     request_timeout = aiohttp.ClientTimeout(total=deadline)
+
+    # Optimized TCP connector for connection pooling
+    connector = aiohttp.TCPConnector(
+        limit=20,
+        limit_per_host=10,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+        force_close=False,
+    )
+
     browser_runtime = None
     dnsrobot_browser = None
     dnsrobot_semaphore = None
@@ -1202,7 +1442,7 @@ async def _cli(argv: list[str] | None = None) -> int:
         try:
             browser_runtime, dnsrobot_browser = await start_dnsrobot_browser(ns.proxy)
             dnsrobot_semaphore = asyncio.Semaphore(2)
-        except Exception as exc:  # noqa: BLE001 - report a safe unknown result
+        except Exception as exc:  # noqa: BLE001
             print(
                 "DNS Robot browser unavailable; its result will be ERROR: "
                 f"{_redact_sensitive_text(exc)}",
@@ -1211,7 +1451,9 @@ async def _cli(argv: list[str] | None = None) -> int:
 
     try:
         async with aiohttp.ClientSession(
-                headers=BROWSER_HEADERS, timeout=request_timeout) as session:
+                headers=BROWSER_HEADERS,
+                timeout=request_timeout,
+                connector=connector) as session:
             results = await run_all_checks(
                 session,
                 ns.username,
@@ -1222,12 +1464,13 @@ async def _cli(argv: list[str] | None = None) -> int:
                 timeout=deadline,
                 dnsrobot_browser=dnsrobot_browser,
                 dnsrobot_semaphore=dnsrobot_semaphore,
+                enable_extra_platforms=not ns.no_extra,
             )
     finally:
         if dnsrobot_browser is not None:
             try:
                 await dnsrobot_browser.close()
-            except Exception as exc:  # noqa: BLE001 - do not hide the report
+            except Exception as exc:  # noqa: BLE001
                 print(
                     f"DNS Robot browser cleanup failed: {_redact_sensitive_text(exc)}",
                     file=sys.stderr,
@@ -1235,7 +1478,7 @@ async def _cli(argv: list[str] | None = None) -> int:
         if browser_runtime is not None:
             try:
                 await browser_runtime.stop()
-            except Exception as exc:  # noqa: BLE001 - do not hide the report
+            except Exception as exc:  # noqa: BLE001
                 print(
                     f"Playwright cleanup failed: {_redact_sensitive_text(exc)}",
                     file=sys.stderr,
@@ -1248,7 +1491,7 @@ async def _cli(argv: list[str] | None = None) -> int:
     print(f"\nAvailability report for '{ns.username}':")
     print("-" * 62)
     for result in results:
-        print(f"  {result.emoji} {result.platform:<10} "
+        print(f"  {result.emoji} {result.platform:<12} "
               f"{icon[result.status]} {result.detail}")
     print("-" * 62)
 
