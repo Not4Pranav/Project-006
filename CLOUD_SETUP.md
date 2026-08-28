@@ -365,7 +365,9 @@ curl -s https://your-app.onrender.com/health
 | `DISCORD_TOKEN missing` | Environment variable not set in the host's dashboard (a committed `.env` will not exist there). |
 | Boot is busy for a few minutes, then settles | Normal: that is the background proxy search probing ~100,000 entries to reach `PROXY_MIN_POOL`. Lower it (see above) if the instance is small. |
 | `Only N of the requested 1000 proxies are working` | The list is too stale to supply that many. Point `PROXY_LIST_URL` at a fresher one, lower `PROXY_MIN_POOL`, or add paid proxies to `proxies.txt` — those are never dropped. |
-| Killed with exit code 137 | Out of memory — set `DISCORD_CHECK_MODE=off` and `ENABLE_EXTRA_PLATFORMS=false`. |
+| Killed with exit code 137 | Out of memory — first disable browser modes: set `GUNSLOL_CHECK_MODE=page` (or `DISCORD_CHECK_MODE=off`/`instantusername`). If still OOM, set `ENABLE_EXTRA_PLATFORMS=false`. |
+| guns.lol always shows Cloudflare challenge | Switch to `GUNSLOL_CHECK_MODE=browser` to render the page in Chromium and defeat the challenge. Needs ~300 MB extra RAM and Chromium installed. |
+| Instagram always shows Unknown (or false TAKEN on datacenter IPs) | The bot now uses Instagram's `web_profile_info` JSON endpoint first (no login, public `X-IG-App-ID` header). 404 → AVAILABLE, 200 with user JSON → TAKEN. If that endpoint also fails, the page fallback is strict: a datacenter landing page with no profile markers is reported as **Unknown**, never guessed as taken. This is by design — a false \"taken\" hides a potentially free name. |
 | Works locally, all ⚠️ in the cloud | The host's IP is rate-limited by Instagram/X. Add `PROXY_URLS`, or disable extra platforms. |
 | Oracle "Out of capacity" | Try another availability domain, another region, or the AMD micro shape. |
 | Bot restarts every few minutes | Check logs for a crash loop; run `python test_bot.py` on the host to confirm the install. |

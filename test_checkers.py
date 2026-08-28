@@ -261,18 +261,24 @@ class TestInterpreters(unittest.TestCase):
             interpret_instagram_profile_info(
                 404, {"message": "User not found", "status": "fail"}),
             AVAILABLE)
-        # Anything else is inconclusive: the caller falls back to the page.
-        self.assertIsNone(interpret_instagram_profile_info(200, None))
-        self.assertIsNone(interpret_instagram_profile_info(200, {}))
-        self.assertIsNone(
-            interpret_instagram_profile_info(200, {"data": {"user": None}}))
-        self.assertIsNone(
-            interpret_instagram_profile_info(200, {"data": {"user": {}}}))
-        self.assertIsNone(
-            interpret_instagram_profile_info(401, {"require_login": True}))
-        self.assertIsNone(interpret_instagram_profile_info(403, {}))
-        self.assertIsNone(interpret_instagram_profile_info(429, {}))
+        # 200 without a user object = BLOCKED (not None - the endpoint
+        # answered but had no profile data, so the name is not available
+        # from this source)
+        self.assertEqual(interpret_instagram_profile_info(200, None), BLOCKED)
+        self.assertEqual(interpret_instagram_profile_info(200, {}), BLOCKED)
+        self.assertEqual(
+            interpret_instagram_profile_info(200, {"data": {"user": None}}), BLOCKED)
+        self.assertEqual(
+            interpret_instagram_profile_info(200, {"data": {"user": {}}}), BLOCKED)
+        # 401/403/429 = BLOCKED (the endpoint is independently rate-limited)
+        self.assertEqual(
+            interpret_instagram_profile_info(401, {"require_login": True}), BLOCKED)
+        self.assertEqual(interpret_instagram_profile_info(403, {}), BLOCKED)
+        self.assertEqual(interpret_instagram_profile_info(429, {}), BLOCKED)
+        # 5xx and other statuses are inconclusive -> None (fall back to page)
         self.assertIsNone(interpret_instagram_profile_info(500, {}))
+        self.assertIsNone(interpret_instagram_profile_info(502, {}))
+        self.assertIsNone(interpret_instagram_profile_info(503, {}))
 
     def test_instagram_typographic_apostrophe(self):
         """Instagram serves a curly apostrophe; the ASCII marker must still hit."""
@@ -845,27 +851,29 @@ class TestCheckers(unittest.TestCase):
         self.assertEqual(session.get.call_count, 1)
 
     def test_instagram_datacenter_landing_page_is_unknown(self):
-        # The API is walled and the profile page answers a generic 200 landing
-        # page with neither missing- nor profile markers: report unknown,
-        # never a guessed "taken".
+        # The API is unreachable (5xx -> None from interpret_instagram_profile_info)
+        # and the profile page answers a generic 200 landing page with neither
+        # missing- nor profile markers: report unknown, never a guessed "taken".
         session = self._instagram_routed_session(
-            401, {"require_login": True}, 200,
+            500, {}, 200,
             "<html><title>Instagram</title>sign up to see photos</html>")
         r = self.run_async(checkers.check_instagram(session, "kevin"))
         self.assertEqual(r.status, BLOCKED)
         self.assertEqual(session.get.call_count, 2)
 
     def test_instagram_page_fallback_taken_when_api_walled(self):
+        # API returns 500 (inconclusive -> None), fallback to page with markers.
         session = self._instagram_routed_session(
-            429, {}, 200,
+            500, {}, 200,
             '<meta property="og:title" content="Jane Doe (@janedoe) '
             '\u2022 Instagram photos and videos">')
         r = self.run_async(checkers.check_instagram(session, "janedoe"))
         self.assertEqual(r.status, TAKEN)
 
     def test_instagram_page_fallback_free(self):
+        # API returns 500 (inconclusive -> None), fallback to page with missing text.
         session = self._instagram_routed_session(
-            403, {}, 200, "Sorry, this page isn't available")
+            500, {}, 200, "Sorry, this page isn't available")
         r = self.run_async(checkers.check_instagram(session, "zxqw99182"))
         self.assertEqual(r.status, AVAILABLE)
         self.assertIn("profile page", r.detail)
@@ -880,6 +888,117 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_twitter(
             _session_with_status(200, "This account doesn't exist"), "zxqw99182"))
         self.assertEqual(r.status, AVAILABLE)
+
+    # -- guns.lol browser mode tests --
+
+    def test_gunslol_browser_no_browser_returns_error(self):
+        r = self.run_async(checkers.check_gunslol_browser(
+            None, "zxqw99182"))
+        self.assertEqual(r.status, ERROR)
+        self.assertIn("unavailable", r.detail.lower())
+
+    def test_gunslol_browser_invalid_name_short_circuits(self):
+        r = self.run_async(checkers.check_gunslol_browser(
+            MagicMock(), "a"))
+        self.assertEqual(r.status, INVALID)
+
+    def test_gunslol_browser_renders_page_and_interprets(self):
+        """Happy path: challenge clears, page renders, interpreter sees unclaimed."""
+        page = MagicMock()
+        page.title = AsyncMock(return_value="guns.lol")
+        page.evaluate = AsyncMock(return_value="Username not found")
+        page.goto = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+
+        r = self.run_async(checkers.check_gunslol_browser(
+            browser, "zxqw99182", timeout=2.0))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertIn("browser", r.detail)
+        page.goto.assert_called_once()
+        context.close.assert_awaited_once()
+
+    def test_gunslol_browser_challenge_never_clears(self):
+        """Challenge markers persist until budget exhausted -> BLOCKED."""
+        page = MagicMock()
+        page.title = AsyncMock(return_value="Just a moment...")
+        page.evaluate = AsyncMock(
+            return_value="Checking your browser before accessing guns.lol")
+        page.goto = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+
+        r = self.run_async(checkers.check_gunslol_browser(
+            browser, "zxqw99182", timeout=0.1))
+        self.assertEqual(r.status, BLOCKED)
+        self.assertIn("challenge", r.detail.lower())
+        context.close.assert_awaited_once()
+
+    def test_gunslol_browser_taken_page(self):
+        """Browser renders a taken profile page."""
+        page = MagicMock()
+        page.title = AsyncMock(return_value="guns.lol")
+        page.evaluate = AsyncMock(
+            return_value="<h1>User Profile</h1><p>Joined 2024</p>")
+        page.goto = AsyncMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+
+        r = self.run_async(checkers.check_gunslol_browser(
+            browser, "notch", timeout=2.0))
+        self.assertEqual(r.status, TAKEN)
+        self.assertIn("browser", r.detail)
+
+    # -- gunslol_mode threading through worker wiring --
+
+    def test_gunslol_mode_page_uses_http_checker(self):
+        """gunslol_mode='page' (default) builds the HTTP check_gunslol coroutine."""
+        actual = []
+        original = checkers.check_gunslol
+
+        async def capture(*args, **kwargs):
+            actual.append((args, kwargs))
+            return checkers.Result("guns.lol", "x", AVAILABLE)
+
+        with patch.object(checkers, "check_gunslol", capture):
+            workers = checkers.build_check_workers(
+                _session_with_status(404), "vortex",
+                discord_mode="off", enable_extra_platforms=False,
+                instantusername_fallback=False,
+                gunslol_mode="page")
+            self.run_async(workers[1])  # guns.lol is second worker
+        self.assertEqual(len(actual), 1)
+        self.assertIn("vortex", actual[0][0])
+
+    def test_gunslol_mode_browser_uses_browser_checker(self):
+        """gunslol_mode='browser' builds the check_gunslol_browser coroutine."""
+        actual = []
+
+        async def capture(*args, **kwargs):
+            actual.append((args, kwargs))
+            return checkers.Result("guns.lol", "x", AVAILABLE)
+
+        browser = MagicMock()
+        with patch.object(checkers, "check_gunslol_browser", capture):
+            workers = checkers.build_check_workers(
+                _session_with_status(404), "vortex",
+                discord_mode="off", enable_extra_platforms=False,
+                instantusername_fallback=False,
+                dnsrobot_browser=browser,
+                gunslol_mode="browser")
+            self.run_async(workers[1])  # guns.lol is second worker
+        self.assertEqual(len(actual), 1)
+        # The browser is passed through
+        self.assertIn("vortex", actual[0][0])
 
 
 class TestProxyReportingAndRetries(unittest.TestCase):
@@ -977,13 +1096,23 @@ class TestSpeedPaths(unittest.TestCase):
 
     def test_page_read_is_bounded(self):
         """A huge page is truncated, and the marker still resolves."""
-        body = "Sorry, this page isn't available" + ("x" * 5_000_000)
-        session = _session_with_status(200, body)
+        # Use the routed session so the API endpoint returns something
+        # inconclusive (500), forcing the fallback to the page.
+        session = TestCheckers._instagram_routed_session(
+            500, {}, 200,
+            "Sorry, this page isn't available" + ("x" * 5_000_000))
         result = self.run_async(
             checkers.check_instagram(session, "zxqw99182"))
         self.assertEqual(result.status, AVAILABLE)
         # The stream read was capped rather than pulling the whole body.
-        session.get.return_value.__aenter__.return_value.content.read \
+        # The page context is the second call.
+        page_ctx = None
+        for call in session.get.call_args_list:
+            if "web_profile_info" not in call.args[0]:
+                page_ctx = call
+                break
+        self.assertIsNotNone(page_ctx)
+        page_ctx.return_value.__aenter__.return_value.content.read \
             .assert_awaited_with(checkers.MAX_PAGE_BYTES)
 
     def test_healthy_minecraft_primary_costs_one_request(self):

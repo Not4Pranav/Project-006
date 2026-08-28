@@ -157,6 +157,7 @@ TARGET_CHANNEL_ID = _opt_int("TARGET_CHANNEL_ID")
 LOG_CHANNEL_ID = _opt_int("LOG_CHANNEL_ID")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DISCORD_CHECK_MODE = os.getenv("DISCORD_CHECK_MODE", "off").strip().lower()
+GUNSLOL_CHECK_MODE = os.getenv("GUNSLOL_CHECK_MODE", "page").strip().lower()
 DISCORD_ACCOUNT_API_URL = (
     os.getenv("DISCORD_ACCOUNT_API_URL", "").strip()
     or checkers.DEFAULT_DISCORD_ACCOUNT_API_URL
@@ -649,7 +650,7 @@ class SniperBot(discord.Client):
                 checkers.refresh_instantusername_services(
                     self.http_sniper, self._next_proxy))
 
-        if DISCORD_CHECK_MODE in ("dnsrobot", "combined"):
+        if DISCORD_CHECK_MODE in ("dnsrobot", "combined") or GUNSLOL_CHECK_MODE == "browser":
             try:
                 proxy_for_browser = self._next_proxy()
                 self._playwright, self.dnsrobot_browser = (
@@ -1141,6 +1142,7 @@ class SniperBot(discord.Client):
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
             disabled_platforms=DISABLED_PLATFORMS,
+            gunslol_mode=GUNSLOL_CHECK_MODE,
         ))
 
         try:
@@ -1399,6 +1401,7 @@ class SniperBot(discord.Client):
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
             disabled_platforms=DISABLED_PLATFORMS,
+            gunslol_mode=GUNSLOL_CHECK_MODE,
         )
 
         # Hard outer bound, mirroring the batched path: a checker that ignores
@@ -1545,7 +1548,8 @@ class SniperBot(discord.Client):
         print(f"🟢 MULTI-SNIPER v3.0 ONLINE as {self.user}")
         print("🔒 Watching channel : "
               f"{TARGET_CHANNEL_ID if TARGET_CHANNEL_ID else 'ALL CHANNELS'}")
-        banner = ["Minecraft", "guns.lol",
+        gunslol_banner = f"guns.lol (mode: {GUNSLOL_CHECK_MODE})"
+        banner = ["Minecraft", gunslol_banner,
                   f"Discord (mode: {DISCORD_CHECK_MODE})"]
         if ENABLE_EXTRA_PLATFORMS:
             banner.extend(["GitHub", "Steam", "Reddit", "Instagram", "Twitter/X"])
@@ -1756,6 +1760,9 @@ def main() -> None:
             "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', "
             "'instantusername', 'combined', 'account', 'account_api', "
             "or 'probe'.")
+    if GUNSLOL_CHECK_MODE not in ("page", "browser"):
+        raise SystemExit(
+            "❌ GUNSLOL_CHECK_MODE must be 'page' or 'browser'.")
     if _DISABLED_UNKNOWN_TOKENS:
         raise SystemExit(
             "❌ DISABLED_PLATFORMS has unknown entries: "

@@ -280,6 +280,9 @@ INSTAGRAM_PROFILE_MARKERS = (
     "\u2022 instagram photos and videos",
     "instagram://user?username=",
     "profile_pic_url",
+    'og:type" content="profile"',
+    "biography",
+    "edge_followed_by",
 )
 # The X-IG-App-ID instagram.com's own web client sends; it is what makes the
 # web_profile_info JSON endpoint answer unauthenticated profile lookups. The
@@ -536,10 +539,10 @@ def interpret_instagram_profile_info(
     status) - the caller then falls back to the profile-page scrape.
 
     200 with ``data.user`` populated = taken; 404 = Instagram itself
-    confirming no such user exists. Everything else is inconclusive rather
-    than guessed, and inconclusive is common: the app-id endpoint is
-    rate-limited separately from the HTML pages, so a 401/403/429 here does
-    not imply the page fallback is walled too.
+    confirming no such user exists. 200 without a user object, 401, 403,
+    and 429 are returned as BLOCKED because the endpoint is independently
+    rate-limited: a wall here does not mean the HTML-page fallback is also
+    walled, but the answer is definitively "not available from this source".
     """
     if status == 200:
         if isinstance(payload, Mapping):
@@ -551,10 +554,12 @@ def interpret_instagram_profile_info(
                 or str(user.get("username") or "").strip()
             ):
                 return TAKEN           # populated user object -> name claimed
-        return None                    # 200 but not a profile payload
+        return BLOCKED                 # 200 but not a profile payload
     if status == 404:
         return AVAILABLE
-    return None
+    if status in (401, 403, 429):
+        return BLOCKED
+    return None                         # Unexpected status: fall back to page
 
 
 def interpret_instagram(status: int, page: str | None = None) -> str:
@@ -1297,6 +1302,116 @@ async def check_gunslol(session, username: str, proxy=None) -> Result:
         return _request_error("guns.lol", GUNSLOL_EMOJI, exc)
 
 
+async def check_gunslol_browser(
+    browser,
+    username: str,
+    browser_semaphore: asyncio.Semaphore | None = None,
+    timeout: float | None = None,
+) -> Result:
+    """Check guns.lol availability by loading the profile page in a real
+    browser (Playwright Chromium), reusing the same shared browser instance
+    and semaphore that the Discord dnsrobot/combined path uses.
+
+    The page is polled every 0.4 s until Cloudflare challenge markers
+    disappear or the budget ends. The rendered ``<title>`` and
+    ``document.body.innerText`` are then interpreted with
+    ``interpret_gunslol``.
+    """
+
+    if not GUNSLOL_PATTERN.fullmatch(username):
+        return Result(
+            "guns.lol", GUNSLOL_EMOJI, INVALID,
+            "name must be 2-24 chars of A-Z a-z 0-9 . - _",
+        )
+    if browser is None:
+        return Result(
+            "guns.lol", GUNSLOL_EMOJI, ERROR,
+            "guns.lol browser is unavailable; install Chromium and start Playwright",
+        )
+
+    page_budget = max(0.05, timeout if timeout is not None else 3.0)
+    deadline = time.monotonic() + page_budget
+    context = None
+
+    GUNSLOL_CHALLENGE_MARKERS_LOWER = tuple(
+        m.casefold() for m in GUNSLOL_CHALLENGE_MARKERS
+    )
+
+    async def poll_page() -> Result:
+        nonlocal context
+        context = await browser.new_context(
+            user_agent=BROWSER_HEADERS["User-Agent"],
+            locale="en-US",
+        )
+        page = await context.new_page()
+        await page.goto(
+            f"https://guns.lol/{username}",
+            wait_until="domcontentloaded",
+            timeout=dnsrobot_page_timeout_ms(deadline),
+        )
+
+        # Poll every 0.4 s until challenge markers clear or budget runs out.
+        while time.monotonic() < deadline:
+            title = await page.title()
+            body_text = await page.evaluate("document.body.innerText")
+            combined = f"{title}\n{body_text}"
+            page_text = _normalize_page(combined)
+
+            # Check if challenge markers are still present.
+            if any(marker in page_text for marker in GUNSLOL_CHALLENGE_MARKERS_LOWER):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return Result(
+                        "guns.lol", GUNSLOL_EMOJI, BLOCKED,
+                        "Cloudflare challenge never cleared within the budget",
+                    )
+                await asyncio.sleep(min(0.4, remaining))
+                continue
+
+            # Challenge cleared: interpret with the combined text.
+            outcome = interpret_gunslol(200, combined)
+            detail = "browser: "
+            if outcome == AVAILABLE:
+                detail += "unclaimed page"
+            elif outcome == TAKEN:
+                detail += "profile page rendered"
+            elif outcome == BLOCKED:
+                detail += "challenge or rate-limit page"
+            else:
+                detail += f"HTTP 200 -> {outcome}"
+            return Result("guns.lol", GUNSLOL_EMOJI, outcome, detail)
+
+        # Budget exhausted while challenge was still present.
+        return Result(
+            "guns.lol", GUNSLOL_EMOJI, BLOCKED,
+            "Cloudflare challenge never cleared within the budget",
+        )
+
+    try:
+        if browser_semaphore is None:
+            return await poll_page()
+        async with browser_semaphore:
+            return await poll_page()
+    except asyncio.CancelledError:
+        raise
+    except PlaywrightTimeoutError:
+        return Result(
+            "guns.lol", GUNSLOL_EMOJI, BLOCKED,
+            "guns.lol page did not render before the deadline",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _request_error("guns.lol", GUNSLOL_EMOJI, exc)
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.debug("guns.lol browser context cleanup failed: %s",
+                          _redact_sensitive_text(exc))
+
+
 async def check_discord_account_api(
     session,
     username: str,
@@ -1735,7 +1850,7 @@ async def check_instagram(session, username: str, proxy=None) -> Result:
             headers=INSTAGRAM_API_HEADERS,
         )
         outcome = interpret_instagram_profile_info(status, payload)
-        if outcome is not None:
+        if outcome is not None and outcome != ERROR:
             detail = f"HTTP {status} (web_profile_info)"
             if status == 200 and outcome == TAKEN:
                 user = payload["data"]["user"]
@@ -2129,6 +2244,7 @@ def build_check_workers(
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
     disabled_platforms: Collection[str] = frozenset(),
+    gunslol_mode: str = "page",
 ) -> list[Awaitable[Result]]:
     """Build one bounded coroutine per configured platform, in PLATFORMS order.
 
@@ -2160,9 +2276,19 @@ def build_check_workers(
                 deadline_result.emoji, username, proxy)
         return _run_bounded(coro, deadline_result, timeout)
 
+    gunslol_mode = (gunslol_mode or "page").strip().lower()
+    if gunslol_mode == "browser":
+        gunslol_coro = check_gunslol_browser(
+            dnsrobot_browser, username,
+            browser_semaphore=dnsrobot_semaphore,
+            timeout=timeout,
+        )
+    else:
+        gunslol_coro = check_gunslol(session, username, proxy)
+
     entries: list[tuple[str, str, Awaitable[Result]]] = [
         ("Minecraft", MINECRAFT_EMOJI, check_minecraft(session, username, proxy)),
-        ("guns.lol", GUNSLOL_EMOJI, check_gunslol(session, username, proxy)),
+        ("guns.lol", GUNSLOL_EMOJI, gunslol_coro),
         ("Discord", DISCORD_EMOJI, check_discord(
             session,
             username,
@@ -2215,6 +2341,7 @@ async def run_all_checks(
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
     disabled_platforms: Collection[str] = frozenset(),
+    gunslol_mode: str = "page",
 ) -> list[Result]:
     """Fan out every platform check in parallel and return ordered results.
 
@@ -2240,6 +2367,7 @@ async def run_all_checks(
         enable_extra_platforms=enable_extra_platforms,
         instantusername_fallback=instantusername_fallback,
         disabled_platforms=disabled_platforms,
+        gunslol_mode=gunslol_mode,
     )
     return list(await asyncio.gather(*workers))
 
@@ -2259,6 +2387,7 @@ async def stream_all_checks(
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
     disabled_platforms: Collection[str] = frozenset(),
+    gunslol_mode: str = "page",
 ) -> AsyncIterator[Result]:
     """Yield each platform result the moment that platform answers.
 
@@ -2280,6 +2409,7 @@ async def stream_all_checks(
         enable_extra_platforms=enable_extra_platforms,
         instantusername_fallback=instantusername_fallback,
         disabled_platforms=disabled_platforms,
+        gunslol_mode=gunslol_mode,
     )
     tasks = [asyncio.ensure_future(worker) for worker in workers]
     try:
@@ -2351,6 +2481,11 @@ async def _cli(argv: list[str] | None = None) -> int:
               "DNS Robot page in Chromium when it is installed; "
               "account_api is a compatibility alias)"))
     parser.add_argument(
+        "--gunslol-mode", choices=("page", "browser"),
+        default="page",
+        help=("guns.lol check mode: page (default, plain HTTP) or "
+              "browser (loads guns.lol in Playwright Chromium)"))
+    parser.add_argument(
         "--disable", default="",
         help=("comma list of platforms to skip this run, e.g. "
               "'Reddit,Twitter/X'"))
@@ -2384,7 +2519,7 @@ async def _cli(argv: list[str] | None = None) -> int:
     browser_runtime = None
     dnsrobot_browser = None
     dnsrobot_semaphore = None
-    if ns.mode in ("dnsrobot", "combined"):
+    if ns.mode in ("dnsrobot", "combined") or ns.gunslol_mode == "browser":
         try:
             browser_runtime, dnsrobot_browser = await start_dnsrobot_browser(ns.proxy)
             dnsrobot_semaphore = asyncio.Semaphore(2)
@@ -2414,6 +2549,7 @@ async def _cli(argv: list[str] | None = None) -> int:
                 dnsrobot_semaphore=dnsrobot_semaphore,
                 enable_extra_platforms=not ns.no_extra,
                 disabled_platforms=disabled,
+                gunslol_mode=ns.gunslol_mode,
             )
     finally:
         if dnsrobot_browser is not None:
