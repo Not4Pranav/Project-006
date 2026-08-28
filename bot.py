@@ -291,6 +291,16 @@ def configured_proxies() -> list[str]:
 ENABLE_EXTRA_PLATFORMS = os.getenv("ENABLE_EXTRA_PLATFORMS", "true").strip().lower() in (
     "true", "1", "yes", "on", "")
 
+# Per-platform opt-out, comma-separated display names, e.g. "Reddit,Twitter/X".
+# Disabled platforms are never even scheduled: they cost no sockets, no proxy
+# pool slots, and no reply rows. Useful on datacenter hosting where Reddit and
+# X hard-wall automated traffic and mostly return Unknown. Casual spellings
+# ("twitter", "X") are accepted via checkers.parse_disabled_platforms.
+_disabled_raw = os.getenv("DISABLED_PLATFORMS", "").strip()
+DISABLED_PLATFORMS, _DISABLED_UNKNOWN_TOKENS = (
+    checkers.parse_disabled_platforms(_disabled_raw))
+del _disabled_raw
+
 # The event handler starts after Discord delivers MESSAGE_CREATE. Reserving a
 # little room beneath five seconds means the checker fan-out cannot consume all
 # the time that the reaction REST call needs. Values from the environment are
@@ -452,7 +462,7 @@ def format_results(
 
     if include_extra is None:
         include_extra = ENABLE_EXTRA_PLATFORMS
-    expected = checkers.PLATFORMS if include_extra else checkers.CORE_PLATFORMS
+    expected = checkers.active_platforms(include_extra, DISABLED_PLATFORMS)
     by_platform = {result.platform: result for result in results}
 
     lines: list[str] = []
@@ -882,7 +892,10 @@ class SniperBot(discord.Client):
 
         if self.http_sniper is None:
             return
-        urls = list(checkers.PREWARM_URLS)
+        # Skip hosts whose platform is disabled or extra-turned-off: warming
+        # a socket we will never use only makes startup slower.
+        urls = list(checkers.prewarm_urls(
+            include_extra=ENABLE_EXTRA_PLATFORMS, disabled=DISABLED_PLATFORMS))
         if INSTANTUSERNAME_FALLBACK:
             # Warm the second-opinion host too, so a rescued check does not
             # pay DNS+TLS on its first use either.
@@ -1126,6 +1139,7 @@ class SniperBot(discord.Client):
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
+            disabled_platforms=DISABLED_PLATFORMS,
         ))
 
         try:
@@ -1138,7 +1152,10 @@ class SniperBot(discord.Client):
         if checker_task not in done:
             checker_task.cancel()
             checker_task.add_done_callback(self._consume_cancelled_checker_task)
-            return checkers.timeout_results("response deadline reached")
+            return checkers.timeout_results(
+                "response deadline reached",
+                include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
 
         try:
             return checker_task.result()
@@ -1148,7 +1165,8 @@ class SniperBot(discord.Client):
             log.warning("Checker task failed before its deadline: %s",
                         checkers._redact_sensitive_text(exc))
             return checkers.timeout_results(
-                "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS)
+                "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
 
     async def _send_reply(
         self,
@@ -1247,8 +1265,8 @@ class SniperBot(discord.Client):
     def _fill_missing(results: list[checkers.Result]) -> list[checkers.Result]:
         """Add an honest ERROR for any configured platform that never answered."""
 
-        expected = (checkers.PLATFORMS if ENABLE_EXTRA_PLATFORMS
-                    else checkers.CORE_PLATFORMS)
+        expected = checkers.active_platforms(
+            ENABLE_EXTRA_PLATFORMS, DISABLED_PLATFORMS)
         seen = {result.platform for result in results}
         by_platform = {result.platform: result for result in results}
         ordered: list[checkers.Result] = []
@@ -1379,6 +1397,7 @@ class SniperBot(discord.Client):
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
+            disabled_platforms=DISABLED_PLATFORMS,
         )
 
         # Hard outer bound, mirroring the batched path: a checker that ignores
@@ -1525,12 +1544,16 @@ class SniperBot(discord.Client):
         print(f"🟢 MULTI-SNIPER v3.0 ONLINE as {self.user}")
         print("🔒 Watching channel : "
               f"{TARGET_CHANNEL_ID if TARGET_CHANNEL_ID else 'ALL CHANNELS'}")
+        banner = ["Minecraft", "guns.lol",
+                  f"Discord (mode: {DISCORD_CHECK_MODE})"]
         if ENABLE_EXTRA_PLATFORMS:
-            print("🕹️ Platforms        : Minecraft | guns.lol | Discord | "
-                  "GitHub | Steam | Reddit | Instagram | Twitter/X")
-        else:
-            print("🕹️ Platforms        : Minecraft | guns.lol | "
-                  f"Discord (mode: {DISCORD_CHECK_MODE})")
+            banner.extend(["GitHub", "Steam", "Reddit", "Instagram", "Twitter/X"])
+        if DISABLED_PLATFORMS:
+            banner = [name for name in banner
+                      if name.split(" (mode:", 1)[0] not in DISABLED_PLATFORMS]
+        print(f"🕹️ Platforms        : {' | '.join(banner)}")
+        if DISABLED_PLATFORMS:
+            print(f"   └─ skipping     : {', '.join(sorted(DISABLED_PLATFORMS))}")
         if DISCORD_CHECK_MODE == "dnsrobot":
             print("🌐 DNS Robot browser : "
                   f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
@@ -1645,7 +1668,8 @@ class SniperBot(discord.Client):
         if check_budget <= 0:
             results = checkers.timeout_results(
                 "response deadline reached",
-                include_extra=ENABLE_EXTRA_PLATFORMS)
+                include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
             await self._publish_results(message, results, deadline)
         elif STREAM_REACTIONS:
             # Fastest path: answer each platform as it reports.
@@ -1731,6 +1755,15 @@ def main() -> None:
             "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', "
             "'instantusername', 'combined', 'account', 'account_api', "
             "or 'probe'.")
+    if _DISABLED_UNKNOWN_TOKENS:
+        raise SystemExit(
+            "❌ DISABLED_PLATFORMS has unknown entries: "
+            f"{', '.join(_DISABLED_UNKNOWN_TOKENS)}. Valid names: "
+            + ", ".join(name for name, _ in checkers.PLATFORMS) + ".")
+    if not checkers.active_platforms(ENABLE_EXTRA_PLATFORMS, DISABLED_PLATFORMS):
+        raise SystemExit(
+            "❌ DISABLED_PLATFORMS disables every configured platform; "
+            "at least one check must stay enabled.")
     # Validate every proxy that will actually be used, whether it came from
     # PROXY_URL, PROXY_URLS, or the proxy file.
     resolved_proxies = configured_proxies()

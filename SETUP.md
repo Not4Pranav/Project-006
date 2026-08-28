@@ -360,6 +360,7 @@ For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` ins
 - **Reaction ordering:** with the default `STREAM_REACTIONS=true`, emojis appear as each platform answers (fastest first). Set it to `false` if you want them batched in fixed platform order instead.
 - **Startup pre-warm:** `Pre-warmed 9/9 platform connections in 0.4s` in the log means the connection pool is hot (the 8 platform hosts plus the fallback provider when enabled); a lower count just means some hosts were unreachable at boot and will connect on demand.
 - **Reducing load:** set `ENABLE_EXTRA_PLATFORMS=false` to check only Minecraft, guns.lol, and Discord.
+- **Skipping noisy platforms:** `DISABLED_PLATFORMS=Reddit,Twitter/X` drops individual platforms entirely (no rows, no requests). Checks run in parallel under one shared deadline, so this does not speed the others up — it drops the platforms that mostly answer *Unknown* on datacenter IPs.
 - **Updating:**
 
   ```bash

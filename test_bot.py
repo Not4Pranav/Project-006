@@ -215,6 +215,25 @@ class TestReactions(ReactModeMixin, unittest.TestCase):
         # Wait, we set mode to probe above in setUp, so Discord is checked
         self.assertEqual(len(r), 3)
 
+    def test_disabled_platforms_never_run_and_never_render(self):
+        old_disabled = bot_module.DISABLED_PLATFORMS
+        bot_module.DISABLED_PLATFORMS = frozenset({"Reddit", "Twitter/X"})
+        try:
+            b = make_bot(404)
+            msg = make_message("zxqw99182")
+            asyncio.run(b.on_message(msg))
+            self.assertEqual(len(reactions(msg)), 6)
+            text = bot_module.format_results([
+                bot_module.checkers.Result(p, e, bot_module.checkers.AVAILABLE,
+                                           "ok")
+                for p, e in bot_module.checkers.PLATFORMS
+                if p not in {"Reddit", "Twitter/X"}])
+            self.assertNotIn("Reddit", text)
+            self.assertNotIn("Twitter/X", text)
+            self.assertIn("Instagram", text)
+        finally:
+            bot_module.DISABLED_PLATFORMS = old_disabled
+
     def test_dnsrobot_mode_loads_page_without_probe_credentials(self):
         old_mode = bot_module.DISCORD_CHECK_MODE
         bot_module.DISCORD_CHECK_MODE = "dnsrobot"

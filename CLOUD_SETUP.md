@@ -290,6 +290,11 @@ HTTP_POOL_LIMIT_PER_HOST=40
 # Lower memory / fewer outbound requests on a tiny instance
 # ENABLE_EXTRA_PLATFORMS=false
 
+# On free cloud IPs Reddit and X wall automated traffic and almost always
+# report Unknown — skip them so every row is a real verdict. Checks run in
+# parallel, so this does not speed the others up; it just removes noise.
+DISABLED_PLATFORMS=Reddit,Twitter/X
+
 # Proxy pool size. The default aims for 1,000 working proxies, which means
 # ~100,000 probes and about 4 minutes of background CPU at every boot -
 # too much for the smallest free tiers, and on a host that sleeps (Render

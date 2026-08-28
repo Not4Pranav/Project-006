@@ -442,6 +442,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `TARGET_CHANNEL_ID` | *(blank = all)* | The single channel to watch |
 | `LOG_CHANNEL_ID` | *(blank = off)* | Private channel that receives free-name hits |
 | `ENABLE_EXTRA_PLATFORMS` | `true` | Include GitHub, Steam, Reddit, Instagram, Twitter/X |
+| `DISABLED_PLATFORMS` | *(blank)* | Comma-separated platforms to skip entirely, e.g. `Reddit,Twitter/X` (recommended on free cloud hosts, which those two usually answer with *Unknown* anyway) |
 | `RESPONSE_MODE` | `reply` | `reply` (text list), `react` (emoji), or `both` |
 | `REPLY_EDIT_INTERVAL` | `0.7` | Minimum seconds between live edits of the reply |
 | `REPLY_INCLUDE_SKIPPED` | `false` | Show disabled platforms as *Not checked* |

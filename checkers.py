@@ -40,7 +40,7 @@ import inspect
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
@@ -105,6 +105,53 @@ FAST_PLATFORMS: tuple[tuple[str, str], ...] = (
     ("Instagram", INSTAGRAM_EMOJI),
     ("Twitter/X", TWITTER_EMOJI),
 )
+
+
+# Per-platform opt-out list. On datacenter-grade hosting some platforms
+# (Reddit, Twitter/X) wall automated traffic so hard that they mostly return
+# Unknown; a deployment can skip them instead of showing noise.
+def _platform_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).casefold())
+
+
+PLATFORM_LOOKUP: dict[str, str] = {_platform_key(p): p for p, _ in PLATFORMS}
+# Common informal spellings; keep short, they resolve to canonical names.
+PLATFORM_LOOKUP.update({"twitter": "Twitter/X", "x": "Twitter/X"})
+
+
+def parse_disabled_platforms(raw: str) -> tuple[frozenset[str], list[str]]:
+    """Map a comma list ("Reddit, Twitter") to canonical platform names.
+
+    Returns (disabled, unknown_tokens): unknown tokens fail config validation
+    loudly rather than being silently ignored, because a typo'd entry that
+    does nothing is exactly how a user ends up believing Reddit is off when
+    it is not.
+    """
+
+    disabled: set[str] = set()
+    unknown: list[str] = []
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        match = PLATFORM_LOOKUP.get(_platform_key(token))
+        if match is None:
+            unknown.append(token)
+        else:
+            disabled.add(match)
+    return frozenset(disabled), unknown
+
+
+def active_platforms(
+    include_extra: bool = True,
+    disabled: Collection[str] = frozenset(),
+) -> tuple[tuple[str, str], ...]:
+    """The platform list honouring the extra-platform toggle and opt-outs."""
+
+    base = PLATFORMS if include_extra else CORE_PLATFORMS
+    if not disabled:
+        return base
+    return tuple((p, e) for p, e in base if p not in disabled)
 
 # Realistic browser headers help regular profile pages return their ordinary
 # HTML instead of a simplistic bot response. They do not try to bypass a
@@ -937,16 +984,29 @@ MINECRAFT_ENDPOINTS: Sequence[str] = (
 )
 
 # Hosts contacted by the checkers, used to pre-open pooled TLS connections.
-PREWARM_URLS: tuple[str, ...] = (
-    "https://api.mojang.com/",
-    "https://api.minecraftservices.com/",
-    "https://guns.lol/",
-    "https://github.com/",
-    "https://steamcommunity.com/",
-    "https://www.reddit.com/",
-    "https://www.instagram.com/",
-    "https://x.com/",
+# Keyed by platform so deployments that disable a platform can also skip
+# warming its socket.
+PREWARM_HOSTS: tuple[tuple[str, str], ...] = (
+    ("Minecraft", "https://api.mojang.com/"),
+    ("Minecraft", "https://api.minecraftservices.com/"),
+    ("guns.lol", "https://guns.lol/"),
+    ("GitHub", "https://github.com/"),
+    ("Steam", "https://steamcommunity.com/"),
+    ("Reddit", "https://www.reddit.com/"),
+    ("Instagram", "https://www.instagram.com/"),
+    ("Twitter/X", "https://x.com/"),
 )
+PREWARM_URLS: tuple[str, ...] = tuple(url for _, url in PREWARM_HOSTS)
+
+
+def prewarm_urls(
+    include_extra: bool = True,
+    disabled: Collection[str] = frozenset(),
+) -> tuple[str, ...]:
+    """The warm-up host list honouring the same toggles as the fan-out."""
+
+    active = {name for name, _ in active_platforms(include_extra, disabled)}
+    return tuple(url for name, url in PREWARM_HOSTS if name in active)
 
 DEFAULT_DISCORD_ACCOUNT_API_URL = (
     "https://discord.com/api/v10/unique-username/"
@@ -1939,16 +1999,20 @@ async def _with_fallback(
 def timeout_results(
     detail: str = "check deadline reached",
     include_extra: bool = True,
+    disabled: Collection[str] = frozenset(),
 ) -> list[Result]:
     """Return one honest unknown/error result per platform that would run.
 
-    ``include_extra`` mirrors ``run_all_checks(enable_extra_platforms=...)`` so
-    a timed-out lookup reports exactly the platforms that were configured,
-    instead of inventing errors for checks that are switched off.
+    ``include_extra`` mirrors ``run_all_checks(enable_extra_platforms=...)`` and
+    ``disabled`` mirrors ``disabled_platforms``, so a timed-out lookup reports
+    exactly the platforms that were configured, instead of inventing errors for
+    checks that are switched off.
     """
 
-    platforms = PLATFORMS if include_extra else CORE_PLATFORMS
-    return [Result(platform, emoji, ERROR, detail) for platform, emoji in platforms]
+    return [
+        Result(platform, emoji, ERROR, detail)
+        for platform, emoji in active_platforms(include_extra, disabled)
+    ]
 
 
 async def _run_bounded(
@@ -1987,6 +2051,7 @@ def build_check_workers(
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
+    disabled_platforms: Collection[str] = frozenset(),
 ) -> list[Awaitable[Result]]:
     """Build one bounded coroutine per configured platform, in PLATFORMS order.
 
@@ -1995,52 +2060,65 @@ def build_check_workers(
 
     Each worker is independent and holds no shared mutable state, so any number
     of lookups (different users, different usernames) can run at the same time.
-    """
 
-    fallbacks = timeout_results()
+    Platforms in ``disabled_platforms`` are not born at all: a disabled
+    platform costs zero sockets, zero pool slots, and zero columns.
+    """
 
     def bounded(coro, deadline_result: Result) -> Awaitable[Result]:
         """Attach the instantusername second opinion, then the deadline."""
 
+        # Skip the hedge when the primary already *is* the instantusername
+        # check (Discord in instantusername/combined mode): a failed primary
+        # would otherwise re-hit the identical same-service URL as its own
+        # "second opinion", which is a wasted duplicate, not a hedge.
+        already_instantusername = (
+            deadline_result.platform == "Discord"
+            and discord_mode in ("instantusername", "combined"))
         if (instantusername_fallback
+                and not already_instantusername
                 and deadline_result.platform in INSTANTUSERNAME_SERVICES):
             coro = _with_fallback(
                 coro, session, deadline_result.platform,
                 deadline_result.emoji, username, proxy)
         return _run_bounded(coro, deadline_result, timeout)
 
-    workers: list[Awaitable[Result]] = [
-        bounded(check_minecraft(session, username, proxy), fallbacks[0]),
-        bounded(check_gunslol(session, username, proxy), fallbacks[1]),
-        bounded(
-            check_discord(
-                session,
-                username,
-                proxy=proxy,
-                mode=discord_mode,
-                probe_url=discord_probe_url,
-                probe_headers=discord_probe_headers,
-                account_api_url=discord_account_api_url,
-                account_api_headers=discord_account_api_headers,
-                dnsrobot_browser=dnsrobot_browser,
-                dnsrobot_semaphore=dnsrobot_semaphore,
-                dnsrobot_timeout=timeout,
-            ),
-            fallbacks[2],
-        ),
+    entries: list[tuple[str, str, Awaitable[Result]]] = [
+        ("Minecraft", MINECRAFT_EMOJI, check_minecraft(session, username, proxy)),
+        ("guns.lol", GUNSLOL_EMOJI, check_gunslol(session, username, proxy)),
+        ("Discord", DISCORD_EMOJI, check_discord(
+            session,
+            username,
+            proxy=proxy,
+            mode=discord_mode,
+            probe_url=discord_probe_url,
+            probe_headers=discord_probe_headers,
+            account_api_url=discord_account_api_url,
+            account_api_headers=discord_account_api_headers,
+            dnsrobot_browser=dnsrobot_browser,
+            dnsrobot_semaphore=dnsrobot_semaphore,
+            dnsrobot_timeout=timeout,
+        )),
     ]
-
     if enable_extra_platforms:
-        extra_fallbacks = [
-            Result(p, e, ERROR, "check deadline reached") for p, e in FAST_PLATFORMS
-        ]
-        workers.extend([
-            bounded(check_github(session, username, proxy), extra_fallbacks[0]),
-            bounded(check_steam(session, username, proxy), extra_fallbacks[1]),
-            bounded(check_reddit(session, username, proxy), extra_fallbacks[2]),
-            bounded(check_instagram(session, username, proxy), extra_fallbacks[3]),
-            bounded(check_twitter(session, username, proxy), extra_fallbacks[4]),
+        entries.extend([
+            ("GitHub", GITHUB_EMOJI, check_github(session, username, proxy)),
+            ("Steam", STEAM_EMOJI, check_steam(session, username, proxy)),
+            ("Reddit", REDDIT_EMOJI, check_reddit(session, username, proxy)),
+            ("Instagram", INSTAGRAM_EMOJI,
+             check_instagram(session, username, proxy)),
+            ("Twitter/X", TWITTER_EMOJI, check_twitter(session, username, proxy)),
         ])
+
+    workers: list[Awaitable[Result]] = []
+    for platform, emoji, coro in entries:
+        if platform in disabled_platforms:
+            # Un-awaited coroutine would log a warning; close it cleanly.
+            if inspect.iscoroutine(coro):
+                coro.close()
+            continue
+        workers.append(bounded(
+            coro, Result(platform, emoji, ERROR, "check deadline reached")))
 
     return workers
 
@@ -2059,6 +2137,7 @@ async def run_all_checks(
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
+    disabled_platforms: Collection[str] = frozenset(),
 ) -> list[Result]:
     """Fan out every platform check in parallel and return ordered results.
 
@@ -2066,8 +2145,9 @@ async def run_all_checks(
     begins at the same time, so the total duration is at most the one timeout,
     not the sum of platform timeouts. Timed-out workers return ERROR results.
 
-    Results come back in ``PLATFORMS`` order. Use ``stream_all_checks`` when
-    you would rather act on each platform the moment it answers.
+    Results come back in ``PLATFORMS`` order minus ``disabled_platforms``.
+    Use ``stream_all_checks`` when you would rather act on each platform the
+    moment it answers.
     """
 
     workers = build_check_workers(
@@ -2082,6 +2162,7 @@ async def run_all_checks(
         dnsrobot_semaphore=dnsrobot_semaphore,
         enable_extra_platforms=enable_extra_platforms,
         instantusername_fallback=instantusername_fallback,
+        disabled_platforms=disabled_platforms,
     )
     return list(await asyncio.gather(*workers))
 
@@ -2100,6 +2181,7 @@ async def stream_all_checks(
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     enable_extra_platforms: bool = True,
     instantusername_fallback: bool = True,
+    disabled_platforms: Collection[str] = frozenset(),
 ) -> AsyncIterator[Result]:
     """Yield each platform result the moment that platform answers.
 
@@ -2120,6 +2202,7 @@ async def stream_all_checks(
         dnsrobot_semaphore=dnsrobot_semaphore,
         enable_extra_platforms=enable_extra_platforms,
         instantusername_fallback=instantusername_fallback,
+        disabled_platforms=disabled_platforms,
     )
     tasks = [asyncio.ensure_future(worker) for worker in workers]
     try:
