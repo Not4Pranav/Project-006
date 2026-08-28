@@ -29,6 +29,7 @@ from checkers import (
     interpret_github,
     interpret_gunslol,
     interpret_instagram,
+    interpret_instagram_profile_info,
     interpret_minecraft,
     interpret_reddit,
     interpret_steam,
@@ -209,8 +210,14 @@ class TestInterpreters(unittest.TestCase):
         self.assertEqual(interpret_reddit(500), ERROR)
 
     def test_instagram(self):
-        # 200 with normal page = taken
-        self.assertEqual(interpret_instagram(200, "<html>profile page</html>"), TAKEN)
+        # 200 with positive profile markers = taken
+        self.assertEqual(
+            interpret_instagram(
+                200,
+                '<meta property="og:description" content="1 Followers, 2 '
+                'Following, 3 Posts - See Instagram photos and videos from '
+                'Jane Doe (@janedoe)">'),
+            TAKEN)
         # 200 with "not available" = available
         self.assertEqual(interpret_instagram(200, "Sorry, this page isn't available"), AVAILABLE)
         # 200 with login wall = blocked
@@ -219,6 +226,16 @@ class TestInterpreters(unittest.TestCase):
             interpret_instagram(200, "redirecting to /challenge/ required"), BLOCKED)
         # 200 with empty body = blocked
         self.assertEqual(interpret_instagram(200, ""), BLOCKED)
+        # Datacenter landing page: 200 with neither missing-profile text nor
+        # real profile markers must be unknown, not a guessed "taken".
+        self.assertEqual(
+            interpret_instagram(200, "<html>Welcome to Instagram</html>"), BLOCKED)
+        self.assertEqual(
+            interpret_instagram(200, "<html>profile page</html>"), BLOCKED)
+        # A page that only shows profile JSON is still recognisably a profile.
+        self.assertEqual(
+            interpret_instagram(200, '{"profile_pic_url":"https://x/y.jpg"}'),
+            TAKEN)
         # 404 = available
         self.assertEqual(interpret_instagram(404), AVAILABLE)
         # Redirect = blocked (login wall)
@@ -230,6 +247,33 @@ class TestInterpreters(unittest.TestCase):
         # Other
         self.assertEqual(interpret_instagram(500), ERROR)
 
+    def test_instagram_profile_info(self):
+        # 200 with a populated user object = taken
+        self.assertEqual(
+            interpret_instagram_profile_info(
+                200, {"data": {"user": {"id": "3", "username": "kevin"}}}),
+            TAKEN)
+        self.assertEqual(
+            interpret_instagram_profile_info(
+                200, {"data": {"user": {"username": "kevin"}}}), TAKEN)
+        # 404 = the endpoint itself confirms the name is free
+        self.assertEqual(
+            interpret_instagram_profile_info(
+                404, {"message": "User not found", "status": "fail"}),
+            AVAILABLE)
+        # Anything else is inconclusive: the caller falls back to the page.
+        self.assertIsNone(interpret_instagram_profile_info(200, None))
+        self.assertIsNone(interpret_instagram_profile_info(200, {}))
+        self.assertIsNone(
+            interpret_instagram_profile_info(200, {"data": {"user": None}}))
+        self.assertIsNone(
+            interpret_instagram_profile_info(200, {"data": {"user": {}}}))
+        self.assertIsNone(
+            interpret_instagram_profile_info(401, {"require_login": True}))
+        self.assertIsNone(interpret_instagram_profile_info(403, {}))
+        self.assertIsNone(interpret_instagram_profile_info(429, {}))
+        self.assertIsNone(interpret_instagram_profile_info(500, {}))
+
     def test_instagram_typographic_apostrophe(self):
         """Instagram serves a curly apostrophe; the ASCII marker must still hit."""
         page = "Sorry, this page isn\u2019t available."
@@ -237,7 +281,9 @@ class TestInterpreters(unittest.TestCase):
 
     def test_instagram_bio_word_does_not_block(self):
         """A live profile that merely mentions 'challenge' is TAKEN, not BLOCKED."""
-        page = "<html>bio: I love a good challenge and captcha puzzles</html>"
+        page = ("<html><body>bio: I love a good challenge and captcha puzzles"
+                '<meta property="al:ios:url" '
+                'content="instagram://user?username=janedoe"></body></html>')
         self.assertEqual(interpret_instagram(200, page), TAKEN)
 
     def test_twitter_typographic_apostrophe(self):
@@ -749,6 +795,80 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_instagram(
             _session_with_status(200, "Login to Instagram"), "kevin"))
         self.assertEqual(r.status, BLOCKED)
+
+    @staticmethod
+    def _instagram_routed_session(api_status, api_payload, page_status=200,
+                                  page_body=""):
+        """Fake session routing GETs by URL: API vs profile page."""
+
+        def make_ctx(status, body, payload):
+            response = MagicMock()
+            response.status = status
+            response.charset = "utf-8"
+            response.content = MagicMock()
+            response.content.read = AsyncMock(return_value=body.encode("utf-8"))
+            response.text = AsyncMock(return_value=body)
+            response.json = AsyncMock(return_value=payload)
+            ctx = MagicMock()
+            ctx.__aenter__ = AsyncMock(return_value=response)
+            ctx.__aexit__ = AsyncMock(return_value=False)
+            return ctx
+
+        api_ctx = make_ctx(api_status, "", api_payload)
+        page_ctx = make_ctx(page_status, page_body, {})
+
+        def route(url, **_kwargs):
+            return api_ctx if "web_profile_info" in url else page_ctx
+
+        session = MagicMock()
+        session.get = MagicMock(side_effect=route)
+        return session
+
+    def test_instagram_primary_endpoint_taken(self):
+        session = self._instagram_routed_session(
+            200, {"data": {"user": {"id": "3", "username": "kevin"}}})
+        r = self.run_async(checkers.check_instagram(session, "kevin"))
+        self.assertEqual(r.status, TAKEN)
+        # A definitive primary answer costs exactly one request: no page fetch.
+        self.assertEqual(session.get.call_count, 1)
+        call = session.get.call_args
+        self.assertIn("web_profile_info", call.args[0])
+        self.assertIn("username=kevin", call.args[0])
+        self.assertEqual(call.kwargs["headers"]["X-IG-App-ID"],
+                         checkers.INSTAGRAM_APP_ID)
+
+    def test_instagram_primary_endpoint_free(self):
+        session = self._instagram_routed_session(
+            404, {"message": "User not found", "status": "fail"})
+        r = self.run_async(checkers.check_instagram(session, "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_instagram_datacenter_landing_page_is_unknown(self):
+        # The API is walled and the profile page answers a generic 200 landing
+        # page with neither missing- nor profile markers: report unknown,
+        # never a guessed "taken".
+        session = self._instagram_routed_session(
+            401, {"require_login": True}, 200,
+            "<html><title>Instagram</title>sign up to see photos</html>")
+        r = self.run_async(checkers.check_instagram(session, "kevin"))
+        self.assertEqual(r.status, BLOCKED)
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_instagram_page_fallback_taken_when_api_walled(self):
+        session = self._instagram_routed_session(
+            429, {}, 200,
+            '<meta property="og:title" content="Jane Doe (@janedoe) '
+            '\u2022 Instagram photos and videos">')
+        r = self.run_async(checkers.check_instagram(session, "janedoe"))
+        self.assertEqual(r.status, TAKEN)
+
+    def test_instagram_page_fallback_free(self):
+        session = self._instagram_routed_session(
+            403, {}, 200, "Sorry, this page isn't available")
+        r = self.run_async(checkers.check_instagram(session, "zxqw99182"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertIn("profile page", r.detail)
 
     def test_twitter_free(self):
         r = self.run_async(checkers.check_twitter(
