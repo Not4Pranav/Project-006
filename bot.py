@@ -415,6 +415,12 @@ STATUS_EMOJIS = {
 }
 PENDING_EMOJI = "⏳"
 
+# Compact one-segment-per-platform progress bar shown in the footer while
+# results stream in (e.g. "▰▰▰▱▱▱▱▱ 3/8"). Block glyphs keep every platform
+# visibly advancing without spamming the message with extra lines.
+PROGRESS_FILLED = "▰"
+PROGRESS_EMPTY = "▱"
+
 # Optional tiny HTTP server. Free hosting tiers (Render, Koyeb, Replit) only
 # keep a service alive if it binds a port and answers health checks, so this
 # turns the worker into something they will host for free. Enabled whenever
@@ -481,8 +487,15 @@ def format_results(
         return "⚠️ No platforms were checked."
 
     # The verdict bar: available first and bolded, because that is the one
-    # outcome everyone is scanning for in a sniping channel.
+    # outcome everyone is scanning for in a sniping channel. While checks
+    # stream in, a compact progress bar opens the line instead of a bare
+    # "checking" count — same information, drawn.
     summary: list[str] = []
+    if pending and counts["checking"]:
+        total = len(expected)
+        done = total - counts["checking"]
+        bar = PROGRESS_FILLED * done + PROGRESS_EMPTY * (total - done)
+        summary.append(f"{bar} {done}/{total}")
     if counts["available"]:
         summary.append(f"✅ **{counts['available']} available**")
     if counts["taken"]:
@@ -493,8 +506,6 @@ def format_results(
         summary.append(f"🚫 {counts['invalid']} invalid")
     if counts["not checked"]:
         summary.append(f"⏸️ {counts['not checked']} not checked")
-    if counts["checking"]:
-        summary.append(f"⏳ {counts['checking']} checking")
 
     parts: list[str] = []
     if username:

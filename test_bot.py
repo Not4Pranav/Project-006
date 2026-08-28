@@ -673,12 +673,19 @@ class TestFormatResults(unittest.TestCase):
         self.assertTrue(text.startswith("**`vortex`**"))
         self.assertIn("✅ **1 available**", text)
 
-    def test_pending_progress_shows_in_the_footer(self):
+    def test_pending_progress_bar_in_the_footer(self):
         text = bot_module.format_results(
             [checkers.Result("Minecraft", "x", checkers.AVAILABLE)],
-            pending=True)
-        self.assertIn("⏳", text)
-        self.assertIn("checking", text)
+            pending=True, include_extra=False)
+        self.assertIn("▰▱▱ 1/3", text)          # 1 of 3 core checks done
+        self.assertIn(bot_module.PENDING_LABEL, text)
+
+    def test_progress_bar_disappears_once_finished(self):
+        text = bot_module.format_results(
+            [checkers.Result("Minecraft", "x", checkers.AVAILABLE)],
+            include_extra=False)
+        self.assertNotIn(bot_module.PROGRESS_FILLED, text)
+        self.assertNotIn(bot_module.PROGRESS_EMPTY, text)
 
 
 class TestCacheBounds(unittest.TestCase):
