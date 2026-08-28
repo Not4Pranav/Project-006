@@ -504,8 +504,8 @@ class TestLiveReplyEventDriven(unittest.TestCase):
         for earlier, later in zip(paint_times, paint_times[1:]):
             self.assertGreaterEqual(later - earlier, 0.3 - 0.05)
         final = final_reply(message)
-        self.assertIn("Minecraft: Available", final)
-        self.assertIn("guns.lol: Unavailable", final)
+        self.assertIn("**Minecraft** — ✅ **Available**", final)
+        self.assertIn("**guns.lol** — ❌ Unavailable", final)
         self.assertNotIn(bot_module.PENDING_LABEL, final)
 
     def test_no_change_events_means_no_busy_polling_edits(self):

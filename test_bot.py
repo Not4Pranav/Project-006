@@ -472,9 +472,13 @@ class TestReplyMode(ReplyModeMixin, unittest.TestCase):
 
         self.assertEqual(reactions(msg), [])          # no emoji spam
         self.assertEqual(final_reply(msg), (
-            "Minecraft: Available\n"
-            "guns.lol: Unavailable\n"
-            "Discord: Unknown"
+            "**`vortex`**\n"
+            "\n"
+            f"{checkers.MINECRAFT_EMOJI} **Minecraft** — ✅ **Available**\n"
+            f"{checkers.GUNSLOL_EMOJI} **guns.lol** — ❌ Unavailable\n"
+            f"{checkers.DISCORD_EMOJI} **Discord** — ⚠️ Unknown\n"
+            "\n"
+            "✅ **1 available** · ❌ 1 unavailable · ⚠️ 1 unknown"
         ))
 
     def test_reply_does_not_ping_the_author(self):
@@ -493,7 +497,13 @@ class TestReplyMode(ReplyModeMixin, unittest.TestCase):
         ]):
             asyncio.run(b.on_message(msg))
         self.assertEqual(final_reply(msg), (
-            "Minecraft: Unknown\nguns.lol: Unknown\nDiscord: Invalid"))
+            "**`vortex`**\n"
+            "\n"
+            f"{checkers.MINECRAFT_EMOJI} **Minecraft** — ⚠️ Unknown\n"
+            f"{checkers.GUNSLOL_EMOJI} **guns.lol** — ⚠️ Unknown\n"
+            f"{checkers.DISCORD_EMOJI} **Discord** — 🚫 Invalid\n"
+            "\n"
+            "⚠️ 2 unknown · 🚫 1 invalid"))
 
     def test_skipped_platforms_are_hidden_by_default(self):
         b = make_bot()
@@ -518,7 +528,7 @@ class TestReplyMode(ReplyModeMixin, unittest.TestCase):
                     checkers.Result("Discord", "🐈‍⬛", checkers.SKIPPED),
             ]):
                 asyncio.run(b.on_message(msg))
-            self.assertIn("Discord: Not checked", final_reply(msg))
+            self.assertIn("**Discord** — ⏸️ Not checked", final_reply(msg))
         finally:
             bot_module.REPLY_INCLUDE_SKIPPED = saved
 
@@ -549,7 +559,7 @@ class TestReplyMode(ReplyModeMixin, unittest.TestCase):
         self.assertLess(paint_times[0], 0.2)
         # ...and the pending marker is gone from the final text.
         self.assertNotIn(bot_module.PENDING_LABEL, final_reply(msg))
-        self.assertIn("guns.lol: Unavailable", final_reply(msg))
+        self.assertIn("**guns.lol** — ❌ Unavailable", final_reply(msg))
 
     def test_pending_platforms_are_marked_while_streaming(self):
         async def fast():
@@ -602,7 +612,7 @@ class TestReplyMode(ReplyModeMixin, unittest.TestCase):
         ]):
             asyncio.run(b.on_message(msg))
         self.assertEqual(reactions(msg), ["🕹️"])
-        self.assertIn("Minecraft: Available", final_reply(msg))
+        self.assertIn("**Minecraft** — ✅ **Available**", final_reply(msg))
 
     def test_cache_hit_also_replies(self):
         b = make_bot()
@@ -632,9 +642,11 @@ class TestFormatResults(unittest.TestCase):
                 checkers.Result("Minecraft", "x", checkers.AVAILABLE),
             ])
             self.assertEqual(text.splitlines(), [
-                "Minecraft: Available",
-                "guns.lol: Unavailable",
-                "Discord: Available",
+                f"{checkers.MINECRAFT_EMOJI} **Minecraft** — ✅ **Available**",
+                f"{checkers.GUNSLOL_EMOJI} **guns.lol** — ❌ Unavailable",
+                f"{checkers.DISCORD_EMOJI} **Discord** — ✅ **Available**",
+                "",
+                "✅ **2 available** · ❌ 1 unavailable",
             ])
         finally:
             bot_module.ENABLE_EXTRA_PLATFORMS = saved
@@ -653,6 +665,20 @@ class TestFormatResults(unittest.TestCase):
 
     def test_empty_results_are_never_an_empty_message(self):
         self.assertTrue(bot_module.format_results([]).strip())
+
+    def test_username_header_and_summary_footer(self):
+        text = bot_module.format_results(
+            [checkers.Result("Minecraft", "x", checkers.AVAILABLE)],
+            username="vortex")
+        self.assertTrue(text.startswith("**`vortex`**"))
+        self.assertIn("✅ **1 available**", text)
+
+    def test_pending_progress_shows_in_the_footer(self):
+        text = bot_module.format_results(
+            [checkers.Result("Minecraft", "x", checkers.AVAILABLE)],
+            pending=True)
+        self.assertIn("⏳", text)
+        self.assertIn("checking", text)
 
 
 class TestCacheBounds(unittest.TestCase):

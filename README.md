@@ -7,14 +7,18 @@ Post a bare username in a watched Discord channel. The bot checks it across **8 
 ```
 you:  vortex
 
-bot:  Minecraft: Available
-      guns.lol: Unavailable
-      Discord: Unavailable
-      GitHub: Available
-      Steam: Unavailable
-      Reddit: Available
-      Instagram: Unknown
-      Twitter/X: Unavailable
+bot:  **`vortex`**
+
+      🕹️ **Minecraft** — ✅ **Available**
+      🔫 **guns.lol** — ❌ Unavailable
+      🐈‍⬛ **Discord** — ❌ Unavailable
+      💻 **GitHub** — ✅ **Available**
+      🎮 **Steam** — ❌ Unavailable
+      👀 **Reddit** — ✅ **Available**
+      📸 **Instagram** — ⚠️ Unknown
+      🐦 **Twitter/X** — ❌ Unavailable
+
+      ✅ **3 available** · ❌ 4 unavailable · ⚠️ 1 unknown
 ```
 
 The reply appears **immediately** and fills in live as each platform reports. Prefer emoji reactions on the original message instead? Set `RESPONSE_MODE=react`.

@@ -136,14 +136,18 @@ Expected startup banner:
 Post a bare username in the watched channel. The bot replies almost immediately and fills the list in as each platform reports:
 
 ```
-Minecraft: Available
-guns.lol: Unavailable
-Discord: Unavailable
-GitHub: Available
-Steam: Unavailable
-Reddit: Available
-Instagram: Unknown
-Twitter/X: Unavailable
+**`vortex`**
+
+🕹️ **Minecraft** — ✅ **Available**
+🔫 **guns.lol** — ❌ Unavailable
+🐈‍⬛ **Discord** — ❌ Unavailable
+💻 **GitHub** — ✅ **Available**
+🎮 **Steam** — ❌ Unavailable
+👀 **Reddit** — ✅ **Available**
+📸 **Instagram** — ⚠️ Unknown
+🐦 **Twitter/X** — ❌ Unavailable
+
+✅ **3 available** · ❌ 4 unavailable · ⚠️ 1 unknown
 ```
 
 Set `RESPONSE_MODE=react` if you would rather have emoji reactions on the original message. Stop with `Ctrl+C`.

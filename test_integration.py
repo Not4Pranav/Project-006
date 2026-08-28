@@ -447,7 +447,7 @@ class TestBotBoot(IntegrationCase):
                     await bot.on_message(message)
 
                 text = final_reply(message)
-                self.assertIn("Minecraft: Available", text)
+                self.assertIn("**Minecraft** — ✅ **Available**", text)
                 self.assertGreaterEqual(
                     len(seen), len(checkers.PLATFORMS),
                     "checks did not go through the proxies")
@@ -478,7 +478,8 @@ class TestBotBoot(IntegrationCase):
                 with patch.object(checkers, "build_check_workers",
                                   lambda *a, **k: [done(r) for r in results]):
                     await bot.on_message(message)
-                self.assertIn("Minecraft: Unavailable", final_reply(message))
+                self.assertIn("**Minecraft** — ❌ Unavailable",
+                              final_reply(message))
             finally:
                 await bot.close()
 

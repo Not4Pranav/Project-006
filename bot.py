@@ -403,6 +403,18 @@ STATUS_LABELS = {
 }
 PENDING_LABEL = "Checking..."
 
+# One glanceable glyph per status so a busy channel can scan the reply
+# without reading the labels. ✅ always marks a win, never mere success.
+STATUS_EMOJIS = {
+    checkers.AVAILABLE: "✅",
+    checkers.TAKEN: "❌",
+    checkers.INVALID: "🚫",
+    checkers.BLOCKED: "⚠️",
+    checkers.ERROR: "⚠️",
+    checkers.SKIPPED: "⏸️",
+}
+PENDING_EMOJI = "⏳"
+
 # Optional tiny HTTP server. Free hosting tiers (Render, Koyeb, Replit) only
 # keep a service alive if it binds a port and answers health checks, so this
 # turns the worker into something they will host for free. Enabled whenever
@@ -418,13 +430,17 @@ def format_results(
     results: list[checkers.Result],
     pending: bool = False,
     include_extra: bool | None = None,
+    username: str | None = None,
 ) -> str:
-    """Render results as a readable "Platform: Status" list.
+    """Render results as an emoji-coded list with a summary footer.
 
     Lines always follow the fixed platform order, even though results stream
     back in completion order, so the message never reshuffles under the reader
     while it is being updated. Platforms that have not answered yet show as
-    pending rather than silently missing.
+    pending rather than silently missing. When ``username`` is given it heads
+    the message (code-styled), so a busy channel can see which lookup the
+    reply belongs to; it must already be a validated username token so the
+    markdown wrapper cannot be escaped.
     """
 
     if include_extra is None:
@@ -433,21 +449,60 @@ def format_results(
     by_platform = {result.platform: result for result in results}
 
     lines: list[str] = []
-    for platform, _emoji in expected:
+    counts = {"available": 0, "taken": 0, "unknown": 0, "invalid": 0,
+              "not checked": 0, "checking": 0}
+    for platform, emoji in expected:
         result = by_platform.get(platform)
         if result is None:
             if not pending:
                 continue
-            lines.append(f"{platform}: {PENDING_LABEL}")
+            counts["checking"] += 1
+            lines.append(
+                f"{emoji} **{platform}** — {PENDING_EMOJI} {PENDING_LABEL}")
             continue
         if result.status == checkers.SKIPPED and not REPLY_INCLUDE_SKIPPED:
             continue
+        mark = STATUS_EMOJIS.get(result.status, "⚠️")
         label = STATUS_LABELS.get(result.status, "Unknown")
-        lines.append(f"{platform}: {label}")
+        if result.status == checkers.AVAILABLE:
+            counts["available"] += 1
+            label = f"**{label}**"  # make a free name pop off the list
+        elif result.status == checkers.TAKEN:
+            counts["taken"] += 1
+        elif result.status == checkers.INVALID:
+            counts["invalid"] += 1
+        elif result.status == checkers.SKIPPED:
+            counts["not checked"] += 1
+        else:
+            counts["unknown"] += 1
+        lines.append(f"{emoji} **{platform}** — {mark} {label}")
 
     if not lines:
-        return "No platforms were checked."
-    return "\n".join(lines)
+        return "⚠️ No platforms were checked."
+
+    # The verdict bar: available first and bolded, because that is the one
+    # outcome everyone is scanning for in a sniping channel.
+    summary: list[str] = []
+    if counts["available"]:
+        summary.append(f"✅ **{counts['available']} available**")
+    if counts["taken"]:
+        summary.append(f"❌ {counts['taken']} unavailable")
+    if counts["unknown"]:
+        summary.append(f"⚠️ {counts['unknown']} unknown")
+    if counts["invalid"]:
+        summary.append(f"🚫 {counts['invalid']} invalid")
+    if counts["not checked"]:
+        summary.append(f"⏸️ {counts['not checked']} not checked")
+    if counts["checking"]:
+        summary.append(f"⏳ {counts['checking']} checking")
+
+    parts: list[str] = []
+    if username:
+        parts.append(f"**`{username}`**\n")
+    parts.extend(lines)
+    parts.append("")
+    parts.append(" · ".join(summary))
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1150,7 +1205,8 @@ class SniperBot(discord.Client):
                 message, self._verdict_emojis(results), deadline))
         if REPLY_ENABLED:
             jobs.append(self._send_reply(
-                message, format_results(results),
+                message,
+                format_results(results, username=message.content.strip()),
                 min(REACTION_TIMEOUT, deadline - time.monotonic())))
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
@@ -1220,7 +1276,9 @@ class SniperBot(discord.Client):
             finished = done.is_set()
             now = time.monotonic()
             due = last_paint == 0.0 or now - last_paint >= REPLY_EDIT_INTERVAL
-            text = format_results(results, pending=not finished)
+            text = format_results(
+                results, pending=not finished,
+                username=message.content.strip())
 
             if text != last_text and (due or finished) and editable:
                 cap = min(REACTION_TIMEOUT, max(0.0, deadline - now))

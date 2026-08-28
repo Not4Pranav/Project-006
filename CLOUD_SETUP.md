@@ -268,7 +268,7 @@ Consider a UPS or just accept that a power cut = downtime. `Restart=always` plus
 DISCORD_TOKEN=your-bot-token
 TARGET_CHANNEL_ID=123456789012345678
 
-# Answer style (default: a readable "Platform: Status" reply)
+# Answer style (default: an emoji-coded reply listing each platform's status)
 RESPONSE_MODE=reply
 
 # Only for PaaS hosts that require an HTTP port (Options B, C)
