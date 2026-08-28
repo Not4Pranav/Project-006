@@ -1017,16 +1017,6 @@ DEFAULT_DISCORD_ACCOUNT_API_URL = (
 DISCORD_ACCOUNT_API_URL = DEFAULT_DISCORD_ACCOUNT_API_URL
 
 DEFAULT_DISCORD_DNSROBOT_URL = "https://dnsrobot.net/username-checker"
-DEFAULT_DISCORD_DNSROBOT_API_URL = (
-    "https://discord.com/api/v9/unique-username/"
-    "username-attempt-unauthed"
-)
-DNSROBOT_BROWSER_HEADERS = {
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "Origin": "https://dnsrobot.net",
-    "Referer": DEFAULT_DISCORD_DNSROBOT_URL,
-}
 DNSROBOT_USERNAME_CHECKER_URL = DEFAULT_DISCORD_DNSROBOT_URL
 DNSROBOT_ALLOWED_HOSTS = {"dnsrobot.net", "www.dnsrobot.net"}
 

@@ -429,7 +429,7 @@ Discord has no public username-availability API, so this check is **off by defau
 | `account` / `account_api` | POSTs `{"username": "..."}` to Discord's username-eligibility route | Optionally an authorised credential |
 | `probe` | GETs your own authorised checker URL template (`200` = taken, `404` = free) | `DISCORD_PROBE_URL` |
 
-The bot never claims a name, and never sends the Discord bot token to any of these endpoints. Any credential you configure is sent **only** to the endpoint it belongs to.
+The bot never claims a name, never logs in to a Discord account, and never sends the bot token anywhere except Discord's own gateway. The website modes (`instantusername`, `combined`, `dnsrobot`) never contact Discord's servers directly: they read instantusername.com and/or load dnsrobot.net's public checker page, which does its own checking from the browser. Any credential you configure is sent **only** to the endpoint it belongs to.
 
 ---
 
