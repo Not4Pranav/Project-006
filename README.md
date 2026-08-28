@@ -232,10 +232,12 @@ Set `INSTANTUSERNAME_FALLBACK=false` to disable the second source entirely — f
 | GitHub | 💻 | 404 | 200 profile page | 403 / 429 (rate limit) |
 | Steam | 🎮 | 404, or "profile could not be found" | 200 with profile content | 403 / 429 / 503 |
 | Reddit | 👀 | 404 | 200 with user-about JSON | 403 / 429 / 503 |
-| Instagram | 📸 | 404, or "this page isn't available" | 200 profile page | login wall, checkpoint, 401 / 403 / 429 |
+| Instagram | 📸 | web_profile_info 404, or "this page isn't available" | web_profile_info 200 + user JSON, or page with profile markers | login wall, checkpoint, landing page with no profile markers, 401 / 403 / 429 |
 | Twitter/X | 🐦 | 404, or "this account doesn't exist" | 200 profile page | rate limit, Arkose challenge, 403 / 429 |
 
 Instagram and X are **best-effort**: both aggressively gate unauthenticated traffic. When they gate the bot, the result is honestly reported as unknown (⚠️) rather than guessed. Page matching folds typographic apostrophes to ASCII, so the real `doesn’t` served by those sites is matched correctly.
+
+Instagram is checked against its own `web_profile_info` JSON endpoint first (the same call the web app makes, sent with the public `X-IG-App-ID`): 200 with user JSON means taken, 404 means free. Only when that endpoint answers nothing certain does the bot scrape the profile page — and a 200 page then has to prove itself. A page with neither missing-profile text nor real profile markers (the generic landing page Instagram serves datacenter IPs) is reported as **unknown**, never guessed as taken.
 
 Minecraft is checked against `api.mojang.com` first and falls back to `api.minecraftservices.com` if the first endpoint is blocked or errors.
 

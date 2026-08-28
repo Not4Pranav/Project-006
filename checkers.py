@@ -271,6 +271,23 @@ INSTAGRAM_BLOCKED_MARKERS = (
     "/challenge/",
     "please wait a few minutes before you try again",
 )
+# Positive proof that a 200 page is an actual profile and not the generic
+# landing page Instagram serves datacenter traffic: the server-rendered
+# og:description/og:title phrases, the iOS deep-link, and the embedded
+# profile JSON key. All of them sit inside the first screenful of HTML.
+INSTAGRAM_PROFILE_MARKERS = (
+    "see instagram photos and videos from",
+    "\u2022 instagram photos and videos",
+    "instagram://user?username=",
+    "profile_pic_url",
+)
+# The X-IG-App-ID instagram.com's own web client sends; it is what makes the
+# web_profile_info JSON endpoint answer unauthenticated profile lookups. The
+# endpoint is the primary Instagram check: it answers 200 + user JSON for
+# taken names and a 404 "User not found" for free ones - two answers a
+# profile-page scrape from a datacenter IP often cannot tell apart at all.
+INSTAGRAM_APP_ID = "936619743392459"
+INSTAGRAM_API_HEADERS = {**API_HEADERS, "X-IG-App-ID": INSTAGRAM_APP_ID}
 TWITTER_MISSING_MARKERS = (
     "this account doesn't exist",
     "this user doesn't exist",
@@ -508,12 +525,49 @@ def interpret_reddit(status: int, payload: object | None = None) -> str:
     return ERROR
 
 
-def interpret_instagram(status: int, page: str | None = None) -> str:
-    """Interpret Instagram profile page status.
+def interpret_instagram_profile_info(
+    status: int,
+    payload: object | None = None,
+) -> str | None:
+    """Interpret the web_profile_info JSON endpoint (the primary check).
 
-    Instagram returns 200 for existing profiles and may redirect or return
-    login pages. This is a best-effort check since Instagram aggressively
-    blocks non-authenticated requests.
+    Returns a definitive verdict, or ``None`` when the response says nothing
+    certain about the username (block page, malformed payload, unexpected
+    status) - the caller then falls back to the profile-page scrape.
+
+    200 with ``data.user`` populated = taken; 404 = Instagram itself
+    confirming no such user exists. Everything else is inconclusive rather
+    than guessed, and inconclusive is common: the app-id endpoint is
+    rate-limited separately from the HTML pages, so a 401/403/429 here does
+    not imply the page fallback is walled too.
+    """
+    if status == 200:
+        if isinstance(payload, Mapping):
+            data = payload.get("data")
+            user = data.get("user") if isinstance(data, Mapping) else None
+            if isinstance(user, Mapping) and (
+                user.get("id")
+                or user.get("pk")
+                or str(user.get("username") or "").strip()
+            ):
+                return TAKEN           # populated user object -> name claimed
+        return None                    # 200 but not a profile payload
+    if status == 404:
+        return AVAILABLE
+    return None
+
+
+def interpret_instagram(status: int, page: str | None = None) -> str:
+    """Interpret an Instagram profile *page* status (the fallback check).
+
+    Instagram serves 200 for three very different documents: a real profile
+    page, the "this page isn't available" tombstone, and - from datacenter
+    IPs - a generic landing/login page that says nothing about the username
+    at all. Only positive evidence earns a verdict: explicit missing-profile
+    text means AVAILABLE, explicit profile markers mean TAKEN, and a 200
+    page showing neither is honestly reported as unknown (BLOCKED). The old
+    behaviour defaulted that third case to TAKEN, which made every lookup
+    look claimed from datacenter hosting.
     """
     if status == 200:
         if not isinstance(page, str) or not page.strip():
@@ -526,7 +580,12 @@ def interpret_instagram(status: int, page: str | None = None) -> str:
             return AVAILABLE
         if any(marker in content for marker in INSTAGRAM_BLOCKED_MARKERS):
             return BLOCKED
-        return TAKEN
+        if any(marker in content for marker in INSTAGRAM_PROFILE_MARKERS):
+            return TAKEN
+        # Neither missing- nor profile-specific markers: this is the generic
+        # landing page Instagram hands to datacenter traffic. The name may or
+        # may not exist - report unknown, never a guessed "taken".
+        return BLOCKED
     if status == 404:
         return AVAILABLE
     if status in (302, 301):
@@ -1650,8 +1709,15 @@ async def check_reddit(session, username: str, proxy=None) -> Result:
 async def check_instagram(session, username: str, proxy=None) -> Result:
     """Check Instagram username availability (📸).
 
-    Instagram aggressively blocks non-authenticated and non-browser requests.
-    This is a best-effort check using the web profile page.
+    Primary check: Instagram's own ``web_profile_info`` JSON endpoint, the
+    same call instagram.com's web client makes, sent with the public
+    X-IG-App-ID the site ships. It answers 200 + user JSON for taken names
+    and 404 for free ones.
+
+    Fallback: scrape the profile page. A 200 page still has to *prove* what
+    it is - missing-profile text means free, profile markers mean taken, and
+    neither (the generic landing page Instagram serves datacenter IPs) is
+    reported as unknown instead of guessed as taken.
     """
 
     if not INSTAGRAM_PATTERN.fullmatch(username):
@@ -1661,13 +1727,31 @@ async def check_instagram(session, username: str, proxy=None) -> Result:
         )
 
     try:
+        status, payload = await _fetch_json_get(
+            session,
+            "https://www.instagram.com/api/v1/users/web_profile_info/"
+            f"?username={username}",
+            proxy,
+            headers=INSTAGRAM_API_HEADERS,
+        )
+        outcome = interpret_instagram_profile_info(status, payload)
+        if outcome is not None:
+            detail = f"HTTP {status} (web_profile_info)"
+            if status == 200 and outcome == TAKEN:
+                user = payload["data"]["user"]
+                detail += f" (name={user.get('username', '?')})"
+            return Result("Instagram", INSTAGRAM_EMOJI, outcome, detail)
+    except _REQUEST_ERRORS:
+        pass  # Endpoint unreachable: the profile page may still answer.
+
+    try:
         status, page = await _fetch_page(
             session,
             f"https://www.instagram.com/{username}/",
             proxy,
         )
         outcome = interpret_instagram(status, page)
-        detail = f"HTTP {status}"
+        detail = f"HTTP {status} (profile page)"
         if outcome == BLOCKED:
             detail += " (likely login wall)"
         return Result("Instagram", INSTAGRAM_EMOJI, outcome, detail)
