@@ -36,6 +36,7 @@ Configuration lives in .env (see .env.example):
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
     ENABLE_EXTRA_PLATFORMS    true (default) | false — check GitHub/Steam/Reddit/...
+    DISABLED_PLATFORMS        blank (default) | comma list to skip, e.g. "Reddit,Twitter/X"
     PROXY_ALLOW_DIRECT_FALLBACK  false (default) | true — go direct if all proxies die
 
 Proxy pool features:

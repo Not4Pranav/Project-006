@@ -93,7 +93,7 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 138 offline tests
+python test_checkers.py     # 149 offline tests
 python test_bot.py          # 63 pipeline tests
 python test_stress.py       # 17 stress tests
 python test_integration.py  # 13 integration tests (real local sockets)

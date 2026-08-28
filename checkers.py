@@ -327,10 +327,12 @@ def interpret_gunslol(status: int, page: str | None = None) -> str:
             return AVAILABLE
         return TAKEN
     if status in (404, 410):
-        if isinstance(page, str) and any(
-                marker in _normalize_page(page)
-                for marker in GUNSLOL_CHALLENGE_MARKERS):
-            return BLOCKED
+        if isinstance(page, str) and page.strip():
+            # Normalize once, not once per marker: casefolding the same page
+            # inside the generator used to quadruple that work.
+            normalized = _normalize_page(page)
+            if any(marker in normalized for marker in GUNSLOL_CHALLENGE_MARKERS):
+                return BLOCKED
         return AVAILABLE
     if status == 400:
         return INVALID
@@ -1365,7 +1367,8 @@ async def check_discord_dnsrobot(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                _redact_sensitive_text(exc)
+                log.debug("DNS Robot context cleanup failed: %s",
+                          _redact_sensitive_text(exc))
 
 
 async def check_discord_instantusername(
@@ -2267,10 +2270,16 @@ async def _cli(argv: list[str] | None = None) -> int:
         description="Test the platform checkers without running the bot.")
     parser.add_argument("username", help="name to check, e.g. Notch")
     parser.add_argument(
-        "--mode", choices=("off", "dnsrobot", "account", "account_api", "probe"),
+        "--mode", choices=("off", "dnsrobot", "instantusername", "combined",
+                           "account", "account_api", "probe"),
         default="off",
-        help=("Discord check mode (default: off; dnsrobot loads the DNS Robot page "
-              "in Chromium; account_api is a compatibility alias)"))
+        help=("Discord check mode (default: off; dnsrobot/combined load the "
+              "DNS Robot page in Chromium when it is installed; "
+              "account_api is a compatibility alias)"))
+    parser.add_argument(
+        "--disable", default="",
+        help=("comma list of platforms to skip this run, e.g. "
+              "'Reddit,Twitter/X'"))
     parser.add_argument("--discord-probe-url", default=None,
                         help="explicit authorized checker URL template for probe mode")
     parser.add_argument(
@@ -2283,6 +2292,11 @@ async def _cli(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-extra", action="store_true",
                         help="disable extra platforms (GitHub, Steam, etc.)")
     ns = parser.parse_args(argv)
+    disabled, unknown_disable_tokens = parse_disabled_platforms(ns.disable)
+    if unknown_disable_tokens:
+        parser.error(
+            "unknown --disable entries: " + ", ".join(unknown_disable_tokens)
+            + " (valid: " + ", ".join(p for p, _ in PLATFORMS) + ")")
 
     deadline = max(0.1, ns.timeout)
     # A socket that cannot even connect inside the connect cap should rotate
@@ -2296,14 +2310,16 @@ async def _cli(argv: list[str] | None = None) -> int:
     browser_runtime = None
     dnsrobot_browser = None
     dnsrobot_semaphore = None
-    if ns.mode == "dnsrobot":
+    if ns.mode in ("dnsrobot", "combined"):
         try:
             browser_runtime, dnsrobot_browser = await start_dnsrobot_browser(ns.proxy)
             dnsrobot_semaphore = asyncio.Semaphore(2)
         except Exception as exc:  # noqa: BLE001
             print(
-                "DNS Robot browser unavailable; its result will be ERROR: "
-                f"{_redact_sensitive_text(exc)}",
+                "DNS Robot browser unavailable; its result will be ERROR"
+                + (" (combined falls back to instantusername.com alone)"
+                   if ns.mode == "combined" else "")
+                + f": {_redact_sensitive_text(exc)}",
                 file=sys.stderr,
             )
 
@@ -2323,6 +2339,7 @@ async def _cli(argv: list[str] | None = None) -> int:
                 dnsrobot_browser=dnsrobot_browser,
                 dnsrobot_semaphore=dnsrobot_semaphore,
                 enable_extra_platforms=not ns.no_extra,
+                disabled_platforms=disabled,
             )
     finally:
         if dnsrobot_browser is not None:
