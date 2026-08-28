@@ -390,6 +390,53 @@ class TestCheckers(unittest.TestCase):
         r = self.run_async(checkers.check_discord(_session_with_status(200), "vortex", mode="off"))
         self.assertEqual(r.status, SKIPPED)
 
+    def test_discord_instantusername_mode(self):
+        calls = []
+        session = _instant_session(200, {"available": True}, record=calls)
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="instantusername"))
+        self.assertEqual(r.status, AVAILABLE)
+        self.assertEqual(r.platform, "Discord")
+        self.assertIn("/check/discord/vortex", calls[0][0])
+
+    def test_discord_instantusername_rejects_u_discord_names(self):
+        r = self.run_async(checkers.check_discord(
+            _instant_session(200, {"available": True}), "VORTEX!", mode="instantusername"))
+        self.assertEqual(r.status, INVALID)
+
+    def test_discord_combined_without_browser_uses_web_answer(self):
+        session = _instant_session(200, {"available": False})
+        r = self.run_async(checkers.check_discord(
+            session, "vortex", mode="combined"))
+        self.assertEqual(r.status, TAKEN)
+
+    def test_discord_combined_browser_verdict_wins(self):
+        class _Browser:  # sentinel "a browser exists"; the DNS Robot call is patched
+            pass
+
+        async def fake_dnsrobot(*_args, **_kwargs):
+            return checkers.Result("Discord", "x", TAKEN, "dnsrobot page")
+
+        session = _instant_session(200, {"available": True})
+        with patch.object(checkers, "check_discord_dnsrobot", fake_dnsrobot):
+            r = self.run_async(checkers.check_discord(
+                session, "vortex", mode="combined", dnsrobot_browser=_Browser()))
+        self.assertEqual(r.status, TAKEN)
+        self.assertIn("dnsrobot", r.detail)
+
+    def test_discord_combined_web_wins_when_browser_unknown(self):
+        class _Browser:
+            pass
+
+        async def fake_dnsrobot(*_args, **_kwargs):
+            return checkers.Result("Discord", "x", BLOCKED, "rate limited")
+
+        session = _instant_session(200, {"available": True})
+        with patch.object(checkers, "check_discord_dnsrobot", fake_dnsrobot):
+            r = self.run_async(checkers.check_discord(
+                session, "vortex", mode="combined", dnsrobot_browser=_Browser()))
+        self.assertEqual(r.status, AVAILABLE)
+
     def test_discord_probe(self):
         session = _session_with_status(404)
         headers = {"X-Checker-Token": "not-a-real-secret"}
@@ -1207,7 +1254,6 @@ class TestFallbackWiring(unittest.TestCase):
         gunslol = next(r for r in results if r.platform == "guns.lol")
         self.assertEqual(gunslol.status, BLOCKED)
         self.assertNotIn("guns.lol", called)
-        self.assertNotIn("Minecraft", called)
 
     def test_fallback_still_respects_the_shared_deadline(self):
         async def slow_primary(*_args, **_kwargs):

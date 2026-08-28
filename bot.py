@@ -29,7 +29,8 @@ Configuration lives in .env (see .env.example):
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 single HTTP(S) proxy for outbound checks
     PROXY_URLS                comma-separated proxy pool for rotation + failover
-    DISCORD_CHECK_MODE        off (default) | dnsrobot | account | account_api | probe
+    DISCORD_CHECK_MODE        off (default) | instantusername | combined |
+                              dnsrobot | account | account_api | probe
     DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
     DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
@@ -637,7 +638,7 @@ class SniperBot(discord.Client):
                 checkers.refresh_instantusername_services(
                     self.http_sniper, self._next_proxy))
 
-        if DISCORD_CHECK_MODE == "dnsrobot":
+        if DISCORD_CHECK_MODE in ("dnsrobot", "combined"):
             try:
                 proxy_for_browser = self._next_proxy()
                 self._playwright, self.dnsrobot_browser = (
@@ -645,9 +646,12 @@ class SniperBot(discord.Client):
                 self.dnsrobot_semaphore = asyncio.Semaphore(2)
             except Exception as exc:  # noqa: BLE001
                 log.error(
-                    "DNS Robot browser unavailable; Discord results will be "
-                    "ERROR until Chromium is installed: %s",
+                    "DNS Robot browser unavailable (%s)%s",
                     checkers._redact_sensitive_text(exc),
+                    "; combined mode falls back to instantusername.com alone"
+                    if DISCORD_CHECK_MODE == "combined"
+                    else "; Discord results will be ERROR until Chromium "
+                    "is installed",
                 )
 
     @property
@@ -1721,10 +1725,12 @@ def main() -> None:
             f"❌ RESPONSE_MODE={RESPONSE_MODE_RAW!r} is not valid. "
             "Use 'reply', 'react', or 'both'.")
     if DISCORD_CHECK_MODE not in (
-            "off", "dnsrobot", "account", "account_api", "probe"):
+            "off", "dnsrobot", "instantusername", "combined",
+            "account", "account_api", "probe"):
         raise SystemExit(
-            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', 'account', "
-            "'account_api', or 'probe'.")
+            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', "
+            "'instantusername', 'combined', 'account', 'account_api', "
+            "or 'probe'.")
     # Validate every proxy that will actually be used, whether it came from
     # PROXY_URL, PROXY_URLS, or the proxy file.
     resolved_proxies = configured_proxies()

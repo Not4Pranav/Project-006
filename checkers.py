@@ -16,7 +16,8 @@ checks run concurrently rather than adding their latencies together.
 Supported platforms:
     Minecraft     Mojang profile API (with fallback endpoint)
     guns.lol      Profile page with unclaimed/challenge detection
-    Discord       off | dnsrobot | account | account_api | probe
+    Discord       off | dnsrobot | instantusername | combined |
+                  account | account_api | probe
     GitHub        Public user API (200/404 contract)
     Steam         Community profile page
     Reddit        JSON user-about endpoint
@@ -1307,6 +1308,124 @@ async def check_discord_dnsrobot(
                 _redact_sensitive_text(exc)
 
 
+async def check_discord_instantusername(
+    session,
+    username: str,
+    proxy: object = None,
+) -> Result:
+    """Check Discord via instantusername.com's Discord service (no browser).
+
+    Plain HTTP, no credentials: the same API contract as every other
+    platform's instantusername check, aimed at their ``discord`` service.
+    """
+
+    normalized_username = username.lower()
+    if not DISCORD_PATTERN.fullmatch(normalized_username):
+        return Result(
+            "Discord", DISCORD_EMOJI, INVALID,
+            "Discord usernames are 2-32 chars, lowercase a-z 0-9 . _",
+        )
+    return await check_instantusername(
+        session, "Discord", DISCORD_EMOJI, normalized_username, proxy)
+
+
+async def check_discord_combined(
+    session,
+    username: str,
+    proxy=None,
+    browser=None,
+    browser_semaphore: asyncio.Semaphore | None = None,
+    timeout: float | None = None,
+) -> Result:
+    """Race instantusername.com and the DNS Robot page; first agreement wins.
+
+    instantusername.com answers in plain HTTP tenths of a second; the DNS
+    Robot page drives Discord's own eligibility check in a real browser, so
+    its verdict outranks the aggregator when they disagree. Whichever source
+    is definitive first is held for a short window so the other can confirm
+    or overrule it; if only one source produces an answer at all, that
+    answer is used. On hosts without Chromium the browser leg is skipped
+    and instantusername.com carries the check alone.
+    """
+
+    normalized_username = username.lower()
+    if not DISCORD_PATTERN.fullmatch(normalized_username):
+        return Result(
+            "Discord", DISCORD_EMOJI, INVALID,
+            "Discord usernames are 2-32 chars, lowercase a-z 0-9 . _",
+        )
+
+    instant_task = asyncio.ensure_future(check_instantusername(
+        session, "Discord", DISCORD_EMOJI, normalized_username, proxy))
+    browser_task = (
+        asyncio.ensure_future(check_discord_dnsrobot(
+            session, normalized_username,
+            browser=browser, browser_semaphore=browser_semaphore,
+            timeout=timeout))
+        if browser is not None else None
+    )
+
+    web_result: Result | None = None
+    browser_result: Result | None = None
+    try:
+        pending = {instant_task} | ({browser_task} if browser_task else set())
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                result = await _task_result(task, "Discord", DISCORD_EMOJI)
+                if task is browser_task:
+                    browser_result = result
+                else:
+                    web_result = result
+            if browser_result is not None and browser_result.status in (
+                    AVAILABLE, TAKEN):
+                return browser_result      # the site's own verdict wins
+            if web_result is not None and web_result.status in (
+                    AVAILABLE, TAKEN):
+                if browser_task is None:
+                    return web_result      # no second source: trust it
+                # Give the browser a beat to confirm or contradict before
+                # publishing the aggregator's word alone.
+                if browser_task.done():
+                    browser_result = await _task_result(
+                        browser_task, "Discord", DISCORD_EMOJI)
+                    if browser_result.status in (AVAILABLE, TAKEN):
+                        return browser_result
+                    return web_result      # browser was inconclusive
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(browser_task), COMBINED_BROWSER_GRACE)
+                    browser_result = result
+                    if result.status in (AVAILABLE, TAKEN):
+                        return result      # browser confirmed/overruled
+                    return web_result
+                except asyncio.TimeoutError:
+                    log.info(
+                        "Discord: instantusername.com says %s; DNS Robot "
+                        "still loading, publishing web verdict",
+                        web_result.status)
+                    return web_result
+
+        # Everything finished without a definitive answer: prefer the
+        # first-party-ish browser result, then the aggregator's.
+        if browser_result is not None:
+            return browser_result
+        if web_result is not None:
+            return web_result
+        return Result("Discord", DISCORD_EMOJI, ERROR, "no answer received")
+    finally:
+        for task in (instant_task, browser_task):
+            if task is not None and not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_late_task)
+
+
+# Grace period the aggregator's definitive Discord answer waits for the DNS
+# Robot page to confirm or overrule it before being published on its own.
+COMBINED_BROWSER_GRACE = 0.5
+
+
 async def check_discord(
     session,
     username: str,
@@ -1320,13 +1439,23 @@ async def check_discord(
     dnsrobot_semaphore: asyncio.Semaphore | None = None,
     dnsrobot_timeout: float | None = None,
 ) -> Result:
-    """Check Discord in off, DNS Robot, account, or probe mode."""
+    """Check Discord in off, DNS Robot, instantusername, combined, account, or probe mode."""
 
     mode = (mode or "off").strip().lower()
     if mode == "off":
         return Result(
             "Discord", DISCORD_EMOJI, SKIPPED,
             "check disabled (DISCORD_CHECK_MODE=off)",
+        )
+    if mode == "instantusername":
+        return await check_discord_instantusername(
+            session, username, proxy)
+    if mode == "combined":
+        return await check_discord_combined(
+            session, username, proxy,
+            browser=dnsrobot_browser,
+            browser_semaphore=dnsrobot_semaphore,
+            timeout=dnsrobot_timeout,
         )
     if mode == "dnsrobot":
         return await check_discord_dnsrobot(
@@ -1341,7 +1470,8 @@ async def check_discord(
     if mode != "probe":
         return Result(
             "Discord", DISCORD_EMOJI, ERROR,
-            "DISCORD_CHECK_MODE must be off, dnsrobot, account, account_api, or probe",
+            "DISCORD_CHECK_MODE must be off, dnsrobot, instantusername, "
+            "combined, account, account_api, or probe",
         )
     if not probe_url:
         return Result(
@@ -1543,6 +1673,8 @@ INSTANTUSERNAME_SERVICES_URL = f"{INSTANTUSERNAME_BASE_URL}/services.json"
 # has shipped for years; refresh_instantusername_services() can extend this at
 # runtime from their live catalogue.
 INSTANTUSERNAME_SERVICES: dict[str, str] = {
+    "Discord": "discord",
+    "Minecraft": "mc-java",
     "GitHub": "github",
     "Steam": "steam",
     "Reddit": "reddit",

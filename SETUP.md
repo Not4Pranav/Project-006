@@ -224,6 +224,22 @@ Validate proxy URLs before deploying — the bot refuses to start on a malformed
 
 Discord publishes no availability API, so pick a mode consciously.
 
+### `instantusername` (simplest — plain HTTP, no browser)
+
+```env
+DISCORD_CHECK_MODE=instantusername
+```
+
+Asks instantusername.com's Discord service over the same credential-free JSON API used as the fallback for other platforms. Works on small free hosts. Good default if you want the Discord column live without extra memory.
+
+### `combined` (best accuracy — both checker websites at once)
+
+```env
+DISCORD_CHECK_MODE=combined
+```
+
+Races instantusername.com against the DNS Robot page simultaneously. The DNS Robot browser verdict (Discord's own eligibility check) wins on disagreement; with no browser installed, instantusername.com carries the check alone, so mode still works on free tiers. Without Chromium, logging notes the browser leg is skipped.
+
 ### `dnsrobot`
 
 ```env

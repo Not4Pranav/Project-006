@@ -274,8 +274,9 @@ RESPONSE_MODE=reply
 # Only for PaaS hosts that require an HTTP port (Options B, C)
 PORT=8080
 
-# Free tiers are small: keep the browser mode off
-DISCORD_CHECK_MODE=off
+# Free tiers are small: keep the Chromium mode off. "instantusername" checks
+# Discord over plain HTTP and needs no browser, so it fits everywhere.
+DISCORD_CHECK_MODE=instantusername
 
 # Second opinion when a platform blocks your host's IP. Shared cloud IPs get
 # rate-limited far more often than home ones, so leave this on.
