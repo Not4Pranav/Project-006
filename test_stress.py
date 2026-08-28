@@ -155,7 +155,7 @@ class TestBusyChannel(ReplyMode, unittest.TestCase):
                 platform, emoji,
                 checkers.AVAILABLE if (seed + i) % 3 == 0 else checkers.TAKEN)
             for i, (platform, emoji) in enumerate(checkers.PLATFORMS)
-        ])
+        ], username=username)
 
     def test_fifty_members_fifty_usernames(self):
         """Every member gets their own reply, on their own message."""

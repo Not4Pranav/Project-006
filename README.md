@@ -7,14 +7,18 @@ Post a bare username in a watched Discord channel. The bot checks it across **8 
 ```
 you:  vortex
 
-bot:  Minecraft: Available
-      guns.lol: Unavailable
-      Discord: Unavailable
-      GitHub: Available
-      Steam: Unavailable
-      Reddit: Available
-      Instagram: Unknown
-      Twitter/X: Unavailable
+bot:  **`vortex`**
+
+      🕹️ **Minecraft** — ✅ **Available**
+      🔫 **guns.lol** — ❌ Unavailable
+      🐈‍⬛ **Discord** — ❌ Unavailable
+      💻 **GitHub** — ✅ **Available**
+      🎮 **Steam** — ❌ Unavailable
+      👀 **Reddit** — ✅ **Available**
+      📸 **Instagram** — ⚠️ Unknown
+      🐦 **Twitter/X** — ❌ Unavailable
+
+      ✅ **3 available** · ❌ 4 unavailable · ⚠️ 1 unknown
 ```
 
 The reply appears **immediately** and fills in live as each platform reports. Prefer emoji reactions on the original message instead? Set `RESPONSE_MODE=react`.
@@ -95,7 +99,7 @@ cp .env.example .env
 #       TARGET_CHANNEL_ID=123456789012345678
 
 # 5. Verify offline (no token or network needed)
-python test_checkers.py           # 138 tests
+python test_checkers.py           # 149 tests
 python test_bot.py                # 63 tests
 python test_stress.py             # 17 tests
 python test_integration.py        # 13 tests
@@ -112,6 +116,7 @@ Try it without Discord at all:
 ```bash
 python checkers.py Notch          # one-off report for all 8 platforms
 python checkers.py vortex --no-extra
+python checkers.py Notch --mode instantusername --disable "Reddit,Twitter/X"
 ```
 
 ---
@@ -211,7 +216,7 @@ GET https://api.instantusername.com/check/<service>/<username>
 - It only overrides the result when it is itself definitive (`available` / `taken`). A failed fallback leaves the original honest *Unknown* in place.
 - The service catalogue is fetched from `/services.json` at startup, so platforms instantusername adds later are picked up without a code change. If that fetch fails, a built-in map is used.
 
-Covered by default: **GitHub, Steam, Reddit, Instagram, Twitter/X** (plus Discord and Minecraft automatically, if instantusername lists them). guns.lol has no equivalent there and is never sent.
+Covered by default: **GitHub, Steam, Reddit, Instagram, Twitter/X, Discord, Minecraft** (the built-in map seeds all seven; a live refresh at startup can extend it). guns.lol has no equivalent there and is never sent.
 
 Set `INSTANTUSERNAME_FALLBACK=false` to disable the second source entirely — for example if you do not want usernames leaving your host except to the platforms themselves.
 
@@ -418,11 +423,13 @@ Discord has no public username-availability API, so this check is **off by defau
 | Mode | How it works | Needs |
 |---|---|---|
 | `off` *(default)* | Skipped; reported as `skipped` | — |
+| `instantusername` | Plain-HTTP JSON check against instantusername.com's Discord service | — |
+| `combined` | Races instantusername.com and the dnsrobot.net page; the site's own verdict wins on disagreement; without Chromium the web leg carries the check alone | Optional: Chromium (see `dnsrobot`) |
 | `dnsrobot` | Loads `dnsrobot.net/username-checker` in a headless Chromium context and reads the rendered result | `pip install 'playwright>=1.48,<2'` + `python -m playwright install chromium` |
 | `account` / `account_api` | POSTs `{"username": "..."}` to Discord's username-eligibility route | Optionally an authorised credential |
 | `probe` | GETs your own authorised checker URL template (`200` = taken, `404` = free) | `DISCORD_PROBE_URL` |
 
-The bot never claims a name, and never sends the Discord bot token to any of these endpoints. Any credential you configure is sent **only** to the endpoint it belongs to.
+The bot never claims a name, never logs in to a Discord account, and never sends the bot token anywhere except Discord's own gateway. The website modes (`instantusername`, `combined`, `dnsrobot`) never contact Discord's servers directly: they read instantusername.com and/or load dnsrobot.net's public checker page, which does its own checking from the browser. Any credential you configure is sent **only** to the endpoint it belongs to.
 
 ---
 
@@ -438,6 +445,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `TARGET_CHANNEL_ID` | *(blank = all)* | The single channel to watch |
 | `LOG_CHANNEL_ID` | *(blank = off)* | Private channel that receives free-name hits |
 | `ENABLE_EXTRA_PLATFORMS` | `true` | Include GitHub, Steam, Reddit, Instagram, Twitter/X |
+| `DISABLED_PLATFORMS` | *(blank)* | Comma-separated platforms to skip entirely, e.g. `Reddit,Twitter/X` (recommended on free cloud hosts, which those two usually answer with *Unknown* anyway) |
 | `RESPONSE_MODE` | `reply` | `reply` (text list), `react` (emoji), or `both` |
 | `REPLY_EDIT_INTERVAL` | `0.7` | Minimum seconds between live edits of the reply |
 | `REPLY_INCLUDE_SKIPPED` | `false` | Show disabled platforms as *Not checked* |
@@ -496,7 +504,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 
 | Setting | Default | Description |
 |---|---|---|
-| `DISCORD_CHECK_MODE` | `off` | `off` / `dnsrobot` / `account` / `account_api` / `probe` |
+| `DISCORD_CHECK_MODE` | `off` | `off` / `instantusername` / `combined` / `dnsrobot` / `account` / `account_api` / `probe` |
 | `DISCORD_ACCOUNT_API_URL` | Discord eligibility route | Endpoint for `account` mode |
 | `DISCORD_ACCOUNT_API_TOKEN` | *(blank)* | Credential sent only to that endpoint |
 | `DISCORD_ACCOUNT_API_TOKEN_HEADER` | `Authorization` | Header carrying that credential |
@@ -511,7 +519,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 ## Development and testing
 
 ```bash
-python test_checkers.py       # 138 offline tests (interpreters, request layer, proxies, fallback)
+python test_checkers.py       # 149 offline tests (interpreters, request layer, proxies, fallback)
 python test_bot.py            # 63 pipeline tests (filters, budget, cache, reply, reactions)
 python test_stress.py         # 17 stress tests (fuzzing, busy channels, coalescing, leaks)
 python test_integration.py    # 13 integration tests (real sockets: proxies, boot, CLI)
@@ -551,7 +559,7 @@ The status interpreters (`interpret_minecraft`, `interpret_github`, …) are pur
 | Bot ignores every message | **Message Content Intent** is off in the Developer Portal, or `TARGET_CHANNEL_ID` points at another channel |
 | Bot stays silent in reply mode | Missing the **Send Messages** permission in that channel — check the log line |
 | Bot answers but adds no reaction | Missing the **Add Reactions** permission (react mode only) |
-| Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` |
+| Always ⚠️ on Instagram / X | Those sites are gating the host IP; configure `PROXY_URLS` — or skip them via `DISABLED_PLATFORMS=Reddit,Twitter/X` |
 | ⚠️ on every platform | Outbound HTTPS is blocked, or every proxy is down (check the startup banner and `Proxy … benched` logs) |
 | Discord shows `skipped` | Expected: `DISCORD_CHECK_MODE=off` is the default |
 | `DNS Robot browser unavailable` | Run `pip install 'playwright>=1.48,<2'` then `python -m playwright install chromium` |

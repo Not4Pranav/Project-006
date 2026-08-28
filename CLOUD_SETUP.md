@@ -268,14 +268,15 @@ Consider a UPS or just accept that a power cut = downtime. `Restart=always` plus
 DISCORD_TOKEN=your-bot-token
 TARGET_CHANNEL_ID=123456789012345678
 
-# Answer style (default: a readable "Platform: Status" reply)
+# Answer style (default: an emoji-coded reply listing each platform's status)
 RESPONSE_MODE=reply
 
 # Only for PaaS hosts that require an HTTP port (Options B, C)
 PORT=8080
 
-# Free tiers are small: keep the browser mode off
-DISCORD_CHECK_MODE=off
+# Free tiers are small: keep the Chromium mode off. "instantusername" checks
+# Discord over plain HTTP and needs no browser, so it fits everywhere.
+DISCORD_CHECK_MODE=instantusername
 
 # Second opinion when a platform blocks your host's IP. Shared cloud IPs get
 # rate-limited far more often than home ones, so leave this on.
@@ -288,6 +289,11 @@ HTTP_POOL_LIMIT_PER_HOST=40
 
 # Lower memory / fewer outbound requests on a tiny instance
 # ENABLE_EXTRA_PLATFORMS=false
+
+# On free cloud IPs Reddit and X wall automated traffic and almost always
+# report Unknown — skip them so every row is a real verdict. Checks run in
+# parallel, so this does not speed the others up; it just removes noise.
+DISABLED_PLATFORMS=Reddit,Twitter/X
 
 # Proxy pool size. The default aims for 1,000 working proxies, which means
 # ~100,000 probes and about 4 minutes of background CPU at every boot -

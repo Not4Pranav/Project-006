@@ -93,7 +93,7 @@ Everything else has a working default. `.env` is git-ignored — confirm with `g
 
 ```bash
 python -m py_compile bot.py checkers.py proxies.py && echo "compile OK"
-python test_checkers.py     # 138 offline tests
+python test_checkers.py     # 149 offline tests
 python test_bot.py          # 63 pipeline tests
 python test_stress.py       # 17 stress tests
 python test_integration.py  # 13 integration tests (real local sockets)
@@ -136,14 +136,18 @@ Expected startup banner:
 Post a bare username in the watched channel. The bot replies almost immediately and fills the list in as each platform reports:
 
 ```
-Minecraft: Available
-guns.lol: Unavailable
-Discord: Unavailable
-GitHub: Available
-Steam: Unavailable
-Reddit: Available
-Instagram: Unknown
-Twitter/X: Unavailable
+**`vortex`**
+
+🕹️ **Minecraft** — ✅ **Available**
+🔫 **guns.lol** — ❌ Unavailable
+🐈‍⬛ **Discord** — ❌ Unavailable
+💻 **GitHub** — ✅ **Available**
+🎮 **Steam** — ❌ Unavailable
+👀 **Reddit** — ✅ **Available**
+📸 **Instagram** — ⚠️ Unknown
+🐦 **Twitter/X** — ❌ Unavailable
+
+✅ **3 available** · ❌ 4 unavailable · ⚠️ 1 unknown
 ```
 
 Set `RESPONSE_MODE=react` if you would rather have emoji reactions on the original message. Stop with `Ctrl+C`.
@@ -219,6 +223,22 @@ Validate proxy URLs before deploying — the bot refuses to start on a malformed
 ## 9. Optional: enable the Discord check
 
 Discord publishes no availability API, so pick a mode consciously.
+
+### `instantusername` (simplest — plain HTTP, no browser)
+
+```env
+DISCORD_CHECK_MODE=instantusername
+```
+
+Asks instantusername.com's Discord service over the same credential-free JSON API used as the fallback for other platforms. Works on small free hosts. Good default if you want the Discord column live without extra memory.
+
+### `combined` (best accuracy — both checker websites at once)
+
+```env
+DISCORD_CHECK_MODE=combined
+```
+
+Races instantusername.com against the DNS Robot page simultaneously. The DNS Robot browser verdict (Discord's own eligibility check) wins on disagreement; with no browser installed, instantusername.com carries the check alone, so mode still works on free tiers. Without Chromium, logging notes the browser leg is skipped.
 
 ### `dnsrobot`
 
@@ -340,6 +360,7 @@ For `dnsrobot` mode, base the image on `mcr.microsoft.com/playwright/python` ins
 - **Reaction ordering:** with the default `STREAM_REACTIONS=true`, emojis appear as each platform answers (fastest first). Set it to `false` if you want them batched in fixed platform order instead.
 - **Startup pre-warm:** `Pre-warmed 9/9 platform connections in 0.4s` in the log means the connection pool is hot (the 8 platform hosts plus the fallback provider when enabled); a lower count just means some hosts were unreachable at boot and will connect on demand.
 - **Reducing load:** set `ENABLE_EXTRA_PLATFORMS=false` to check only Minecraft, guns.lol, and Discord.
+- **Skipping noisy platforms:** `DISABLED_PLATFORMS=Reddit,Twitter/X` drops individual platforms entirely (no rows, no requests). Checks run in parallel under one shared deadline, so this does not speed the others up — it drops the platforms that mostly answer *Unknown* on datacenter IPs.
 - **Updating:**
 
   ```bash

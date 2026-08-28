@@ -29,12 +29,14 @@ Configuration lives in .env (see .env.example):
     LOG_CHANNEL_ID            optional channel to log available hits
     PROXY_URL                 single HTTP(S) proxy for outbound checks
     PROXY_URLS                comma-separated proxy pool for rotation + failover
-    DISCORD_CHECK_MODE        off (default) | dnsrobot | account | account_api | probe
+    DISCORD_CHECK_MODE        off (default) | instantusername | combined |
+                              dnsrobot | account | account_api | probe
     DISCORD_ACCOUNT_API_URL   optional account eligibility endpoint override
     DISCORD_ACCOUNT_API_TOKEN optional credential for an authorized account API
     DISCORD_PROBE_URL         authorized external checker URL template (optional)
     DISCORD_PROBE_TOKEN       optional token sent only to that checker endpoint
     ENABLE_EXTRA_PLATFORMS    true (default) | false — check GitHub/Steam/Reddit/...
+    DISABLED_PLATFORMS        blank (default) | comma list to skip, e.g. "Reddit,Twitter/X"
     PROXY_ALLOW_DIRECT_FALLBACK  false (default) | true — go direct if all proxies die
 
 Proxy pool features:
@@ -290,6 +292,16 @@ def configured_proxies() -> list[str]:
 ENABLE_EXTRA_PLATFORMS = os.getenv("ENABLE_EXTRA_PLATFORMS", "true").strip().lower() in (
     "true", "1", "yes", "on", "")
 
+# Per-platform opt-out, comma-separated display names, e.g. "Reddit,Twitter/X".
+# Disabled platforms are never even scheduled: they cost no sockets, no proxy
+# pool slots, and no reply rows. Useful on datacenter hosting where Reddit and
+# X hard-wall automated traffic and mostly return Unknown. Casual spellings
+# ("twitter", "X") are accepted via checkers.parse_disabled_platforms.
+_disabled_raw = os.getenv("DISABLED_PLATFORMS", "").strip()
+DISABLED_PLATFORMS, _DISABLED_UNKNOWN_TOKENS = (
+    checkers.parse_disabled_platforms(_disabled_raw))
+del _disabled_raw
+
 # The event handler starts after Discord delivers MESSAGE_CREATE. Reserving a
 # little room beneath five seconds means the checker fan-out cannot consume all
 # the time that the reaction REST call needs. Values from the environment are
@@ -403,6 +415,24 @@ STATUS_LABELS = {
 }
 PENDING_LABEL = "Checking..."
 
+# One glanceable glyph per status so a busy channel can scan the reply
+# without reading the labels. ✅ always marks a win, never mere success.
+STATUS_EMOJIS = {
+    checkers.AVAILABLE: "✅",
+    checkers.TAKEN: "❌",
+    checkers.INVALID: "🚫",
+    checkers.BLOCKED: "⚠️",
+    checkers.ERROR: "⚠️",
+    checkers.SKIPPED: "⏸️",
+}
+PENDING_EMOJI = "⏳"
+
+# Compact one-segment-per-platform progress bar shown in the footer while
+# results stream in (e.g. "▰▰▰▱▱▱▱▱ 3/8"). Block glyphs keep every platform
+# visibly advancing without spamming the message with extra lines.
+PROGRESS_FILLED = "▰"
+PROGRESS_EMPTY = "▱"
+
 # Optional tiny HTTP server. Free hosting tiers (Render, Koyeb, Replit) only
 # keep a service alive if it binds a port and answers health checks, so this
 # turns the worker into something they will host for free. Enabled whenever
@@ -418,36 +448,84 @@ def format_results(
     results: list[checkers.Result],
     pending: bool = False,
     include_extra: bool | None = None,
+    username: str | None = None,
 ) -> str:
-    """Render results as a readable "Platform: Status" list.
+    """Render results as an emoji-coded list with a summary footer.
 
     Lines always follow the fixed platform order, even though results stream
     back in completion order, so the message never reshuffles under the reader
     while it is being updated. Platforms that have not answered yet show as
-    pending rather than silently missing.
+    pending rather than silently missing. When ``username`` is given it heads
+    the message (code-styled), so a busy channel can see which lookup the
+    reply belongs to; it must already be a validated username token so the
+    markdown wrapper cannot be escaped.
     """
 
     if include_extra is None:
         include_extra = ENABLE_EXTRA_PLATFORMS
-    expected = checkers.PLATFORMS if include_extra else checkers.CORE_PLATFORMS
+    expected = checkers.active_platforms(include_extra, DISABLED_PLATFORMS)
     by_platform = {result.platform: result for result in results}
 
     lines: list[str] = []
-    for platform, _emoji in expected:
+    counts = {"available": 0, "taken": 0, "unknown": 0, "invalid": 0,
+              "not checked": 0, "checking": 0}
+    for platform, emoji in expected:
         result = by_platform.get(platform)
         if result is None:
             if not pending:
                 continue
-            lines.append(f"{platform}: {PENDING_LABEL}")
+            counts["checking"] += 1
+            lines.append(
+                f"{emoji} **{platform}** — {PENDING_EMOJI} {PENDING_LABEL}")
             continue
         if result.status == checkers.SKIPPED and not REPLY_INCLUDE_SKIPPED:
             continue
+        mark = STATUS_EMOJIS.get(result.status, "⚠️")
         label = STATUS_LABELS.get(result.status, "Unknown")
-        lines.append(f"{platform}: {label}")
+        if result.status == checkers.AVAILABLE:
+            counts["available"] += 1
+            label = f"**{label}**"  # make a free name pop off the list
+        elif result.status == checkers.TAKEN:
+            counts["taken"] += 1
+        elif result.status == checkers.INVALID:
+            counts["invalid"] += 1
+        elif result.status == checkers.SKIPPED:
+            counts["not checked"] += 1
+        else:
+            counts["unknown"] += 1
+        lines.append(f"{emoji} **{platform}** — {mark} {label}")
 
     if not lines:
-        return "No platforms were checked."
-    return "\n".join(lines)
+        return "⚠️ No platforms were checked."
+
+    # The verdict bar: available first and bolded, because that is the one
+    # outcome everyone is scanning for in a sniping channel. While checks
+    # stream in, a compact progress bar opens the line instead of a bare
+    # "checking" count — same information, drawn.
+    summary: list[str] = []
+    if pending and counts["checking"]:
+        total = len(expected)
+        done = total - counts["checking"]
+        bar = PROGRESS_FILLED * done + PROGRESS_EMPTY * (total - done)
+        summary.append(f"{bar} {done}/{total}")
+    if counts["available"]:
+        summary.append(f"✅ **{counts['available']} available**")
+    if counts["taken"]:
+        summary.append(f"❌ {counts['taken']} unavailable")
+    if counts["unknown"]:
+        summary.append(f"⚠️ {counts['unknown']} unknown")
+    if counts["invalid"]:
+        summary.append(f"🚫 {counts['invalid']} invalid")
+    if counts["not checked"]:
+        summary.append(f"⏸️ {counts['not checked']} not checked")
+
+    parts: list[str] = []
+    if username:
+        parts.append(f"**`{username}`**\n")
+    parts.extend(lines)
+    parts.append("")
+    parts.append(" · ".join(summary))
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +649,7 @@ class SniperBot(discord.Client):
                 checkers.refresh_instantusername_services(
                     self.http_sniper, self._next_proxy))
 
-        if DISCORD_CHECK_MODE == "dnsrobot":
+        if DISCORD_CHECK_MODE in ("dnsrobot", "combined"):
             try:
                 proxy_for_browser = self._next_proxy()
                 self._playwright, self.dnsrobot_browser = (
@@ -579,9 +657,12 @@ class SniperBot(discord.Client):
                 self.dnsrobot_semaphore = asyncio.Semaphore(2)
             except Exception as exc:  # noqa: BLE001
                 log.error(
-                    "DNS Robot browser unavailable; Discord results will be "
-                    "ERROR until Chromium is installed: %s",
+                    "DNS Robot browser unavailable (%s)%s",
                     checkers._redact_sensitive_text(exc),
+                    "; combined mode falls back to instantusername.com alone"
+                    if DISCORD_CHECK_MODE == "combined"
+                    else "; Discord results will be ERROR until Chromium "
+                    "is installed",
                 )
 
     @property
@@ -812,7 +893,10 @@ class SniperBot(discord.Client):
 
         if self.http_sniper is None:
             return
-        urls = list(checkers.PREWARM_URLS)
+        # Skip hosts whose platform is disabled or extra-turned-off: warming
+        # a socket we will never use only makes startup slower.
+        urls = list(checkers.prewarm_urls(
+            include_extra=ENABLE_EXTRA_PLATFORMS, disabled=DISABLED_PLATFORMS))
         if INSTANTUSERNAME_FALLBACK:
             # Warm the second-opinion host too, so a rescued check does not
             # pay DNS+TLS on its first use either.
@@ -1056,6 +1140,7 @@ class SniperBot(discord.Client):
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
+            disabled_platforms=DISABLED_PLATFORMS,
         ))
 
         try:
@@ -1068,7 +1153,10 @@ class SniperBot(discord.Client):
         if checker_task not in done:
             checker_task.cancel()
             checker_task.add_done_callback(self._consume_cancelled_checker_task)
-            return checkers.timeout_results("response deadline reached")
+            return checkers.timeout_results(
+                "response deadline reached",
+                include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
 
         try:
             return checker_task.result()
@@ -1078,7 +1166,8 @@ class SniperBot(discord.Client):
             log.warning("Checker task failed before its deadline: %s",
                         checkers._redact_sensitive_text(exc))
             return checkers.timeout_results(
-                "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS)
+                "checker task failed", include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
 
     async def _send_reply(
         self,
@@ -1150,7 +1239,8 @@ class SniperBot(discord.Client):
                 message, self._verdict_emojis(results), deadline))
         if REPLY_ENABLED:
             jobs.append(self._send_reply(
-                message, format_results(results),
+                message,
+                format_results(results, username=message.content.strip()),
                 min(REACTION_TIMEOUT, deadline - time.monotonic())))
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
@@ -1176,8 +1266,8 @@ class SniperBot(discord.Client):
     def _fill_missing(results: list[checkers.Result]) -> list[checkers.Result]:
         """Add an honest ERROR for any configured platform that never answered."""
 
-        expected = (checkers.PLATFORMS if ENABLE_EXTRA_PLATFORMS
-                    else checkers.CORE_PLATFORMS)
+        expected = checkers.active_platforms(
+            ENABLE_EXTRA_PLATFORMS, DISABLED_PLATFORMS)
         seen = {result.platform for result in results}
         by_platform = {result.platform: result for result in results}
         ordered: list[checkers.Result] = []
@@ -1220,7 +1310,9 @@ class SniperBot(discord.Client):
             finished = done.is_set()
             now = time.monotonic()
             due = last_paint == 0.0 or now - last_paint >= REPLY_EDIT_INTERVAL
-            text = format_results(results, pending=not finished)
+            text = format_results(
+                results, pending=not finished,
+                username=message.content.strip())
 
             if text != last_text and (due or finished) and editable:
                 cap = min(REACTION_TIMEOUT, max(0.0, deadline - now))
@@ -1306,6 +1398,7 @@ class SniperBot(discord.Client):
             dnsrobot_semaphore=self.dnsrobot_semaphore,
             enable_extra_platforms=ENABLE_EXTRA_PLATFORMS,
             instantusername_fallback=INSTANTUSERNAME_FALLBACK,
+            disabled_platforms=DISABLED_PLATFORMS,
         )
 
         # Hard outer bound, mirroring the batched path: a checker that ignores
@@ -1452,12 +1545,16 @@ class SniperBot(discord.Client):
         print(f"🟢 MULTI-SNIPER v3.0 ONLINE as {self.user}")
         print("🔒 Watching channel : "
               f"{TARGET_CHANNEL_ID if TARGET_CHANNEL_ID else 'ALL CHANNELS'}")
+        banner = ["Minecraft", "guns.lol",
+                  f"Discord (mode: {DISCORD_CHECK_MODE})"]
         if ENABLE_EXTRA_PLATFORMS:
-            print("🕹️ Platforms        : Minecraft | guns.lol | Discord | "
-                  "GitHub | Steam | Reddit | Instagram | Twitter/X")
-        else:
-            print("🕹️ Platforms        : Minecraft | guns.lol | "
-                  f"Discord (mode: {DISCORD_CHECK_MODE})")
+            banner.extend(["GitHub", "Steam", "Reddit", "Instagram", "Twitter/X"])
+        if DISABLED_PLATFORMS:
+            banner = [name for name in banner
+                      if name.split(" (mode:", 1)[0] not in DISABLED_PLATFORMS]
+        print(f"🕹️ Platforms        : {' | '.join(banner)}")
+        if DISABLED_PLATFORMS:
+            print(f"   └─ skipping     : {', '.join(sorted(DISABLED_PLATFORMS))}")
         if DISCORD_CHECK_MODE == "dnsrobot":
             print("🌐 DNS Robot browser : "
                   f"{'ready' if self.dnsrobot_browser else 'unavailable'}")
@@ -1572,7 +1669,8 @@ class SniperBot(discord.Client):
         if check_budget <= 0:
             results = checkers.timeout_results(
                 "response deadline reached",
-                include_extra=ENABLE_EXTRA_PLATFORMS)
+                include_extra=ENABLE_EXTRA_PLATFORMS,
+                disabled=DISABLED_PLATFORMS)
             await self._publish_results(message, results, deadline)
         elif STREAM_REACTIONS:
             # Fastest path: answer each platform as it reports.
@@ -1652,10 +1750,21 @@ def main() -> None:
             f"❌ RESPONSE_MODE={RESPONSE_MODE_RAW!r} is not valid. "
             "Use 'reply', 'react', or 'both'.")
     if DISCORD_CHECK_MODE not in (
-            "off", "dnsrobot", "account", "account_api", "probe"):
+            "off", "dnsrobot", "instantusername", "combined",
+            "account", "account_api", "probe"):
         raise SystemExit(
-            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', 'account', "
-            "'account_api', or 'probe'.")
+            "❌ DISCORD_CHECK_MODE must be 'off', 'dnsrobot', "
+            "'instantusername', 'combined', 'account', 'account_api', "
+            "or 'probe'.")
+    if _DISABLED_UNKNOWN_TOKENS:
+        raise SystemExit(
+            "❌ DISABLED_PLATFORMS has unknown entries: "
+            f"{', '.join(_DISABLED_UNKNOWN_TOKENS)}. Valid names: "
+            + ", ".join(name for name, _ in checkers.PLATFORMS) + ".")
+    if not checkers.active_platforms(ENABLE_EXTRA_PLATFORMS, DISABLED_PLATFORMS):
+        raise SystemExit(
+            "❌ DISABLED_PLATFORMS disables every configured platform; "
+            "at least one check must stay enabled.")
     # Validate every proxy that will actually be used, whether it came from
     # PROXY_URL, PROXY_URLS, or the proxy file.
     resolved_proxies = configured_proxies()
