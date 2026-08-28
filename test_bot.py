@@ -818,6 +818,16 @@ class TestConfigErrors(unittest.TestCase):
         finally:
             bot_module.TOKEN, bot_module.DISCORD_CHECK_MODE = old_token, old_mode
 
+    def test_bad_gunslol_mode_rejected(self):
+        old_token, old_gunslol = bot_module.TOKEN, bot_module.GUNSLOL_CHECK_MODE
+        bot_module.TOKEN = "fake_token_so_token_check_passes"
+        bot_module.GUNSLOL_CHECK_MODE = "bogus"
+        try:
+            with self.assertRaises(SystemExit):
+                bot_module.main()
+        finally:
+            bot_module.TOKEN, bot_module.GUNSLOL_CHECK_MODE = old_token, old_gunslol
+
     def test_bad_proxy_rejected_before_connecting(self):
         old_token, old_proxy = bot_module.TOKEN, bot_module.PROXY_URL
         bot_module.TOKEN = "test-bot-token"

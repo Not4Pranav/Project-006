@@ -456,6 +456,7 @@ Every value has a safe default except `DISCORD_TOKEN`. Out-of-range or malformed
 | `PORT` / `KEEPALIVE_PORT` | *(blank)* | Serve a health endpoint so free hosts keep the bot alive |
 | `PREWARM_CONNECTIONS` | `true` | Open TLS to all platform hosts (plus the fallback provider) at startup |
 | `INSTANTUSERNAME_FALLBACK` | `true` | Ask instantusername.com when a platform's own check fails |
+| `GUNSLOL_CHECK_MODE` | `page` | `page` (plain HTTP) or `browser` (Playwright Chromium to defeat Cloudflare challenges; ~300 MB extra RAM) |
 | `COALESCE_DUPLICATES` | `true` | Members asking the same name at once share one lookup |
 
 ### Latency and throttling
